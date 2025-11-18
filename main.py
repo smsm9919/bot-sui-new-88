@@ -1818,19 +1818,20 @@ def super_council_ai_enhanced(df):
         breakout = detect_breakout_opportunity(df, ind)
         
         # إصلاح: استخدام last_scalar بدلاً من الوصول المباشر
-        macd, macd_signal, macd_hist = compute_macd(df['close'].astype(float))
-        macd_current = last_scalar(macd)
-        macd_signal_current = last_scalar(macd_signal) 
-        macd_hist_current = last_scalar(macd_hist)
+        close_series = df['close'].astype(float)
+        macd, macd_signal, macd_hist = compute_macd(close_series)
+        macd_current = last_scalar(macd, 0.0)
+        macd_signal_current = last_scalar(macd_signal, 0.0)
+        macd_hist_current = last_scalar(macd_hist, 0.0)
         
         macd_bullish = macd_current > macd_signal_current and macd_hist_current > 0
         macd_bearish = macd_current < macd_signal_current and macd_hist_current < 0
         
-        bb_upper, bb_middle, bb_lower = compute_bollinger_bands(df['close'].astype(float))
+        bb_upper, bb_middle, bb_lower = compute_bollinger_bands(close_series)
         current_price = float(df['close'].iloc[-1])
         
-        bb_upper_val = last_scalar(bb_upper)
-        bb_lower_val = last_scalar(bb_lower)
+        bb_upper_val = last_scalar(bb_upper, current_price)
+        bb_lower_val = last_scalar(bb_lower, current_price)
         
         if bb_upper_val != bb_lower_val:
             bb_position = (current_price - bb_lower_val) / (bb_upper_val - bb_lower_val)
@@ -1838,8 +1839,8 @@ def super_council_ai_enhanced(df):
             bb_position = 0.5
         
         stoch_k, stoch_d = compute_stochastic(df['high'].astype(float), df['low'].astype(float), df['close'].astype(float))
-        stoch_k_val = last_scalar(stoch_k)
-        stoch_d_val = last_scalar(stoch_d)
+        stoch_k_val = last_scalar(stoch_k, 50.0)
+        stoch_d_val = last_scalar(stoch_d, 50.0)
         
         stoch_bullish = stoch_k_val > stoch_d_val and stoch_k_val < 80
         stoch_bearish = stoch_k_val < stoch_d_val and stoch_k_val > 20
@@ -1911,6 +1912,10 @@ def super_council_ai_enhanced(df):
             momentum_accel = safe_get(momentum, 'price_accel', 0.0)
             momentum_roc = safe_get(momentum, 'roc', 0.0)
             
+            # إصلاح: تحويل إلى قيم scalar
+            momentum_accel = last_scalar(momentum_accel, 0.0) if hasattr(momentum_accel, '__iter__') else momentum_accel
+            momentum_roc = last_scalar(momentum_roc, 0.0) if hasattr(momentum_roc, '__iter__') else momentum_roc
+            
             if momentum_accel > 0 and momentum_roc > 0.5:
                 score_b += WEIGHT_MOMENTUM * 1.5
                 votes_b += 2
@@ -1927,6 +1932,12 @@ def super_council_ai_enhanced(df):
         if VOLUME_CONFIRMATION:
             volume_spike = volume_profile.get('volume_spike', False)
             volume_trend = volume_profile.get('volume_trend', '')
+            
+            # إصلاح: تحويل volume_spike إلى boolean
+            if hasattr(volume_spike, '__iter__'):
+                volume_spike = last_scalar(volume_spike, False)
+            if hasattr(volume_trend, '__iter__'):
+                volume_trend = last_scalar(volume_trend, '')
             
             if volume_spike and volume_trend == 'up':
                 if current_price > float(df['open'].iloc[-1]):
@@ -2020,11 +2031,11 @@ def super_council_ai_enhanced(df):
                 logs.append(f"🌊 تدفق بيعي قوي (z: {delta_z:.2f})")
 
         # 8. مؤشر MACD المتقدم
-        if macd_bullish and macd_hist_current > last_scalar(macd_hist.shift(1) if hasattr(macd_hist, 'shift') else 0):
+        if macd_bullish and macd_hist_current > 0:
             score_b += WEIGHT_MACD * 1.5
             votes_b += 2
             logs.append("📈 MACD صاعد متسارع")
-        elif macd_bearish and macd_hist_current < last_scalar(macd_hist.shift(1) if hasattr(macd_hist, 'shift') else 0):
+        elif macd_bearish and macd_hist_current < 0:
             score_s += WEIGHT_MACD * 1.5
             votes_s += 2
             logs.append("📉 MACD هابط متسارع")
@@ -2120,6 +2131,8 @@ def super_council_ai_enhanced(df):
         }
     except Exception as e:
         log_w(f"super_council_ai_enhanced error: {e}")
+        import traceback
+        log_w(f"Traceback: {traceback.format_exc()}")
         return {"b":0,"s":0,"score_b":0.0,"score_s":0.0,"logs":[],"ind":{},"confidence":0.0}
 
 council_votes_pro_enhanced = super_council_ai_enhanced
