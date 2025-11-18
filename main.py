@@ -779,19 +779,36 @@ def _pct(x):
 def last_scalar(x, default=0.0):
     """يرجع float من آخر عنصر; يقبل Series/np.ndarray/list/float."""
     try:
-        if isinstance(x, pd.Series): return float(x.iloc[-1])
-        if isinstance(x, (list, tuple, np.ndarray)): return float(x[-1])
-        if x is None: return float(default)
+        # لو رقم خلاص
+        if isinstance(x, (int, float)):
+            return float(x)
+        
+        # لو Pandas scalar
+        if isinstance(x, pd.Series): 
+            return float(x.iloc[-1])
+        if isinstance(x, (list, tuple, np.ndarray)): 
+            return float(x[-1])
+            
+        # أي نص زي "up" / "down" / "" نرجّعه None
+        if isinstance(x, str):
+            return None
+            
+        # لو None أو NaN
+        if x is None or (isinstance(x, float) and math.isnan(x)):
+            return None
+            
+        # محاولة أخيرة
         return float(x)
     except Exception:
-        return float(default)
+        return None
 
 def safe_get(ind: dict, key: str, default=0.0):
     """يقرأ مؤشر من dict ويحوّله scalar أخير."""
     if ind is None: 
         return float(default)
     val = ind.get(key, default)
-    return last_scalar(val, default=default)
+    result = last_scalar(val, default=default)
+    return result if result is not None else float(default)
 
 def _ind_brief(ind):
     if not ind: return "n/a"
@@ -1928,18 +1945,17 @@ def super_council_ai_enhanced(df):
                 logs.append("💥 تسارع هابط قوي")
                 confidence_factors.append(1.2)
 
-        # 2. تأكيد الحجم
+        # 2. تأكيد الحجم - إصلاح المعالجة
         if VOLUME_CONFIRMATION:
             volume_spike = volume_profile.get('volume_spike', False)
-            volume_trend = volume_profile.get('volume_trend', '')
+            volume_trend_label = volume_profile.get('volume_trend', '')  # "up" / "down"
             
-            # إصلاح: تحويل volume_spike إلى boolean
+            # إصلاح: تحويل volume_spike إلى boolean بشكل آمن
             if hasattr(volume_spike, '__iter__'):
                 volume_spike = last_scalar(volume_spike, False)
-            if hasattr(volume_trend, '__iter__'):
-                volume_trend = last_scalar(volume_trend, '')
             
-            if volume_spike and volume_trend == 'up':
+            # استخدم volume_trend_label مباشرة كمقارنة نصية
+            if volume_spike and volume_trend_label == 'up':
                 if current_price > float(df['open'].iloc[-1]):
                     score_b += WEIGHT_VOLUME * 1.2
                     votes_b += 1
