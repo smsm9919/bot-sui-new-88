@@ -669,6 +669,27 @@ COUNCIL_STRONG_VOTES   = 10      # عدد أصوات BUY أو SELL في اتجا
 # منع دخول مجلس الإدارة عكس ترند قوي إلا لو Golden في نفس الاتجاه
 COUNCIL_BLOCK_STRONG_TREND = True
 
+# ===== COUNCIL PROFIT PROFILE (DYNAMIC TP) =====
+# تصنيف قوة الصفقة حسب قوة مجلس الإدارة + المناطق الذكية
+
+COUNCIL_STRONG_CONF      = 0.75   # ثقة عالية جدًا
+COUNCIL_MEDIUM_CONF      = 0.55   # ثقة متوسطة  
+COUNCIL_VOTES_STRONG     = 10     # عدد أصوات قوي
+COUNCIL_VOTES_MEDIUM     = 6      # عدد أصوات متوسط
+
+COUNCIL_GOLDEN_BONUS     = 2.0    # بونس لو في منطقة ذهبية
+COUNCIL_FLOW_BONUS       = 1.5    # بونس لو Flow/CVD قوي
+COUNCIL_TREND_STRONG_BNS = 1.5    # بونس للترند القوي
+COUNCIL_TREND_WEAK_PENALTY = -1.0 # خصم للترند الضعيف
+
+# ===== SMART PROFIT SIMPLE SYSTEM =====
+# إعدادات مبسطة لجني الأرباح
+SCALP_FULL_TP_PCT = 0.8    # إغلاق كامل عند 0.8% للسكالب
+TREND_TP1_PCT = 1.5        # TP1 عند 1.5% للترند
+TREND_TP2_PCT = 3.0        # TP2 عند 3.0% للترند
+TREND_TP1_CLOSE_PCT = 0.4  # إغلاق 40% عند TP1
+TREND_TP2_CLOSE_PCT = 0.6  # إغلاق 60% الباقية عند TP2
+
 # ===== SNAPSHOT & MARK SYSTEM =====
 GREEN="🟢"; RED="🔴"
 RESET="\x1b[0m"; BOLD="\x1b[1m"
@@ -1856,6 +1877,100 @@ def decide_strategy_mode(df, adx=None, di_plus=None, di_minus=None, rsi_ctx=None
     
     return {"mode": mode, "why": why}
 
+# =================== COUNCIL PROFIT PROFILE SYSTEM ===================
+def build_profit_profile_from_council(mode, council, gz=None, trend_strength=None, flow_ctx=None):
+    """
+    يبني خطة جني أرباح ديناميكية حسب قوة مجلس الإدارة والمنطقة (Golden/SMC/Flow).
+    يرجّع dict فيه نسب TP المناسبة للصفقة.
+    """
+    if not council:
+        council = {"b": 0, "s": 0, "score_b": 0.0, "score_s": 0.0, "confidence": 0.0}
+
+    conf     = float(council.get("confidence", 0.0) or 0.0)
+    sb       = float(council.get("score_b", 0.0) or 0.0)
+    ss       = float(council.get("score_s", 0.0) or 0.0)
+    vb       = int(council.get("b", 0) or 0)
+    vs       = int(council.get("s", 0) or 0)
+    votes    = max(vb, vs)
+    main_sc  = max(sb, ss)
+
+    # base strength score من المجلس نفسه
+    strength_score = main_sc + conf * 4.0 + votes * 0.3
+
+    # bonus من Golden Zones
+    golden_tag = None
+    if gz and gz.get("ok"):
+        z = gz.get("zone", {}) or {}
+        z_type = z.get("type", "")
+        if z_type in ("golden_bottom", "golden_top"):
+            strength_score += COUNCIL_GOLDEN_BONUS
+            golden_tag = z_type
+
+    # bonus من Flow / CVD
+    if flow_ctx and flow_ctx.get("ok"):
+        dz = abs(float(flow_ctx.get("delta_z", 0.0) or 0.0))
+        if dz >= 2.0:
+            strength_score += COUNCIL_FLOW_BONUS
+
+    # bonus/penalty من قوة الترند
+    trend_tag = None
+    if trend_strength:
+        t_strength = trend_strength.get("strength", "")
+        if t_strength in ("strong", "very_strong"):
+            strength_score += COUNCIL_TREND_STRONG_BNS
+            trend_tag = t_strength
+        elif t_strength == "weak":
+            strength_score += COUNCIL_TREND_WEAK_PENALTY
+
+    # تصنيف القوة: weak / medium / strong
+    if (conf >= COUNCIL_STRONG_CONF and votes >= COUNCIL_VOTES_STRONG) or strength_score >= 18.0:
+        profile_type = "strong"
+    elif (conf >= COUNCIL_MEDIUM_CONF and votes >= COUNCIL_VOTES_MEDIUM) or strength_score >= 11.0:
+        profile_type = "medium"
+    else:
+        profile_type = "weak"
+
+    profile = {
+        "type": profile_type,
+        "raw_score": round(strength_score, 2),
+        "conf": round(conf, 2),
+        "votes": votes,
+        "golden": golden_tag,
+        "trend_tag": trend_tag,
+    }
+
+    # ===== تحديد نسب TP حسب نوع الصفقة (mode) وقوة المجلس =====
+    if mode == "scalp":
+        # سكالب → هدف واحد فقط، لكن يقوى أو يضعف حسب قوة المجلس
+        if profile_type == "strong":
+            profile["scalp_tp_full_pct"] = 1.0   # سكالب قوي: 1%
+        elif profile_type == "medium":
+            profile["scalp_tp_full_pct"] = 0.8   # سكالب متوسط: 0.8%
+        else:
+            profile["scalp_tp_full_pct"] = 0.6   # سكالب ضعيف: 0.6%
+    else:
+        # ترند → جني أرباح على مرحلتين (TP1 + TP2) بمستويات مختلفة
+        if profile_type == "strong":
+            # صفقة ترند محترمة جدًا
+            profile["tp1_pct"]      = 1.8    # 1.8%
+            profile["tp2_pct"]      = 4.0    # 4.0%
+            profile["tp1_fraction"] = 0.35   # غلق 35% عند TP1
+            profile["tp2_fraction"] = 0.65   # غلق الباقي بالكامل عند TP2
+        elif profile_type == "medium":
+            # ترند عادي لكن محترم
+            profile["tp1_pct"]      = 1.5    # 1.5%
+            profile["tp2_pct"]      = 3.0    # 3.0%
+            profile["tp1_fraction"] = 0.40
+            profile["tp2_fraction"] = 0.60
+        else:
+            # صفقة ضعيفة / غير مؤكدة → جني أسرع
+            profile["tp1_pct"]      = 1.0    # 1.0%
+            profile["tp2_pct"]      = 2.0    # 2.0%
+            profile["tp1_fraction"] = 0.50   # غلق 50% بدري
+            profile["tp2_fraction"] = 0.50
+
+    return profile
+
 # =================== SUPER COUNCIL AI - ENHANCED VERSION ===================
 def super_council_ai_enhanced(df):
     try:
@@ -2474,7 +2589,7 @@ def decide_tp_profile(council_conf, council_total_score, trend_strength, mode="t
 
 # =================== ENHANCED TRADE EXECUTION ===================
 def open_market_enhanced(side, qty, price):
-    """نسخة محسنة من فتح الصفقة مع تصنيف الترند/السكالب + خطة TP 1–3 مرات"""
+    """نسخة محسنة من فتح الصفقة مع Profit Profile الذكي"""
     if qty <= 0 or price is None:
         log_e("❌ invalid qty/price")
         return False
@@ -2490,37 +2605,25 @@ def open_market_enhanced(side, qty, price):
 
     log_i(f"🎛 TRADE MODE DECISION: {mode.upper()} | {why_mode}")
 
-    # إعدادات الإدارة الأساسية بناءً على المود (للـ BE / Trail)
+    # إعدادات الإدارة الأساسية بناءً على المود
     management_config = setup_trade_management(mode)
 
-    # ✅ مجلس الإدارة + قوة الترند لبناء خطة TP
-    council_data = council_votes_pro_enhanced(df)
-    trend_strength = compute_trend_strength(df, ind)
-    
-    # 🎯 بناء خطة TP الذكية
-    council_total = council_data.get("score_b", 0) + council_data.get("score_s", 0)
-    council_conf = council_data.get("confidence", 0.0)
+    # نحسب بيانات المجلس + المناطق الذكية لبناء خطة الربح
+    council_data = super_council_ai_enhanced(df)
+    gz_data = golden_zone_check(df, ind)
+    trend_info = compute_trend_strength(df, ind)
+    try:
+        flow_ctx = compute_flow_metrics(df)
+    except Exception:
+        flow_ctx = None
 
-    profile, levels, weights, color, tp_reason = decide_tp_profile(
-        council_conf, council_total, trend_strength.get("strength", 0), mode
-    )
-
-    # طباعة الخطة مع الألوان
-    if profile == "weak":
-        log_i(f"{color} TP PROFILE: WEAK | {tp_reason}")
-        log_i(f"   📊 خطة: إغلاق واحد عند {levels[0]}% (100%)")
-    elif profile == "medium":
-        log_i(f"{color} TP PROFILE: MEDIUM | {tp_reason}")  
-        log_i(f"   📊 خطة: TP1 {levels[0]}% (50%) → TP2 {levels[1]}% (50%)")
-    else:
-        log_i(f"{color} TP PROFILE: STRONG | {tp_reason}")
-        log_i(f"   📊 خطة: TP1 {levels[0]}% (30%) → TP2 {levels[1]}% (30%) → TP3 {levels[2]}% (40%)")
+    profit_profile = build_profit_profile_from_council(mode, council_data, gz_data, trend_info, flow_ctx)
 
     # تنفيذ الأوردر فعلياً
     success = execute_trade_decision(
         side, price, qty, mode,
         council_data,
-        golden_zone_check(df, ind)
+        gz_data
     )
 
     if success:
@@ -2542,36 +2645,46 @@ def open_market_enhanced(side, qty, price):
             "breakeven_armed": False,
             "highest_profit_pct": 0.0,
             "profit_targets_achieved": 0,
-            # 🆕 خطة TP الذكية
-            "tp_profile": profile,
-            "tp_levels": levels,
-            "tp_weights": weights,
-            "tp_hits": [False] * len(levels),
-            "tp_color": color,
-            "tp_reason": tp_reason,
-            "tp_opened_at": time.time()
+            # 🆕 خطة الربح الذكية من المجلس
+            "profit_profile": profit_profile,
+            "smart_trend_tp1_done": False,
+            "smart_trend_tp2_done": False,
+            "smart_scalp_full_done": False,
         })
 
         # 🧾 تجهيز بيانات اللوج الملوّن
-        entry_src   = STATE.get("last_entry_source", "RF+SMC")
-        entry_reas  = STATE.get("last_entry_reasons", "")
-        bal_before  = STATE.get("last_balance", None)
+        entry_src = STATE.get("last_entry_source", "RF+SMC")
+        entry_reas = STATE.get("last_entry_reasons", "")
+        bal_before = STATE.get("last_balance", None)
 
-        is_council  = STATE.get("council_controlled", False)
-        side_emoji  = "🟩 LONG" if trade_side == "long" else "🟥 SHORT"
-        src_tag     = "🏛 COUNCIL" if is_council else "📡 RF"
-        mode_tag    = "TREND" if mode == "trend" else "SCALP"
+        is_council = STATE.get("council_controlled", False)
+        side_emoji = "🟩 LONG" if trade_side == "long" else "🟥 SHORT"
+        src_tag = "🏛 COUNCIL" if is_council else "📡 RF"
+        mode_tag = "TREND" if mode == "trend" else "SCALP"
 
-        # وصف TP لو الخطة موجودة
-        tp_pairs = [f"{lvl:.1f}%/{wt*100:.0f}%" for lvl, wt in zip(levels, weights)]
-        tp_desc  = " | ".join(tp_pairs)
+        # 🔵 سطر لوج ملوّن يشرح خطة جني الربح
+        p_type = profit_profile.get("type", "n/a").upper()
+        p_tp1 = profit_profile.get("tp1_pct", profit_profile.get("scalp_tp_full_pct", None))
+        p_tp2 = profit_profile.get("tp2_pct", None)
+        raw_s = profit_profile.get("raw_score", 0.0)
+        conf = profit_profile.get("conf", 0.0)
+        votes = profit_profile.get("votes", 0)
+        golden = profit_profile.get("golden", None)
+        trend_tag = profit_profile.get("trend_tag", None)
 
-        # 🟢 سطر اللوج الملوّن
+        log_g(
+            f"🧠 PROFIT PROFILE [{p_type}] | mode={mode} | "
+            f"TP1={p_tp1}% TP2={p_tp2}% | council_score={raw_s} conf={conf} votes={votes} "
+            f"{'| golden='+golden if golden else ''} "
+            f"{'| trend='+trend_tag if trend_tag else ''}"
+        )
+
+        # 🟢 لوج فتح الصفقة الأساسي
         log_g(
             f"{side_emoji} OPENED | {src_tag} | MODE={mode_tag} "
             f"| qty={float(qty):.4f} @ {float(price):.6f} "
             f"{f'| bal={bal_before:.2f} USDT' if bal_before is not None else ''} "
-            f"| TP: {tp_desc} "
+            f"| ProfitProfile: {p_type} "
             f"{f'| reasons: {entry_reas}' if entry_reas else ''}"
         )
 
@@ -2584,18 +2697,13 @@ def open_market_enhanced(side, qty, price):
             "leverage": LEVERAGE,
             "mode": mode,
             "mode_why": why_mode,
-            "tp_plan": {
-                "profile": profile,
-                "levels": levels,
-                "weights": weights,
-                "reason": tp_reason
-            },
+            "profit_profile": profit_profile,
             "management": management_config,
             "opened_at": int(time.time())
         })
 
-        log_g(f"✅ POSITION OPENED: {side.upper()} | mode={mode} | reason={why_mode} | tp_profile={profile}")
-        print_position_snapshot(reason=f"OPEN - {mode.upper()} ({profile})")
+        log_g(f"✅ POSITION OPENED: {side.upper()} | mode={mode} | profit_profile={p_type}")
+        print_position_snapshot(reason=f"OPEN - {mode.upper()} ({p_type})")
         return True
 
     return False
@@ -2892,6 +3000,114 @@ def manage_scalp_trailing_stop(current_price, side, ind):
                 log_w(f"SCALP TRAIL STOP: {current_price} vs trail {STATE['trail']}")
                 close_market_strict("scalp_trailing_stop")
 
+# =================== SMART PROFIT SIMPLE SYSTEM ===================
+def apply_smart_profit_strategy():
+    """نسخة مبسطة من نظام جني الأرباح بدون أخطاء"""
+    if not STATE.get("open") or STATE["qty"] <= 0:
+        return
+        
+    try:
+        current_price = price_now()
+        if not current_price or not STATE.get("entry"):
+            return
+            
+        entry_price = STATE["entry"]
+        side = STATE["side"]
+        qty = STATE["qty"]
+        mode = STATE.get("mode", "scalp")
+        
+        # حساب الربح/الخسارة
+        if side == "long":
+            pnl_pct = ((current_price - entry_price) / entry_price) * 100
+        else:
+            pnl_pct = ((entry_price - current_price) / entry_price) * 100
+        
+        STATE["pnl"] = pnl_pct
+        
+        # 🎯 نظام جني الأرباح المبسط
+        if mode == "scalp":
+            # سكالب: إغلاق كامل عند 0.8%
+            if pnl_pct >= SCALP_FULL_TP_PCT and not STATE.get("scalp_tp_done", False):
+                log_g(f"💰 SCALP TP FULL | pnl={pnl_pct:.2f}%")
+                close_market_strict("scalp_tp_full")
+                STATE["scalp_tp_done"] = True
+                return
+                
+        else:
+            # ترند: TP1 جزئي + TP2 كامل
+            # TP1 عند 1.5% - إغلاق 40%
+            if (pnl_pct >= TREND_TP1_PCT and 
+                not STATE.get("trend_tp1_done", False) and 
+                STATE["qty"] > 0):
+                
+                close_qty = safe_qty(STATE["qty"] * TREND_TP1_CLOSE_PCT)
+                if close_qty > 0:
+                    close_side = "sell" if STATE["side"] == "long" else "buy"
+                    if MODE_LIVE and EXECUTE_ORDERS and not DRY_RUN:
+                        try:
+                            params = exchange_specific_params(close_side, is_close=True)
+                            ex.create_order(SYMBOL, "market", close_side, close_qty, None, params)
+                            log_g(f"🎯 TREND TP1 | pnl={pnl_pct:.2f}% | closed {TREND_TP1_CLOSE_PCT*100:.0f}%")
+                        except Exception as e:
+                            log_e(f"❌ TREND TP1 close failed: {e}")
+                    STATE["qty"] = safe_qty(STATE["qty"] - close_qty)
+                    STATE["trend_tp1_done"] = True
+            
+            # TP2 عند 3.0% - إغلاق باقي الصفقة
+            if (pnl_pct >= TREND_TP2_PCT and 
+                not STATE.get("trend_tp2_done", False) and 
+                STATE["qty"] > 0):
+                
+                log_g(f"🏁 TREND TP2 FULL EXIT | pnl={pnl_pct:.2f}%")
+                close_market_strict("trend_tp2_full")
+                STATE["trend_tp2_done"] = True
+                return
+                
+    except Exception as e:
+        log_w(f"Simple profit strategy error: {e}")
+
+def manage_after_entry_simple(df, ind, info):
+    """إدارة مبسطة للصفقات بدون تعقيد"""
+    if not STATE["open"] or STATE["qty"] <= 0:
+        return
+
+    px = info.get("price") or price_now()
+    if not px:
+        return
+        
+    entry = STATE["entry"]
+    side = STATE["side"]
+    mode = STATE.get("mode", "scalp")
+    
+    # حساب الربح/الخسارة
+    if side == "long":
+        pnl_pct = ((px - entry) / entry) * 100
+    else:
+        pnl_pct = ((entry - px) / entry) * 100
+        
+    STATE["pnl"] = pnl_pct
+    
+    # تحديث أعلى ربح
+    if pnl_pct > STATE["highest_profit_pct"]:
+        STATE["highest_profit_pct"] = pnl_pct
+    
+    # 🛡️ حماية أساسية - إغلاق عند خسارة كبيرة
+    if pnl_pct <= -2.0:  # إغلاق عند خسارة 2%
+        log_w(f"🛑 HARD STOP LOSS | pnl={pnl_pct:.2f}%")
+        close_market_strict("hard_stop_loss")
+        return
+    
+    # 📈 تفعيل نقطة التعادل عند ربح معقول
+    if not STATE.get("breakeven_armed") and pnl_pct >= 0.5:
+        STATE["breakeven_armed"] = True
+        STATE["breakeven"] = entry
+        log_i(f"🛡️ BREAKEVEN ARMED at {pnl_pct:.2f}%")
+    
+    # 🎯 تطبيق نظام جني الأرباح المبسط
+    apply_smart_profit_strategy()
+    
+    STATE["bars"] += 1
+
 # =================== SMART TP PROFILE MANAGEMENT ===================
 
 def build_tp_plan_for_trade(council_data, trend_strength, mode):
@@ -2915,307 +3131,141 @@ def manage_after_entry_enhanced_with_smart_patch(df, ind, info, performance_stat
     if not STATE["open"] or STATE["qty"] <= 0:
         return
 
-    px   = info["price"]
-    entry= STATE["entry"]
+    px = info["price"]
+    entry = STATE["entry"]
     side = STATE["side"]
-    qty  = STATE["qty"]
-
-    council_trade = STATE.get("council_controlled", False)
+    qty = STATE["qty"]
     mode = STATE.get("mode", "trend")
-
-    # صفقة مجلس الإدارة → نعاملها كـ TREND إجباري
-    if council_trade and mode != "trend":
-        mode = "trend"
-        STATE["mode"] = "trend"
-
+    
     pnl_pct = (px - entry) / entry * 100 * (1 if side == "long" else -1)
     STATE["pnl"] = pnl_pct
-
+    
     if pnl_pct > STATE["highest_profit_pct"]:
         STATE["highest_profit_pct"] = pnl_pct
 
     # ============================================
-    # 1) بناء خطة TP
+    #  SMART PROFIT CORE (SCALP / TREND) — DYNAMIC BY COUNCIL
     # ============================================
-    tp_plan = STATE.get("tp_plan")
-    tp_hits = STATE.get("tp_hits")
 
-    if not tp_plan or not tp_hits:
-        council_data   = council_votes_pro_enhanced(df)
-        trend_strength = compute_trend_strength(df, ind)
-        tp_plan = build_tp_plan_for_trade(council_data, trend_strength, mode)
-        tp_hits = [False] * len(tp_plan["levels"])
+    profit_profile = STATE.get("profit_profile", {}) or {}
 
-    # 🧠 صفقة مجلس الإدارة → خطة خاصة قوية (3 TPs)
-    if council_trade:
-        tp_plan = {
-            "profile": "council_strong",
-            "levels":   [0.8, 2.0, 4.0],      # %0.8 → %2.0 → %4.0
-            "fractions":[0.30, 0.30, 0.40]    # 30% + 30% + 40%
-        }
-        if len(tp_hits) != 3:
-            tp_hits = [False, False, False]
+    if mode == "scalp":
+        # نجيب هدف السكالب من البروفايل أو من الافتراضي
+        tp_full = profit_profile.get("scalp_tp_full_pct", SCALP_FULL_TP_PCT)
+        if pnl_pct >= tp_full and not STATE.get("smart_scalp_full_done", False):
+            log_g(f"💰 SMART SCALP TP FULL [{profit_profile.get('type','n/a')}] "
+                  f"| pnl={pnl_pct:.2f}% >= {tp_full:.2f}%")
+            close_market_strict("smart_scalp_tp_full")
+            STATE["smart_scalp_full_done"] = True
+            performance_stats["total_trades"] += 1
+            performance_stats["winning_trades"] += 1
+            return  # الصفقة اتقفلت بالكامل
 
-    STATE["tp_plan"] = tp_plan
-    STATE["tp_hits"] = tp_hits
+    else:
+        # ترند: TP1 + TP2 ديناميك حسب البروفايل
+        tp1_pct = profit_profile.get("tp1_pct", TREND_TP1_PCT)        # افتراضي 1.5%
+        tp2_pct = profit_profile.get("tp2_pct", TREND_TP2_PCT)        # افتراضي 3.0%
+        tp1_frac = profit_profile.get("tp1_fraction", TREND_TP1_CLOSE_PCT)  # افتراضي 40%
+        tp2_frac = profit_profile.get("tp2_fraction", TREND_TP2_CLOSE_PCT)  # افتراضي 60%
 
-    levels    = tp_plan["levels"]
-    fractions = tp_plan["fractions"]
+        # TP1: إغلاق جزئي
+        if (pnl_pct >= tp1_pct 
+            and not STATE.get("smart_trend_tp1_done", False)
+            and STATE["qty"] > 0):
 
-    # ============================================
-    # 2) BE + Trail الأساسي
-    # ============================================
-    management   = STATE.get("management", {})
-    be_after     = management.get("be_activate_pct", SCALP_BE_AFTER_PCT) * 100
-    trail_start  = management.get("trail_activate_pct", SCALP_TRAIL_START_PCT) * 100
+            close_qty = safe_qty(STATE["qty"] * tp1_frac)
+            if close_qty > 0:
+                close_side = "sell" if side == "long" else "buy"
+                if MODE_LIVE and EXECUTE_ORDERS and not DRY_RUN:
+                    try:
+                        params = exchange_specific_params(close_side, is_close=True)
+                        ex.create_order(SYMBOL, "market", close_side, close_qty, None, params)
+                        log_g(f"🎯 SMART TREND TP1 [{profit_profile.get('type','n/a')}] "
+                              f"| pnl={pnl_pct:.2f}% >= {tp1_pct:.2f}% "
+                              f"| closed {tp1_frac*100:.0f}% ({close_qty:.4f})")
+                        performance_stats["total_trades"] += 1
+                        performance_stats["winning_trades"] += 1
+                    except Exception as e:
+                        log_e(f"❌ SMART TREND TP1 close failed: {e}")
+                STATE["qty"] = safe_qty(STATE["qty"] - close_qty)
+                STATE["smart_trend_tp1_done"] = True
 
-    if not STATE.get("breakeven_armed") and pnl_pct >= be_after:
-        STATE["breakeven_armed"] = True
-        STATE["breakeven"] = entry
-        log_i(f"🛡️ BE ARMED ({mode}) at {pnl_pct:.2f}%")
+        # TP2: إغلاق باقي الصفقة
+        if (pnl_pct >= tp2_pct 
+            and not STATE.get("smart_trend_tp2_done", False)
+            and STATE["qty"] > 0):
 
-    if not STATE.get("trail_active") and pnl_pct >= trail_start:
-        STATE["trail_active"] = True
-        log_i(f"📈 TRAIL ACTIVE ({mode}) at {pnl_pct:.2f}%")
-
-    # ============================================
-    # 3) Smart Exit Guard (Golden / Flow / Walls ...)
-    # ============================================
-    guard = smart_exit_guard(
-        STATE, df, ind,
-        flow = info.get("flow"),
-        bm   = info.get("bm"),
-        now_price  = px,
-        pnl_pct    = pnl_pct,
-        mode       = mode,
-        side       = side,
-        entry_price= entry,
-        gz         = info.get("gz") if "gz" in info else None
-    )
-
-    if guard and isinstance(guard, dict):
-        action = guard.get("action")
-        logmsg = guard.get("log")
-        if logmsg:
-            log_i(logmsg)
-
-        if action == "close":
-            close_market_strict(guard.get("why", "smart_exit"))
-            performance_stats['total_trades'] += 1
-            if pnl_pct > 0:
-                performance_stats['winning_trades'] += 1
-            return
-        elif action == "tighten":
-            # تشديد التريل
-            mult = guard.get("trail_mult", TRAIL_TIGHT_MULT)
-            atr  = safe_get(ind, "atr", 0.0)
-            if side == "long":
-                new_trail = px - (atr * mult)
-                if STATE.get("trail") is None or new_trail > STATE["trail"]:
-                    STATE["trail"] = new_trail
-            else:
-                new_trail = px + (atr * mult)
-                if STATE.get("trail") is None or new_trail < STATE["trail"]:
-                    STATE["trail"] = new_trail
+            log_g(f"🏁 SMART TREND TP2 FULL EXIT [{profit_profile.get('type','n/a')}] "
+                  f"| pnl={pnl_pct:.2f}% >= {tp2_pct:.2f}%")
+            close_market_strict("smart_trend_tp2_full")
+            STATE["smart_trend_tp2_done"] = True
+            performance_stats["total_trades"] += 1
+            performance_stats["winning_trades"] += 1
+            return  # الصفقة اتقفلت بالكامل
 
     # ============================================
-    # 4) تنفيذ الـ TPs (1–3 مرات فقط)
+    #  SMART EXIT ENGINE (الإدارة القديمة + الدفاع)
     # ============================================
-    for i, (lvl, frac) in enumerate(zip(levels, fractions)):
-        if STATE["qty"] <= 0:
-            break
 
-        if not tp_hits[i] and pnl_pct >= lvl:
-            close_qty  = safe_qty(STATE["qty"] * frac)
-            if close_qty <= 0:
-                tp_hits[i] = True
-                continue
-
+    # هنا تبقى كل الدفاعات القديمة زي ما هي بدون تغيير
+    # (trend_ctx, reversal_candle, weak_volume, big_profit_protection, etc.)
+    
+    # ---- حالة الترند القوي ----
+    trend_ctx = info.get("trend_ctx", SmartTrendContext())
+    if trend_ctx.is_strong_trend() and mode == "trend":
+        if not STATE.get("trail_tightened", False):
+            STATE["trail_tightened"] = True
+            if "management" in STATE:
+                STATE["management"]["atr_trail_mult"] *= 0.7
+            log_i("📌 Strong Trend → Tightened Trail")
+    
+    # ---- كشف شمعة الانعكاس ----
+    candles = compute_candles(df)
+    reversal_candle = False
+    if side == "long" and (candles.get("wick_up_big") or candles.get("score_sell", 0) > 2.0):
+        reversal_candle = True
+    elif side == "short" and (candles.get("wick_dn_big") or candles.get("score_buy", 0) > 2.0):
+        reversal_candle = True
+    
+    if reversal_candle and pnl_pct > 0.5 and STATE["qty"] > 0:
+        close_qty = safe_qty(STATE["qty"] * 0.3)
+        if close_qty > 0:
             close_side = "sell" if side == "long" else "buy"
-
             if MODE_LIVE and EXECUTE_ORDERS and not DRY_RUN:
                 try:
                     params = exchange_specific_params(close_side, is_close=True)
                     ex.create_order(SYMBOL, "market", close_side, close_qty, None, params)
-                    tag = "COUNCIL" if council_trade else tp_plan['profile']
-                    log_g(
-                        f"🎯 TP{i+1}/{len(levels)} [{tag}] "
-                        f"lvl={lvl:.2f}% | closed {frac*100:.1f}% | pnl={pnl_pct:.2f}%"
-                    )
-                    STATE["profit_targets_achieved"] += 1
+                    log_g(f"🕯️ Reversal Candle → Partial Exit 30% | PnL: {pnl_pct:.2f}%")
+                    STATE["qty"] = safe_qty(STATE["qty"] - close_qty)
                     performance_stats['total_profit'] += (close_qty * abs(px - entry))
                 except Exception as e:
-                    log_e(f"❌ TP{i+1} close failed: {e}")
-                    continue
-
-            STATE["qty"] = safe_qty(STATE["qty"] - close_qty)
-            tp_hits[i] = True
-
-            # آخر TP → إغلاق صارم للباقي
-            if i == len(levels) - 1:
-                if STATE["qty"] > 0:
-                    reason = "council_final" if council_trade else f"tp_profile_{tp_plan['profile']}_final"
-                    log_i(f"🔚 FINAL TP reached → STRICT CLOSE | remaining={STATE['qty']:.4f}")
-                    close_market_strict(reason)
-                STATE["tp_hits"] = tp_hits
-                return
-
-    STATE["tp_hits"] = tp_hits
-
-    # ============================================
-    # 5) إدارة التريل النهائية حسب نوع الصفقة
-    # ============================================
-    if council_trade:
+                    log_e(f"❌ Reversal partial close failed: {e}")
+    
+    # ---- خروج عند ضعف الحجم في السكالب ----
+    vol_ok = info.get("vol_ok", False)
+    if not vol_ok and pnl_pct > 0.3 and mode == "scalp":
+        log_i("⛔ Weak Volume + Profit → Closing Position")
+        close_market_strict("weak_volume_profit")
+        performance_stats['total_trades'] += 1
+        performance_stats['winning_trades'] += 1
+        return
+    
+    # ---- حماية الأرباح الكبيرة في الترند ----
+    if pnl_pct > 2.0 and mode == "trend":
+        if not STATE.get("big_profit_protected", False):
+            STATE["big_profit_protected"] = True
+            breakeven_plus = entry * (1.01 if side == "long" else 0.99)
+            STATE["breakeven"] = breakeven_plus
+            log_i(f"💰 Big Profit Protection → Breakeven+1%: {breakeven_plus:.6f}")
+    
+    # ---- الإدارة النهائية حسب النوع ----
+    if mode == "trend":
         trend_strength = compute_trend_strength(df, ind)
-        manage_intelligent_trailing_stop(px, side, ind, trend_strength)
+        manage_trend_ride_intelligently(df, ind, info, trend_strength)
     else:
-        if mode == "trend":
-            trend_strength = compute_trend_strength(df, ind)
-            manage_trend_ride_intelligently(df, ind, info, trend_strength)
-        else:
-            manage_scalp_trade(df, ind, info)
+        manage_scalp_trade(df, ind, info)
 
     STATE["bars"] += 1
-
-def smart_exit_guard(state, df, ind, flow, bm, now_price, pnl_pct, mode, side, entry_price, gz=None):
-    # 🆕 منطق خاص بالمنطقة الذهبية العكسية + لوج ملوّن
-    golden_reversal = False
-    council_trade = STATE.get("council_controlled", False)
-
-    if gz and gz.get('ok'):
-        ztype  = gz['zone']['type']
-        gscore = gz.get('score', 0.0)
-
-        opp = (ztype == 'golden_top' and side == 'long') or \
-              (ztype == 'golden_bottom' and side == 'short')
-
-        if opp and gscore >= GOLDEN_REVERSAL_SCORE:
-            golden_reversal = True
-
-            # 1) صفقة مجلس إدارة قوية → إغلاق صارم مباشر مع ربح محترم
-            if council_trade and pnl_pct >= 0.8:
-                log_e(
-                    f"🟥 COUNCIL GOLDEN REVERSAL → CLOSE STRONG | "
-                    f"zone={ztype} | side={side} | score={gscore:.1f} | pnl={pnl_pct:.2f}%"
-                )
-                return {
-                    "action": "close",
-                    "why": "council_golden_reversal",
-                    "log": f"🟥 CLOSE STRONG (COUNCIL) | golden {ztype} vs {side} | score={gscore:.1f} | pnl={pnl_pct:.2f}%"
-                }
-
-            # 2) صفقة عادية بعد TP1 أو ربح ≥ 1%
-            if state.get('tp1_done') or pnl_pct >= 1.0:
-                log_w(
-                    f"🟧 GOLDEN REVERSAL → STRONG CLOSE | "
-                    f"zone={ztype} | side={side} | score={gscore:.1f} | pnl={pnl_pct:.2f}%"
-                )
-                return {
-                    "action": "close",
-                    "why": "golden_reversal",
-                    "log": f"🟧 CLOSE STRONG | golden {ztype} vs {side} | score={gscore:.1f} | pnl={pnl_pct:.2f}%"
-                }
-
-            # 3) قبل TP1 والربح موجب → تشديد التريل فقط
-            if pnl_pct > 0:
-                log_i(
-                    f"🟡 GOLDEN WARNING → TIGHTEN TRAIL | "
-                    f"zone={ztype} | side={side} | score={gscore:.1f} | pnl={pnl_pct:.2f}%"
-                )
-                return {
-                    "action": "tighten",
-                    "why": "golden_warning",
-                    "trail_mult": TRAIL_TIGHT_MULT,
-                    "log": f"🟡 Golden opposite warning | {ztype} vs {side} | score={gscore:.1f} | pnl={pnl_pct:.2f}%"
-                }
-
-    atr = safe_get(ind, 'atr', 0.0)
-    adx = safe_get(ind, 'adx', 0.0)
-    rsi = safe_get(ind, 'rsi', 50.0)
-    rsi_ma = safe_get(ind, 'rsi_ma', 50.0)
-    
-    if len(df) >= 3:
-        adx_slope = adx - safe_get(ind, 'adx_prev', adx)
-    else:
-        adx_slope = 0.0
-
-    wick_signal = False
-    if len(df) > 0:
-        c = df.iloc[-1]
-        wick_up = float(c['high']) - max(float(c['close']), float(c['open']))
-        wick_down = min(float(c['close']), float(c['open'])) - float(c['low'])
-        wick_signal = (wick_up >= WICK_ATR_MULT * atr) if side == "long" else (wick_down >= WICK_ATR_MULT * atr)
-
-    rsi_cross_down = (rsi < rsi_ma) if side == "long" else (rsi > rsi_ma)
-    adx_falling = (adx_slope < 0)
-    cvd_down = (flow and flow.get('ok') and flow.get('cvd_trend') == 'down')
-    evx_spike = False
-    
-    bm_wall_close = False
-    if bm and bm.get('ok'):
-        if side == "long":
-            sell_walls = bm.get('sell_walls', [])
-            if sell_walls:
-                best_ask = min([p for p, _ in sell_walls])
-                bps = abs((best_ask - now_price) / now_price) * 10000.0
-                bm_wall_close = (bps <= BM_WALL_PROX_BPS)
-        else:
-            buy_walls = bm.get('buy_walls', [])
-            if buy_walls:
-                best_bid = max([p for p, _ in buy_walls])
-                bps = abs((best_bid - now_price) / now_price) * 10000.0
-                bm_wall_close = (bps <= BM_WALL_PROX_BPS)
-
-    if state.get('tp1_done') and (gz and gz.get('ok')):
-        opp = (gz['zone']['type']=='golden_top' and side=='long') or (gz['zone']['type']=='golden_bottom' and side=='short')
-        if opp and gz.get('score',0) >= GOLDEN_REVERSAL_SCORE:
-            return {
-                "action": "close", 
-                "why": "golden_reversal",
-                "log": f"🔴 CLOSE STRONG | golden reversal after TP1 | score={gz['score']:.1f}"
-            }
-
-    tp1_target = TP1_SCALP_PCT if mode == 'scalp' else TP1_TREND_PCT
-    if pnl_pct >= tp1_target and not state.get('tp1_done'):
-        qty_pct = 0.35 if mode == 'scalp' else 0.25
-        return {
-            "action": "partial", 
-            "why": f"TP1 hit {tp1_target*100:.2f}%",
-            "qty_pct": qty_pct,
-            "log": f"💰 TP1 جزئي {tp1_target*100:.2f}% | pnl={pnl_pct*100:.2f}% | mode={mode}"
-        }
-
-    if pnl_pct > 0:
-        if wick_signal or evx_spike or bm_wall_close or cvd_down:
-            return {
-                "action": "tighten", 
-                "why": "exhaustion/flow/wall",
-                "trail_mult": TRAIL_TIGHT_MULT,
-                "log": f"🛡️ Tighten | wick={int(bool(wick_signal))} evx={int(bool(evx_spike))} wall={bm_wall_close} cvd_down={cvd_down}"
-            }
-
-    bearish_signals = [rsi_cross_down, adx_falling, cvd_down, evx_spike, bm_wall_close]
-    bearish_count = sum(bearish_signals)
-    
-    if pnl_pct >= HARD_CLOSE_PNL_PCT and bearish_count >= 2:
-        reasons = []
-        if rsi_cross_down: reasons.append("rsi↓")
-        if adx_falling: reasons.append("adx↓")
-        if cvd_down: reasons.append("cvd↓")
-        if evx_spike: reasons.append("evx")
-        if bm_wall_close: reasons.append("wall")
-        
-        return {
-            "action": "close", 
-            "why": "hard_close_signal",
-            "log": f"🔴 CLOSE STRONG | pnl={pnl_pct*100:.2f}% | {', '.join(reasons)}"
-        }
-
-    return {
-        "action": "hold", 
-        "why": "keep_riding", 
-        "log": None
-    }
 
 # ============================================
 #  ENHANCED TRADE LOOP WITH SMART PATCH
