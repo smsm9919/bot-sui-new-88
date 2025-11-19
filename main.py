@@ -114,12 +114,12 @@ class SMCDetector:
         # مناطق السيولة فوق السعر (لصفقات البيع)
         for _, high in self.swing_highs:
             if high > current_price * 1.01:  # فوق السعر ب 1%
-                zones.append(("sell_liquidity", high)
+                zones.append(("sell_liquidity", high))
         
         # مناطق السيولة تحت السعر (لصفقات الشراء)
         for _, low in self.swing_lows:
             if low < current_price * 0.99:  # تحت السعر ب 1%
-                zones.append(("buy_liquidity", low)
+                zones.append(("buy_liquidity", low))
                 
         return zones
 
