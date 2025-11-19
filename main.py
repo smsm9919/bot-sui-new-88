@@ -11,8 +11,6 @@ SUI ULTRA PRO AI BOT - الإصدار الذكي المتقدم المتكامل
 • SMART PROFIT AI - نظام جني الأرباح الذكي المتقدم
 • TP PROFILE SYSTEM - نظام جني الأرباح الذكي (1→2→3 مرات)
 • COUNCIL STRONG ENTRY - دخول ذكي من مجلس الإدارة في المناطق القوية
-• UNIFIED ENTRY LOGGING - نظام تسجيل موحد للصفقات
-• AUTO SYNC SYSTEM - مزامنة تلقائية مع المنصة
 """
 
 import os, time, math, random, signal, sys, traceback, logging, json
@@ -442,7 +440,7 @@ SHADOW_MODE_DASHBOARD = False
 DRY_RUN = False
 
 # ==== Addon: Logging + Recovery Settings ====
-BOT_VERSION = f"SUI ULTRA PRO AI v7.0 — {EXCHANGE_NAME.upper()} - SMART PROFIT AI + TP PROFILE + COUNCIL STRONG ENTRY + UNIFIED LOGGING + AUTO SYNC"
+BOT_VERSION = f"SUI ULTRA PRO AI v7.0 — {EXCHANGE_NAME.upper()} - SMART PROFIT AI + TP PROFILE + COUNCIL STRONG ENTRY"
 print("🚀 Booting:", BOT_VERSION, flush=True)
 
 STATE_PATH = "./bot_state.json"
@@ -947,70 +945,6 @@ def print_position_snapshot(reason="OPEN", color=None):
         log_i("—"*72)
     except Exception as e:
         log_w(f"SNAPSHOT ERR: {e}")
-
-# =================== UNIFIED ENTRY LOGGING SYSTEM ===================
-
-def log_entry_line(source, side, qty, price, mode, council=None, profit_profile=None, balance=None, gz=None):
-    """
-    🎯 سطر لوج ملوّن موحّد عند فتح أي صفقة (BUY/SELL)
-    source: RF / COUNCIL / SUPER_SCALP / SYNC
-    """
-    try:
-        side = side.lower()
-        is_buy = side.startswith("b") or side == "long"
-        emoji_side = "🟢 BUY" if is_buy else "🔴 SELL"
-        emoji_src = {
-            "RF": "📡",
-            "COUNCIL": "🏛",
-            "SUPER_SCALP": "⚡", 
-            "SYNC": "♻️"
-        }.get(source, "🎯")
-
-        mode_tag = mode.upper() if mode else "N/A"
-
-        # معالجة بيانات المجلس
-        votes_b = votes_s = 0
-        score_b = score_s = 0.0
-        conf = 0.0
-        if council:
-            votes_b = council.get("b", 0)
-            votes_s = council.get("s", 0)
-            score_b = council.get("score_b", 0.0)
-            score_s = council.get("score_s", 0.0)
-            conf = council.get("confidence", 0.0)
-
-        # معالجة خطة الربح
-        pp_type = "N/A"
-        tp1 = tp2 = "N/A"
-        if profit_profile:
-            pp_type = profit_profile.get("type", "N/A")
-            tp1 = profit_profile.get("tp1_pct", profit_profile.get("scalp_tp_full_pct", "N/A"))
-            tp2 = profit_profile.get("tp2_pct", "N/A")
-
-        # معالجة المنطقة الذهبية
-        gz_tag = ""
-        if gz and gz.get("ok"):
-            z = gz.get("zone", {}) or {}
-            z_tag = z.get("type", "")
-            gz_tag = f" | 🟡 {z_tag} s={gz.get('score',0):.1f}"
-
-        bal_str = f"{balance:.2f}" if balance is not None else "N/A"
-
-        # بناء رسالة اللوج النهائية
-        entry_msg = (
-            f"{emoji_src} {emoji_side} OPEN | src={source} | mode={mode_tag} | "
-            f"qty={float(qty):.4f} px={float(price):.6f} | bal={bal_str}"
-            f"{gz_tag} | "
-            f"council=({votes_b}/{votes_s} votes, {score_b:.1f}/{score_s:.1f}, conf={conf:.2f}) | "
-            f"PP={pp_type} TP1={tp1}% TP2={tp2}%"
-        )
-
-        log_g(entry_msg)
-        return True
-        
-    except Exception as e:
-        log_w(f"Entry log error: {e}")
-        return False
 
 def _round_amt(q):
     if q is None: return 0.0
@@ -2086,7 +2020,7 @@ def super_council_ai_enhanced(df):
         else:
             bb_position = 0.5
         
-        stoch_k, stoch_d = compute_stochastic(df['high'].ast(float), df['low'].astype(float), df['close'].astype(float))
+        stoch_k, stoch_d = compute_stochastic(df['high'].astype(float), df['low'].astype(float), df['close'].astype(float))
         stoch_k_val = last_scalar(stoch_k, 50.0)
         stoch_d_val = last_scalar(stoch_d, 50.0)
         
@@ -2494,18 +2428,6 @@ def execute_super_scalp(px_now, balance, df, ind, flow, volume_profile, momentum
         STATE["scalp_tp_weights"] = [0.3, 0.3, 0.25, 0.15]
         STATE["scalp_tp_achieved"] = [False, False, False, False]
         
-        # 🆕 تسجيل دخول السكالب في اللوج
-        log_entry_line(
-            source="SUPER_SCALP",
-            side=direction,
-            qty=float(smart_scalp_qty),
-            price=float(px_now),
-            mode="scalp",
-            council=None,
-            profit_profile=STATE.get("profit_profile"),
-            balance=balance
-        )
-        
         log_i(f"🔥 SUPER SCALP {direction.upper()} qty={smart_scalp_qty:.4f} px={px_now:.6f}")
         log_i(f"   Reason: {reason}")
         log_i(f"   Volatility Factor: {volatility_factor:.2f}")
@@ -2686,7 +2608,7 @@ def open_market_enhanced(side, qty, price):
     # إعدادات الإدارة الأساسية بناءً على المود
     management_config = setup_trade_management(mode)
 
-    # نحسب بيانات المجلس + المناطق الذهبية لبناء خطة الربح
+    # نحسب بيانات المجلس + المناطق الذكية لبناء خطة الربح
     council_data = super_council_ai_enhanced(df)
     gz_data = golden_zone_check(df, ind)
     trend_info = compute_trend_strength(df, ind)
@@ -2696,11 +2618,6 @@ def open_market_enhanced(side, qty, price):
         flow_ctx = None
 
     profit_profile = build_profit_profile_from_council(mode, council_data, gz_data, trend_info, flow_ctx)
-
-    # 🆕 حفظ بيانات الدخول للّوج
-    entry_source = STATE.get("last_entry_source", "COUNCIL")
-    entry_reasons = STATE.get("last_entry_reasons", "")
-    current_balance = balance_usdt()
 
     # تنفيذ الأوردر فعلياً
     success = execute_trade_decision(
@@ -2735,23 +2652,41 @@ def open_market_enhanced(side, qty, price):
             "smart_scalp_full_done": False,
         })
 
-        # 🧾 تسجيل دخول الصفقة في اللوج
-        log_entry_line(
-            source=entry_source,
-            side=side,
-            qty=float(qty),
-            price=float(price),
-            mode=mode,
-            council=council_data,
-            profit_profile=profit_profile,
-            balance=current_balance,
-            gz=gz_data
+        # 🧾 تجهيز بيانات اللوج الملوّن
+        entry_src = STATE.get("last_entry_source", "RF+SMC")
+        entry_reas = STATE.get("last_entry_reasons", "")
+        bal_before = STATE.get("last_balance", None)
+
+        is_council = STATE.get("council_controlled", False)
+        side_emoji = "🟩 LONG" if trade_side == "long" else "🟥 SHORT"
+        src_tag = "🏛 COUNCIL" if is_council else "📡 RF"
+        mode_tag = "TREND" if mode == "trend" else "SCALP"
+
+        # 🔵 سطر لوج ملوّن يشرح خطة جني الربح
+        p_type = profit_profile.get("type", "n/a").upper()
+        p_tp1 = profit_profile.get("tp1_pct", profit_profile.get("scalp_tp_full_pct", None))
+        p_tp2 = profit_profile.get("tp2_pct", None)
+        raw_s = profit_profile.get("raw_score", 0.0)
+        conf = profit_profile.get("conf", 0.0)
+        votes = profit_profile.get("votes", 0)
+        golden = profit_profile.get("golden", None)
+        trend_tag = profit_profile.get("trend_tag", None)
+
+        log_g(
+            f"🧠 PROFIT PROFILE [{p_type}] | mode={mode} | "
+            f"TP1={p_tp1}% TP2={p_tp2}% | council_score={raw_s} conf={conf} votes={votes} "
+            f"{'| golden='+golden if golden else ''} "
+            f"{'| trend='+trend_tag if trend_tag else ''}"
         )
 
-        # 🧠 تعليم إن الصفقة دي تحت إدارة المجلس (لو مصدر الدخول مجلس)
-        STATE["council_controlled"] = (entry_source == "COUNCIL_STRONG")
-        if STATE["council_controlled"]:
-            log_g("🧠 COUNCIL TRADE → إدارة ترند ذكية + TP متعدد + إغلاق صارم")
+        # 🟢 لوج فتح الصفقة الأساسي
+        log_g(
+            f"{side_emoji} OPENED | {src_tag} | MODE={mode_tag} "
+            f"| qty={float(qty):.4f} @ {float(price):.6f} "
+            f"{f'| bal={bal_before:.2f} USDT' if bal_before is not None else ''} "
+            f"| ProfitProfile: {p_type} "
+            f"{f'| reasons: {entry_reas}' if entry_reas else ''}"
+        )
 
         # حفظ السنابشوت
         save_state({
@@ -2767,8 +2702,8 @@ def open_market_enhanced(side, qty, price):
             "opened_at": int(time.time())
         })
 
-        log_g(f"✅ POSITION OPENED: {side.upper()} | mode={mode} | profit_profile={profit_profile.get('type', 'N/A')}")
-        print_position_snapshot(reason=f"OPEN - {mode.upper()} ({profit_profile.get('type', 'N/A')})")
+        log_g(f"✅ POSITION OPENED: {side.upper()} | mode={mode} | profit_profile={p_type}")
+        print_position_snapshot(reason=f"OPEN - {mode.upper()} ({p_type})")
         return True
 
     return False
@@ -3333,7 +3268,7 @@ def manage_after_entry_enhanced_with_smart_patch(df, ind, info, performance_stat
     STATE["bars"] += 1
 
 # ============================================
-#  ENHANCED TRADE LOOP WITH SMART PATCH + UNIFIED LOGGING + AUTO SYNC
+#  ENHANCED TRADE LOOP WITH SMART PATCH
 # ============================================
 
 def trade_loop_enhanced_with_smart_patch():
@@ -3359,60 +3294,6 @@ def trade_loop_enhanced_with_smart_patch():
             if df.empty:
                 time.sleep(BASE_SLEEP)
                 continue
-
-            # ============================================
-            #  🆕 AUTO SYNC SYSTEM - مزامنة تلقائية مع المنصة
-            # ============================================
-            try:
-                exch_qty, exch_side, exch_entry = _read_position()
-                if exch_qty > 0 and not STATE.get("open", False):
-                    # 📦 هناك صفقة على المنصة لكن STATE فاضي
-                    log_w(f"🔄 SYNC DETECTED: {exch_side.upper()} {exch_qty:.4f} @ {exch_entry:.6f}")
-                    
-                    STATE.update({
-                        "open": True,
-                        "side": exch_side,
-                        "entry": exch_entry,
-                        "qty": exch_qty,
-                        "pnl": 0.0,
-                        "bars": 0,
-                        "trail": None,
-                        "breakeven": None,
-                        "tp1_done": False,
-                        "highest_profit_pct": 0.0,
-                        "profit_targets_achieved": 0,
-                        "mode": "sync",
-                        "mode_why": "SYNC_FROM_EXCHANGE",
-                        "opened_at": time.time()
-                    })
-
-                    # 🧾 تسجيل دخول المزامنة
-                    log_entry_line(
-                        source="SYNC",
-                        side=exch_side,
-                        qty=exch_qty,
-                        price=exch_entry,
-                        mode="sync",
-                        council=None,
-                        profit_profile=None,
-                        balance=bal,
-                        gz=None
-                    )
-
-                    save_state({
-                        "in_position": True,
-                        "side": exch_side.upper(),
-                        "entry_price": exch_entry,
-                        "position_qty": exch_qty,
-                        "leverage": LEVERAGE,
-                        "mode": "sync",
-                        "opened_at": int(time.time())
-                    })
-
-                    log_g(f"✅ POSITION SYNCED: {exch_side.upper()} {exch_qty:.4f} @ {exch_entry:.6f}")
-                    
-            except Exception as sync_error:
-                log_w(f"Sync check error: {sync_error}")
                 
             # ✅ إضافة نظام جني الأرباح الذكي
             if STATE.get("open") and px:
@@ -3726,7 +3607,7 @@ def pretty_snapshot(bal, info, ind, spread_bps, reason=None, df=None):
         print("📈 INDICATORS & RF")
         print(f"   💲 Price {fmt(info.get('price'))} | RF filt={fmt(info.get('filter'))}  hi={fmt(info.get('hi'))} lo={fmt(info.get('lo'))}")
         print(f"   🧮 RSI={fmt(safe_get(ind, 'rsi'))}  +DI={fmt(safe_get(ind, 'plus_di'))}  -DI={fmt(safe_get(ind, 'minus_di'))}  ADX={fmt(safe_get(ind, 'adx'))}  ATR={fmt(safe_get(ind, 'atr'))}")
-        print(f"   🎯 ENTRY: SUPER COUNCIL AI + GOLDEN ENTRY + SUPER SCALP + SMART PROFIT AI + TP PROFILE + UNIFIED LOGGING + AUTO SYNC |  spread_bps={fmt(spread_bps,2)}")
+        print(f"   🎯 ENTRY: SUPER COUNCIL AI + GOLDEN ENTRY + SUPER SCALP + SMART PROFIT AI + TP PROFILE |  spread_bps={fmt(spread_bps,2)}")
         print(f"   ⏱️ closes_in ≈ {left_s}s")
         print("\n🧭 POSITION")
         bal_line = f"Balance={fmt(bal,2)}  Risk={int(RISK_ALLOC*100)}%×{LEVERAGE}x  CompoundPnL={fmt(compound_pnl)}  Eq~{fmt((bal or 0)+compound_pnl,2)}"
@@ -3758,7 +3639,7 @@ def mark_position(color):
 @app.route("/")
 def home():
     mode='LIVE' if MODE_LIVE else 'PAPER'
-    return f"✅ SUI ULTRA PRO AI Bot — {EXCHANGE_NAME.upper()} — {SYMBOL} {INTERVAL} — {mode} — Super Council AI + Intelligent Trend Riding + Smart Profit AI + TP Profile System + Council Strong Entry + Unified Logging + Auto Sync"
+    return f"✅ SUI ULTRA PRO AI Bot — {EXCHANGE_NAME.upper()} — {SYMBOL} {INTERVAL} — {mode} — Super Council AI + Intelligent Trend Riding + Smart Profit AI + TP Profile System + Council Strong Entry"
 
 @app.route("/metrics")
 def metrics():
@@ -3767,7 +3648,7 @@ def metrics():
         "symbol": SYMBOL, "interval": INTERVAL, "mode": "live" if MODE_LIVE else "paper",
         "leverage": LEVERAGE, "risk_alloc": RISK_ALLOC, "price": price_now(),
         "state": STATE, "compound_pnl": compound_pnl,
-        "entry_mode": "SUPER_COUNCIL_AI_GOLDEN_SCALP_SMART_PROFIT_TP_PROFILE_COUNCIL_STRONG_UNIFIED_LOGGING_AUTO_SYNC", 
+        "entry_mode": "SUPER_COUNCIL_AI_GOLDEN_SCALP_SMART_PROFIT_TP_PROFILE_COUNCIL_STRONG", 
         "wait_for_next_signal": wait_for_next_signal_side,
         "guards": {"max_spread_bps": MAX_SPREAD_BPS, "final_chunk_qty": FINAL_CHUNK_QTY},
         "scalp_mode": SCALP_MODE,
@@ -3775,9 +3656,7 @@ def metrics():
         "intelligent_trend_riding": TREND_RIDING_AI,
         "smart_profit_ai": True,
         "tp_profile_system": True,
-        "council_strong_entry": COUNCIL_STRONG_ENTRY,
-        "unified_logging": True,
-        "auto_sync": True
+        "council_strong_entry": COUNCIL_STRONG_ENTRY
     })
 
 @app.route("/health")
@@ -3786,15 +3665,13 @@ def health():
         "ok": True, "exchange": EXCHANGE_NAME, "mode": "live" if MODE_LIVE else "paper",
         "open": STATE["open"], "side": STATE["side"], "qty": STATE["qty"],
         "compound_pnl": compound_pnl, "timestamp": datetime.utcnow().isoformat(),
-        "entry_mode": "SUPER_COUNCIL_AI_GOLDEN_SCALP_SMART_PROFIT_TP_PROFILE_COUNCIL_STRONG_UNIFIED_LOGGING_AUTO_SYNC", 
+        "entry_mode": "SUPER_COUNCIL_AI_GOLDEN_SCALP_SMART_PROFIT_TP_PROFILE_COUNCIL_STRONG", 
         "wait_for_next_signal": wait_for_next_signal_side,
         "scalp_mode": SCALP_MODE,
         "super_council_ai": COUNCIL_AI_MODE,
         "smart_profit_ai": True,
         "tp_profile_system": True,
-        "council_strong_entry": COUNCIL_STRONG_ENTRY,
-        "unified_logging": True,
-        "auto_sync": True
+        "council_strong_entry": COUNCIL_STRONG_ENTRY
     }), 200
 
 # ============================================
@@ -3832,14 +3709,6 @@ def smart_stats():
         "council_strong_entry": {
             "active": COUNCIL_STRONG_ENTRY,
             "current_trade": STATE.get("council_controlled", False)
-        },
-        "unified_logging": {
-            "active": True,
-            "sources": ["RF", "COUNCIL", "SUPER_SCALP", "SYNC"]
-        },
-        "auto_sync": {
-            "active": True,
-            "last_sync": STATE.get("opened_at", 0)
         }
     })
 
@@ -3881,8 +3750,8 @@ def verify_execution_environment():
     print(f"🔧 EXCHANGE: {EXCHANGE_NAME.upper()} | SYMBOL: {SYMBOL}", flush=True)
     print(f"🔧 EXECUTE_ORDERS: {EXECUTE_ORDERS} | DRY_RUN: {DRY_RUN}", flush=True)
     print(f"🎯 GOLDEN ENTRY: score={GOLDEN_ENTRY_SCORE} | ADX={GOLDEN_ENTRY_ADX}", flush=True)
-    print(f"🚀 SMART PATCH: OB/FVG + SMC + Golden Zones + Volume Confirmation + SMART PROFIT AI + TP PROFILE + COUNCIL STRONG ENTRY + UNIFIED LOGGING + AUTO SYNC", flush=True)
-    print(f"🧠 SMART PROFIT AI: Scalp + Trend + Volume Analysis + TP Profile (1→2→3) + Council Strong Entry + Unified Logging + Auto Sync Activated", flush=True)
+    print(f"🚀 SMART PATCH: OB/FVG + SMC + Golden Zones + Volume Confirmation + SMART PROFIT AI + TP PROFILE + COUNCIL STRONG ENTRY", flush=True)
+    print(f"🧠 SMART PROFIT AI: Scalp + Trend + Volume Analysis + TP Profile (1→2→3) + Council Strong Entry Activated", flush=True)
 
 if __name__ == "__main__":
     verify_execution_environment()
@@ -3893,6 +3762,6 @@ if __name__ == "__main__":
     
     log_i(f"🚀 SUI ULTRA PRO AI BOT STARTED - {BOT_VERSION}")
     log_i(f"🎯 SYMBOL: {SYMBOL} | INTERVAL: {INTERVAL} | LEVERAGE: {LEVERAGE}x")
-    log_i(f"💡 SMART PATCH ACTIVATED: Golden Zones + SMC + OB/FVG + Zero Reversal Scalping + SMART PROFIT AI + TP PROFILE + COUNCIL STRONG ENTRY + UNIFIED LOGGING + AUTO SYNC")
+    log_i(f"💡 SMART PATCH ACTIVATED: Golden Zones + SMC + OB/FVG + Zero Reversal Scalping + SMART PROFIT AI + TP PROFILE + COUNCIL STRONG ENTRY")
     
     app.run(host="0.0.0.0", port=PORT, debug=False)
