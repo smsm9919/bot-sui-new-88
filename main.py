@@ -114,12 +114,12 @@ class SMCDetector:
         # مناطق السيولة فوق السعر (لصفقات البيع)
         for _, high in self.swing_highs:
             if high > current_price * 1.01:  # فوق السعر ب 1%
-                zones.append(("sell_liquidity", high))
+                zones.append(("sell_liquidity", high)
         
         # مناطق السيولة تحت السعر (لصفقات الشراء)
         for _, low in self.swing_lows:
             if low < current_price * 0.99:  # تحت السعر ب 1%
-                zones.append(("buy_liquidity", low))
+                zones.append(("buy_liquidity", low)
                 
         return zones
 
@@ -459,8 +459,16 @@ CVD_SMOOTH = 8
 # =================== SETTINGS ===================
 SYMBOL     = os.getenv("SYMBOL", "SUI/USDT:USDT")
 INTERVAL   = os.getenv("INTERVAL", "15m")
-LEVERAGE   = int(os.getenv("LEVERAGE", 10))
-RISK_ALLOC = float(os.getenv("RISK_ALLOC", 0.60))
+
+# ===== RISK / LEVERAGE PROFILE (FIXED) =====
+LEVERAGE   = 10          # رافعة ثابتة 10x
+RISK_ALLOC = 0.60        # 60% من رصيد المحفظة في كل صفقة
+
+# إيقاف أي تعديل تلقائي في الحجم
+ADAPTIVE_POSITION_SIZING = False
+VOLATILITY_ADJUSTED_SIZE = False
+SCALP_SIZE_FACTOR        = 1.0
+
 POSITION_MODE = os.getenv("POSITION_MODE", "oneway")
 
 # RF Settings - Optimized for SUI
@@ -548,7 +556,6 @@ ADX_GATE = 17
 # ===== SUPER SCALP ENGINE =====
 SCALP_MODE            = True
 SCALP_EXECUTE         = True
-SCALP_SIZE_FACTOR     = 0.35
 SCALP_ADX_GATE        = 12.0
 SCALP_MIN_SCORE       = 3.5
 SCALP_IMB_THRESHOLD   = 1.00
@@ -616,8 +623,6 @@ BREAKOUT_CONFIRMATION = True
 VOLUME_CONFIRMATION_MULTIPLIER = 1.2
 
 # ===== SMART POSITION MANAGEMENT =====
-ADAPTIVE_POSITION_SIZING = True
-VOLATILITY_ADJUSTED_SIZE = True
 DYNAMIC_LEVERAGE = False
 MAX_LEVERAGE = 15
 
@@ -1041,6 +1046,38 @@ def safe_qty(q):
     except Exception as e:
         log_e(f"❌ خطأ في safe_qty: {e}")
         return MIN_QTY  # إرجاع الحد الأدنى كحماية
+
+def compute_size(balance, price):
+    """
+    حجم اللوت ثابت:
+    - 60% من رصيد المحفظة
+    - ×10x ليفرج
+    - نفس المنطق لكل الصفقات (سكالب / تريند)
+    """
+    effective_balance = float(balance or 0.0)
+    px = float(price or 0.0)
+
+    if effective_balance <= 0 or px <= 0:
+        return 0.0
+
+    # 1) نحدد الكابيتال المستخدم في الصفقة: 60% من الرصيد
+    capital_usdt = effective_balance * 0.60          # 60% من الرصيد
+
+    # 2) نطبّق رافعة 10x على نفس الكابيتال
+    notional_usdt = capital_usdt * 10.0              # 10x ثابت
+
+    # 3) نحسب عدد العملات
+    raw_qty = notional_usdt / px
+
+    qty = safe_qty(raw_qty)
+
+    log_i(
+        f"SIZE_FIXED_60pct_10x | bal={effective_balance:.2f} | "
+        f"price={px:.6f} | capital={capital_usdt:.2f} | "
+        f"notional={notional_usdt:.2f} | qty={qty:.4f}"
+    )
+
+    return qty
 
 def fmt(v, d=6, na="—"):
     try:
@@ -2522,9 +2559,8 @@ def execute_super_scalp(px_now, balance, df, ind, flow, volume_profile, momentum
     if direction is None:
         return False
 
-    base_qty = compute_size(balance, px_now) * SCALP_SIZE_FACTOR
-    volatility_factor = min(2.0, max(0.5, momentum['volatility'] / max(momentum['volatility_ma'], 1e-9)))
-    smart_scalp_qty = base_qty * volatility_factor
+    # نستخدم نفس حجم الصفقة الثابت 60% × 10x بدون أي تقليص
+    smart_scalp_qty = compute_size(balance, px_now)
     
     if smart_scalp_qty <= 0:
         log_w("SUPER SCALP: skip qty<=0")
@@ -2542,7 +2578,7 @@ def execute_super_scalp(px_now, balance, df, ind, flow, volume_profile, momentum
         
         log_i(f"🔥 SUPER SCALP {direction.upper()} qty={smart_scalp_qty:.4f} px={px_now:.6f}")
         log_i(f"   Reason: {reason}")
-        log_i(f"   Volatility Factor: {volatility_factor:.2f}")
+        log_i(f"   Fixed Size: 60% × 10x")
         log_i(f"   Multi-TP: {STATE['scalp_tp_levels']}")
         
         try:
@@ -2700,46 +2736,19 @@ def decide_tp_profile(council_conf, council_total_score, trend_strength, mode="t
     return "medium", TP_MED_LEVELS, TP_MED_WEIGHTS, "🟡", reason
 
 # =================== ENHANCED TRADE EXECUTION ===================
-def compute_size(balance, price):
-    """نسخة محسنة لحساب الكمية مع منع القيم الصغيرة جداً"""
-    try:
-        if not balance or balance < MIN_BALANCE_FOR_TRADE:
-            log_w(f"⚠️ الرصيد غير كافي: {balance} < {MIN_BALANCE_FOR_TRADE}")
-            return 0.0
-            
-        if not price or price <= 0:
-            log_w(f"⚠️ السعر غير صالح: {price}")
-            return 0.0
-            
-        # حساب الكمية الأساسية
-        alloc = balance * RISK_ALLOC  # نسبة المخاطرة
-        leverage = LEVERAGE or 10
-        position_value = alloc * leverage
-        raw_qty = position_value / price
-        
-        # تطبيق الحد الأدنى للكمية
-        if raw_qty < MIN_QTY:
-            log_w(f"⚠️ الكمية صغيرة: {raw_qty:.4f} < {MIN_QTY}، رفع إلى الحد الأدنى")
-            raw_qty = MIN_QTY
-            
-        # التأكد من أن الكمية لا تتجاوز الرصيد المتاح
-        max_affordable = (balance * 0.8) / price  # 80% من الرصيد كحد أقصى
-        if raw_qty > max_affordable:
-            log_w(f"⚠️ تعديل الكمية: {raw_qty:.4f} → {max_affordable:.4f} (حماية الرصيد)")
-            raw_qty = max_affordable
-            
-        log_i(f"📊 حجم الصفقة: الرصيد={balance:.2f}، السعر={price:.6f}، الكمية={raw_qty:.4f}")
-        return safe_qty(raw_qty)
-        
-    except Exception as e:
-        log_e(f"❌ خطأ في حساب الكمية: {e}")
-        return 0.0
-
 def open_market_enhanced(side, qty, price):
-    """نسخة محسنة من فتح الصفقة مع تصنيف الترند/السكالب + Profit Profile"""
+    """نسخة محسنة من فتح الصفقة مع الحجم الثابت 60% × 10x"""
     if qty <= 0 or price is None:
         log_e("❌ كمية أو سعر غير صالح")
         return False
+
+    # تحقق إضافي من الحجم
+    balance = balance_usdt()
+    expected_qty = compute_size(balance, price)
+    
+    if abs(qty - expected_qty) > (expected_qty * 0.1):  # اختلاف أكثر من 10%
+        log_w(f"⚠️ تصحيح الحجم: {qty:.4f} → {expected_qty:.4f}")
+        qty = expected_qty
 
     df = fetch_ohlcv(limit=200)
     ind = compute_indicators(df)
