@@ -3098,7 +3098,7 @@ def manage_trade_by_profile(df, ind, info):
                         STATE["qty"] = safe_qty(STATE["qty"] - close_qty)
                         STATE["tp2_done"] = True
                     except Exception as e:
-                        log_e(f"❌ TREND_STRONG TP2 close failed: {e})
+                        log_e(f"❌ TREND_STRONG TP2 close failed: {e}")
                         
         elif STATE.get("tp2_done") and not STATE.get("tp3_done") and pnl_pct >= tp3:
             close_market_strict(f"TREND_STRONG TP3: {tp3}%")
