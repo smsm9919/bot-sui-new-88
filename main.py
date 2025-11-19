@@ -690,10 +690,47 @@ TREND_TP2_PCT = 3.0        # TP2 عند 3.0% للترند
 TREND_TP1_CLOSE_PCT = 0.4  # إغلاق 40% عند TP1
 TREND_TP2_CLOSE_PCT = 0.6  # إغلاق 60% الباقية عند TP2
 
+# ================== PROFIT PROFILES (SMALL ACCOUNT) ==================
+# تصنيفات الصفقة: سكالب صغير / ترند متوسط / ترند قوي
+PROFIT_PROFILE_CONFIG = {
+    "SCALP_SMALL": {
+        "label": "SCALP_SMALL",
+        "tp1_pct": 0.45,   # هدف واحد صغير
+        "tp2_pct": None,
+        "tp3_pct": None,
+        "trail_start_pct": 0.50,
+        "desc": "صفقة سكالب صغيرة / حركة سريعة"
+    },
+    "TREND_MEDIUM": {
+        "label": "TREND_MEDIUM",
+        "tp1_pct": 0.8,
+        "tp2_pct": 1.6,
+        "tp3_pct": None,
+        "trail_start_pct": 1.0,
+        "desc": "ترند متوسط / موجة محترمة"
+    },
+    "TREND_STRONG": {
+        "label": "TREND_STRONG",
+        "tp1_pct": 0.8,
+        "tp2_pct": 2.0,
+        "tp3_pct": 4.0,
+        "trail_start_pct": 1.2,
+        "desc": "ترند قوي / حركة كبيرة"
+    },
+}
+
+COUNCIL_STRONG_ENTRY_SCORE = 25.0   # عتبة قوة المجلس
+COUNCIL_STRONG_ENTRY_CONF  = 0.80   # عتبة الثقة
+COUNCIL_STRONG_MIN_VOTES   = 10     # أقل عدد أصوات
+
 # ===== SNAPSHOT & MARK SYSTEM =====
 GREEN="🟢"; RED="🔴"
 RESET="\x1b[0m"; BOLD="\x1b[1m"
 FG_G="\x1b[32m"; FG_R="\x1b[31m"; FG_C="\x1b[36m"; FG_Y="\x1b[33m"; FG_M="\x1b[35m"
+
+# ===== SMART QUANTITY FIX =====
+MIN_QTY = 0.1  # الحد الأدنى للكمية المسموح بها
+MIN_BALANCE_FOR_TRADE = 10.0  # الحد الأدنى للرصيد لفتح صفقة
 
 # =================== PROFESSIONAL LOGGING ===================
 def log_i(msg): print(f"ℹ️ {msg}", flush=True)
@@ -947,23 +984,63 @@ def print_position_snapshot(reason="OPEN", color=None):
         log_w(f"SNAPSHOT ERR: {e}")
 
 def _round_amt(q):
-    if q is None: return 0.0
+    """نسخة محسنة من التقريب مع منع القيم الصغيرة"""
+    if q is None: 
+        return MIN_QTY  # إرجاع الحد الأدنى بدلاً من الصفر
+        
     try:
         d = Decimal(str(q))
-        if LOT_STEP and isinstance(LOT_STEP,(int,float)) and LOT_STEP>0:
+        
+        # إذا كانت القيمة أصغر من الحد الأدنى، إرجاع الحد الأدنى
+        if d < Decimal(str(MIN_QTY)):
+            return float(MIN_QTY)
+            
+        # التقريب العادي
+        if LOT_STEP and isinstance(LOT_STEP, (int, float)) and LOT_STEP > 0:
             step = Decimal(str(LOT_STEP))
-            d = (d/step).to_integral_value(rounding=ROUND_DOWN)*step
-        prec = int(AMT_PREC) if AMT_PREC and AMT_PREC>=0 else 0
+            d = (d / step).to_integral_value(rounding=ROUND_DOWN) * step
+            
+        prec = int(AMT_PREC) if AMT_PREC and AMT_PREC >= 0 else 0
         d = d.quantize(Decimal(1).scaleb(-prec), rounding=ROUND_DOWN)
-        if LOT_MIN and isinstance(LOT_MIN,(int,float)) and LOT_MIN>0 and d < Decimal(str(LOT_MIN)): return 0.0
-        return float(d)
+        
+        if LOT_MIN and isinstance(LOT_MIN, (int, float)) and LOT_MIN > 0 and d < Decimal(str(LOT_MIN)):
+            return float(MIN_QTY)  # إرجاع الحد الأدنى بدلاً من الصفر
+            
+        result = float(d)
+        
+        # تحقق نهائي من القيمة
+        if result <= 0:
+            return float(MIN_QTY)
+            
+        return result
+        
     except (InvalidOperation, ValueError, TypeError):
-        return max(0.0, float(q))
+        return float(MIN_QTY)  # إرجاع الحد الأدنى في حالة الخطأ
 
 def safe_qty(q): 
-    q = _round_amt(q)
-    if q<=0: log_w(f"qty invalid after normalize → {q}")
-    return q
+    """نسخة محسنة مع حماية من القيم الصغيرة جداً"""
+    try:
+        q_float = float(q) if q else 0.0
+        
+        # إذا كانت الكمية صغيرة جداً
+        if q_float < MIN_QTY:
+            log_w(f"🛑 كمية صغيرة جداً: {q_float:.6f} < {MIN_QTY}، رفع إلى الحد الأدنى")
+            q_float = MIN_QTY
+            
+        # التقريب العادي
+        q_rounded = _round_amt(q_float)
+        
+        # التأكد مرة أخرى بعد التقريب
+        if q_rounded <= 0:
+            log_w(f"🛑 الكمية بعد التقريب صفر: {q_float:.6f} → {q_rounded}")
+            q_rounded = MIN_QTY
+            
+        log_i(f"✅ كمية الصفقة النهائية: {q_rounded:.4f}")
+        return q_rounded
+        
+    except Exception as e:
+        log_e(f"❌ خطأ في safe_qty: {e}")
+        return MIN_QTY  # إرجاع الحد الأدنى كحماية
 
 def fmt(v, d=6, na="—"):
     try:
@@ -1971,6 +2048,41 @@ def build_profit_profile_from_council(mode, council, gz=None, trend_strength=Non
 
     return profile
 
+# =================== PROFIT PROFILE CLASSIFICATION ===================
+def classify_profit_profile(df, ind, council_data, trend_info, mode: str):
+    """
+    يحدد نوع الصفقة (سكالب صغير / ترند متوسط / ترند قوي)
+    عشان إدارة الصفقة تمشي على نفس الـ profile من أول شمعة لآخر شمعة.
+    """
+    strength = trend_info.get("strength", "flat")      # weak / medium / strong / very_strong
+    adx_val = safe_get(ind, "adx", 0.0)
+
+    votes_b = council_data.get("b", 0)
+    votes_s = council_data.get("s", 0)
+    score_b = council_data.get("score_b", 0.0)
+    score_s = council_data.get("score_s", 0.0)
+    conf    = council_data.get("confidence", 0.0)
+
+    dom_score = max(score_b, score_s)
+    dom_votes = max(votes_b, votes_s)
+
+    # 1) سكالب صغير: ترند ضعيف أو متوسط + مود "scalp"
+    if mode == "scalp" and (strength in ["weak", "flat"] or adx_val < 20 or dom_score < 15):
+        profile = PROFIT_PROFILE_CONFIG["SCALP_SMALL"]
+        log_i(f"🎯 PROFILE: SCALP_SMALL | strength={strength}, adx={adx_val:.1f}, score={dom_score:.1f}")
+
+    # 2) ترند قوي: strength قوي + ADX محترم + أصوات مجلس قوية
+    elif strength in ["strong", "very_strong"] and adx_val >= 20 and dom_score >= 25 and dom_votes >= 10:
+        profile = PROFIT_PROFILE_CONFIG["TREND_STRONG"]
+        log_i(f"🎯 PROFILE: TREND_STRONG | strength={strength}, adx={adx_val:.1f}, score={dom_score:.1f}, votes={dom_votes}")
+
+    # 3) الباقي: ترند متوسط
+    else:
+        profile = PROFIT_PROFILE_CONFIG["TREND_MEDIUM"]
+        log_i(f"🎯 PROFILE: TREND_MEDIUM | strength={strength}, adx={adx_val:.1f}, score={dom_score:.1f}")
+
+    return profile
+
 # =================== SUPER COUNCIL AI - ENHANCED VERSION ===================
 def super_council_ai_enhanced(df):
     try:
@@ -2588,47 +2700,114 @@ def decide_tp_profile(council_conf, council_total_score, trend_strength, mode="t
     return "medium", TP_MED_LEVELS, TP_MED_WEIGHTS, "🟡", reason
 
 # =================== ENHANCED TRADE EXECUTION ===================
+def compute_size(balance, price):
+    """نسخة محسنة لحساب الكمية مع منع القيم الصغيرة جداً"""
+    try:
+        if not balance or balance < MIN_BALANCE_FOR_TRADE:
+            log_w(f"⚠️ الرصيد غير كافي: {balance} < {MIN_BALANCE_FOR_TRADE}")
+            return 0.0
+            
+        if not price or price <= 0:
+            log_w(f"⚠️ السعر غير صالح: {price}")
+            return 0.0
+            
+        # حساب الكمية الأساسية
+        alloc = balance * RISK_ALLOC  # نسبة المخاطرة
+        leverage = LEVERAGE or 10
+        position_value = alloc * leverage
+        raw_qty = position_value / price
+        
+        # تطبيق الحد الأدنى للكمية
+        if raw_qty < MIN_QTY:
+            log_w(f"⚠️ الكمية صغيرة: {raw_qty:.4f} < {MIN_QTY}، رفع إلى الحد الأدنى")
+            raw_qty = MIN_QTY
+            
+        # التأكد من أن الكمية لا تتجاوز الرصيد المتاح
+        max_affordable = (balance * 0.8) / price  # 80% من الرصيد كحد أقصى
+        if raw_qty > max_affordable:
+            log_w(f"⚠️ تعديل الكمية: {raw_qty:.4f} → {max_affordable:.4f} (حماية الرصيد)")
+            raw_qty = max_affordable
+            
+        log_i(f"📊 حجم الصفقة: الرصيد={balance:.2f}، السعر={price:.6f}، الكمية={raw_qty:.4f}")
+        return safe_qty(raw_qty)
+        
+    except Exception as e:
+        log_e(f"❌ خطأ في حساب الكمية: {e}")
+        return 0.0
+
 def open_market_enhanced(side, qty, price):
-    """نسخة محسنة من فتح الصفقة مع Profit Profile الذكي"""
+    """نسخة محسنة من فتح الصفقة مع تصنيف الترند/السكالب + Profit Profile"""
     if qty <= 0 or price is None:
-        log_e("❌ invalid qty/price")
+        log_e("❌ كمية أو سعر غير صالح")
         return False
 
-    # نجيب الداتا والمؤشرات قبل التنفيذ
     df = fetch_ohlcv(limit=200)
     ind = compute_indicators(df)
 
-    # ✅ نحدد نوع الصفقة: ترند ولا سكالب؟
+    # --- تحديد المود (scalp / trend) حسب الدالة الحالية ---
     mode_info = classify_trade_mode(df, ind)
-    mode = mode_info["mode"]
-    why_mode = mode_info["why"]
+    mode = mode_info.get("mode", "scalp")
+    why_mode = mode_info.get("why", "classify_trade_mode")
 
-    log_i(f"🎛 TRADE MODE DECISION: {mode.upper()} | {why_mode}")
-
-    # إعدادات الإدارة الأساسية بناءً على المود
-    management_config = setup_trade_management(mode)
-
-    # نحسب بيانات المجلس + المناطق الذكية لبناء خطة الربح
-    council_data = super_council_ai_enhanced(df)
-    gz_data = golden_zone_check(df, ind)
-    trend_info = compute_trend_strength(df, ind)
+    # --- تقوية قرار المود بناءً على قوة الترند ---
     try:
-        flow_ctx = compute_flow_metrics(df)
-    except Exception:
-        flow_ctx = None
+        trend_info = compute_trend_strength(df, ind)
+        trend_strength = trend_info.get("strength", "flat")
+        adx_val = safe_get(ind, "adx", 0.0)
+        plus_di = safe_get(ind, "plus_di", 0.0)
+        minus_di = safe_get(ind, "minus_di", 0.0)
+        di_spread = abs(plus_di - minus_di)
 
-    profit_profile = build_profit_profile_from_council(mode, council_data, gz_data, trend_info, flow_ctx)
+        rsi_ctx_local = rsi_ma_context(df)
+        rsi_trendz = rsi_ctx_local.get("trendZ", "none")
 
-    # تنفيذ الأوردر فعلياً
-    success = execute_trade_decision(
-        side, price, qty, mode,
-        council_data,
-        gz_data
-    )
+        council_preview = super_council_ai_enhanced(df)
+        council_conf = council_preview.get("confidence", 0.0)
+        council_score = max(council_preview.get("score_b", 0.0),
+                           council_preview.get("score_s", 0.0))
+
+        strong_trend = trend_strength in ["strong", "very_strong"]
+        di_ok = di_spread >= 10.0
+        adx_ok = adx_val >= 20.0
+        rsi_ok = rsi_trendz in ["bull", "bear"]
+        council_ok = (council_conf >= 0.6 and council_score >= 15.0)
+
+        if strong_trend and adx_ok and di_ok and rsi_ok and council_ok and mode != "trend":
+            log_i("🧠 PROMOTE → TRADE MODE: scalp → TREND "
+                  f"(trend={trend_strength}, adx={adx_val:.1f}, di_spread={di_spread:.1f}, "
+                  f"rsi_trend={rsi_trendz}, council_score={council_score:.1f}, conf={council_conf:.2f})")
+            mode = "trend"
+            why_mode += " | promote_strong_trend"
+    except Exception as e:
+        log_w(f"trade_mode promotion check error: {e}")
+        trend_info = compute_trend_strength(df, ind)
+
+    # ✅ نحسب بيانات المجلس الحقيقية للصفقة
+    council_data = super_council_ai_enhanced(df)
+
+    # ✅ نحدد Profit Profile المناسب
+    profit_profile = classify_profit_profile(df, ind, council_data, trend_info, mode)
+
+    # إعدادات الإدارة المبنية على الـ profile الجديد
+    management_config = {
+        "tp1_pct": profit_profile["tp1_pct"],
+        "tp2_pct": profit_profile["tp2_pct"],
+        "tp3_pct": profit_profile["tp3_pct"],
+        "be_activate_pct": profit_profile["tp1_pct"],
+        "trail_activate_pct": profit_profile["trail_start_pct"],
+        "atr_trail_mult": TREND_ATR_MULT if mode == "trend" else SCALP_ATR_TRAIL_MULT,
+        "profile": profit_profile["label"],
+        "profile_desc": profit_profile["desc"]
+    }
+
+    log_i(f"🎛 TRADE MODE DECISION: {mode.upper()} | profile={profit_profile['label']} | {why_mode}")
+
+    # تنفيذ الأمر
+    success = execute_trade_decision(side, price, qty, mode, council_data, golden_zone_check(df, ind))
 
     if success:
         trade_side = "long" if side.lower().startswith("b") else "short"
-
+        
         STATE.update({
             "open": True,
             "side": trade_side,
@@ -2645,50 +2824,10 @@ def open_market_enhanced(side, qty, price):
             "breakeven_armed": False,
             "highest_profit_pct": 0.0,
             "profit_targets_achieved": 0,
-            # 🆕 خطة الربح الذكية من المجلس
-            "profit_profile": profit_profile,
-            "smart_trend_tp1_done": False,
-            "smart_trend_tp2_done": False,
-            "smart_scalp_full_done": False,
+            "profit_profile": profit_profile["label"],
+            "council_controlled": STATE.get("last_entry_source") == "COUNCIL_STRONG"
         })
 
-        # 🧾 تجهيز بيانات اللوج الملوّن
-        entry_src = STATE.get("last_entry_source", "RF+SMC")
-        entry_reas = STATE.get("last_entry_reasons", "")
-        bal_before = STATE.get("last_balance", None)
-
-        is_council = STATE.get("council_controlled", False)
-        side_emoji = "🟩 LONG" if trade_side == "long" else "🟥 SHORT"
-        src_tag = "🏛 COUNCIL" if is_council else "📡 RF"
-        mode_tag = "TREND" if mode == "trend" else "SCALP"
-
-        # 🔵 سطر لوج ملوّن يشرح خطة جني الربح
-        p_type = profit_profile.get("type", "n/a").upper()
-        p_tp1 = profit_profile.get("tp1_pct", profit_profile.get("scalp_tp_full_pct", None))
-        p_tp2 = profit_profile.get("tp2_pct", None)
-        raw_s = profit_profile.get("raw_score", 0.0)
-        conf = profit_profile.get("conf", 0.0)
-        votes = profit_profile.get("votes", 0)
-        golden = profit_profile.get("golden", None)
-        trend_tag = profit_profile.get("trend_tag", None)
-
-        log_g(
-            f"🧠 PROFIT PROFILE [{p_type}] | mode={mode} | "
-            f"TP1={p_tp1}% TP2={p_tp2}% | council_score={raw_s} conf={conf} votes={votes} "
-            f"{'| golden='+golden if golden else ''} "
-            f"{'| trend='+trend_tag if trend_tag else ''}"
-        )
-
-        # 🟢 لوج فتح الصفقة الأساسي
-        log_g(
-            f"{side_emoji} OPENED | {src_tag} | MODE={mode_tag} "
-            f"| qty={float(qty):.4f} @ {float(price):.6f} "
-            f"{f'| bal={bal_before:.2f} USDT' if bal_before is not None else ''} "
-            f"| ProfitProfile: {p_type} "
-            f"{f'| reasons: {entry_reas}' if entry_reas else ''}"
-        )
-
-        # حفظ السنابشوت
         save_state({
             "in_position": True,
             "side": "LONG" if trade_side == "long" else "SHORT",
@@ -2697,13 +2836,22 @@ def open_market_enhanced(side, qty, price):
             "leverage": LEVERAGE,
             "mode": mode,
             "mode_why": why_mode,
-            "profit_profile": profit_profile,
+            "profit_profile": profit_profile["label"],
             "management": management_config,
             "opened_at": int(time.time())
         })
 
-        log_g(f"✅ POSITION OPENED: {side.upper()} | mode={mode} | profit_profile={p_type}")
-        print_position_snapshot(reason=f"OPEN - {mode.upper()} ({p_type})")
+        # لوج ملوّن واضح
+        profile_color = "🟢" if profit_profile["label"] == "TREND_STRONG" else "🟡" if profit_profile["label"] == "TREND_MEDIUM" else "🔵"
+        log_g(
+            f"{profile_color} COUNCIL TRADE OPENED | {side.upper()} {qty:.4f} @ {price:.6f} "
+            f"| {mode.upper()} | {profit_profile['label']} | "
+            f"TPs: {profit_profile['tp1_pct']}%"
+            f"{f' → {profit_profile["tp2_pct"]}%' if profit_profile['tp2_pct'] else ''}"
+            f"{f' → {profit_profile["tp3_pct"]}%' if profit_profile['tp3_pct'] else ''}"
+        )
+        
+        print_position_snapshot(reason=f"OPEN - {mode.upper()}[{profit_profile['label']}]")
         return True
 
     return False
@@ -2823,12 +2971,6 @@ def _read_position():
         logging.error(f"_read_position error: {e}")
     return 0.0, None, None
 
-def compute_size(balance, price):
-    effective = balance or 0.0
-    capital = effective * RISK_ALLOC * LEVERAGE
-    raw = max(0.0, capital / max(float(price or 0.0), 1e-9))
-    return safe_qty(raw)
-
 def close_market_strict(reason="STRICT"):
     global compound_pnl, wait_for_next_signal_side
     exch_qty, exch_side, exch_entry = _read_position()
@@ -2881,6 +3023,89 @@ def _reset_after_close(reason, prev_side=None):
     logging.info(f"AFTER_CLOSE waiting_for={wait_for_next_signal_side}")
 
 # =================== ENHANCED TRADE MANAGEMENT ===================
+def manage_trade_by_profile(df, ind, info):
+    """إدارة الصفقة حسب التصنيف المحدد من المجلس"""
+    if not STATE["open"] or STATE["qty"] <= 0:
+        return
+
+    px = info["price"]
+    entry = STATE["entry"]
+    side = STATE["side"]
+    mode = STATE.get("mode", "scalp")
+    profile = STATE.get("profit_profile", "SCALP_SMALL")
+    
+    # حساب الربح
+    pnl_pct = (px - entry) / entry * 100 * (1 if side == "long" else -1)
+    STATE["pnl"] = pnl_pct
+    
+    if pnl_pct > STATE["highest_profit_pct"]:
+        STATE["highest_profit_pct"] = pnl_pct
+
+    # جلب إعدادات الـ Profile
+    management = STATE.get("management", {})
+    tp1 = management.get("tp1_pct", 0.45)
+    tp2 = management.get("tp2_pct")
+    tp3 = management.get("tp3_pct")
+    
+    # تطبيق أهداف الربح حسب الـ Profile
+    if profile == "SCALP_SMALL" and not STATE.get("tp1_done") and pnl_pct >= tp1:
+        close_market_strict(f"SCALP_SMALL TP: {tp1}%")
+        return
+        
+    elif profile == "TREND_MEDIUM":
+        if not STATE.get("tp1_done") and pnl_pct >= tp1:
+            close_qty = safe_qty(STATE["qty"] * 0.5)  # إغلاق 50% عند TP1
+            if close_qty > 0:
+                close_side = "sell" if side == "long" else "buy"
+                if MODE_LIVE and EXECUTE_ORDERS and not DRY_RUN:
+                    try:
+                        params = exchange_specific_params(close_side, is_close=True)
+                        ex.create_order(SYMBOL, "market", close_side, close_qty, None, params)
+                        log_g(f"🎯 TREND_MEDIUM TP1 | {tp1}% | closed 50%")
+                        STATE["qty"] = safe_qty(STATE["qty"] - close_qty)
+                        STATE["tp1_done"] = True
+                    except Exception as e:
+                        log_e(f"❌ TREND_MEDIUM TP1 close failed: {e}")
+                        
+        elif STATE.get("tp1_done") and not STATE.get("tp2_done") and pnl_pct >= tp2:
+            close_market_strict(f"TREND_MEDIUM TP2: {tp2}%")
+            return
+            
+    elif profile == "TREND_STRONG":
+        if not STATE.get("tp1_done") and pnl_pct >= tp1:
+            close_qty = safe_qty(STATE["qty"] * 0.3)  # إغلاق 30% عند TP1
+            if close_qty > 0:
+                close_side = "sell" if side == "long" else "buy"
+                if MODE_LIVE and EXECUTE_ORDERS and not DRY_RUN:
+                    try:
+                        params = exchange_specific_params(close_side, is_close=True)
+                        ex.create_order(SYMBOL, "market", close_side, close_qty, None, params)
+                        log_g(f"🎯 TREND_STRONG TP1 | {tp1}% | closed 30%")
+                        STATE["qty"] = safe_qty(STATE["qty"] - close_qty)
+                        STATE["tp1_done"] = True
+                    except Exception as e:
+                        log_e(f"❌ TREND_STRONG TP1 close failed: {e}")
+                        
+        elif STATE.get("tp1_done") and not STATE.get("tp2_done") and pnl_pct >= tp2:
+            close_qty = safe_qty(STATE["qty"] * 0.3)  # إغلاق 30% أخرى عند TP2
+            if close_qty > 0:
+                close_side = "sell" if side == "long" else "buy"
+                if MODE_LIVE and EXECUTE_ORDERS and not DRY_RUN:
+                    try:
+                        params = exchange_specific_params(close_side, is_close=True)
+                        ex.create_order(SYMBOL, "market", close_side, close_qty, None, params)
+                        log_g(f"🎯 TREND_STRONG TP2 | {tp2}% | closed 30%")
+                        STATE["qty"] = safe_qty(STATE["qty"] - close_qty)
+                        STATE["tp2_done"] = True
+                    except Exception as e:
+                        log_e(f"❌ TREND_STRONG TP2 close failed: {e})
+                        
+        elif STATE.get("tp2_done") and not STATE.get("tp3_done") and pnl_pct >= tp3:
+            close_market_strict(f"TREND_STRONG TP3: {tp3}%")
+            return
+
+    STATE["bars"] += 1
+
 def manage_after_entry_enhanced(df, ind, info):
     """إدارة محسنة للصفقات بناءً على نوعها"""
     if not STATE["open"] or STATE["qty"] <= 0:
@@ -3491,32 +3716,44 @@ def trade_loop_enhanced_with_smart_patch():
             # ===== تنفيذ الدخول إن وجد إشارة نهائية =====
             if final_signal and not STATE["open"]:
                 allow_wait, wait_reason = wait_gate_allow(df, info)
-                if not allow_wait:
+
+                # نحسب قوة المجلس هنا
+                max_score = max(council_data.get("score_b", 0.0), council_data.get("score_s", 0.0))
+                max_votes = max(council_data.get("b", 0), council_data.get("s", 0))
+                conf = council_data.get("confidence", 0.0)
+
+                strong_council = (
+                    conf >= COUNCIL_STRONG_ENTRY_CONF and
+                    max_score >= COUNCIL_STRONG_ENTRY_SCORE and
+                    max_votes >= COUNCIL_STRONG_MIN_VOTES
+                )
+
+                # هل إشارة الـ RF الحالية في نفس اتجاه الانتظار؟
+                rf_side = "buy" if info.get("long") else ("sell" if info.get("short") else None)
+                wait_side = wait_for_next_signal_side
+
+                override_wait = False
+                if not allow_wait and strong_council and rf_side and wait_side and rf_side == wait_side:
+                    override_wait = True
+                    log_i(f"🏆 COUNCIL STRONG ENTRY override wait-for-next-RF({wait_side}) "
+                          f"| score={max_score:.1f} votes={max_votes} conf={conf:.2f}")
+
+                if not allow_wait and not override_wait:
                     log_i(f"⏳ Waiting: {wait_reason}")
                 else:
                     qty = compute_size(bal, px or info["price"])
                     if qty > 0:
-                        # 🆕 تخزين مصدر الدخول والرصيد والأسباب للّوج
-                        STATE["last_entry_source"] = entry_source or "RF+SMC"
+                        # حفظ مصدر الدخول للأغراض اللوج
+                        entry_source = "COUNCIL_STRONG" if override_wait else "RF+SMC"
+                        STATE["last_entry_source"] = entry_source
                         STATE["last_entry_reasons"] = " | ".join(entry_reasons) if entry_reasons else ""
                         STATE["last_balance"] = float(bal or 0.0)
 
-                        ok = open_market(final_signal, qty, px or info["price"])
+                        ok = open_market_enhanced(final_signal, qty, px or info["price"])
                         if ok:
-                            # 🧠 تعليم إن الصفقة دي تحت إدارة المجلس (لو مصدر الدخول مجلس)
-                            STATE["council_controlled"] = (entry_source == "COUNCIL_STRONG")
-                            if STATE["council_controlled"]:
-                                log_g("🧠 COUNCIL TRADE → إدارة ترند ذكية + TP متعدد + إغلاق صارم")
-
                             wait_for_next_signal_side = None
-                            log_i(
-                                f"🎯 SMART EXECUTION: {final_signal.upper()} "
-                                f"| src={entry_source or 'RF'} "
-                                f"| Trend={trend_ctx.trend} "
-                                f"| Reasons: {' | '.join(entry_reasons)}"
-                            )
-
-                            # تسجيل تداول السكالب لو مفعّل
+                            log_i(f"🎯 SMART EXECUTION: {final_signal.upper()} | src={entry_source} | "
+                                  f"Reasons: {' | '.join(entry_reasons)}")
                             if SCALP_MODE:
                                 zero_scalper.record_trade(current_time, True)
                     else:
@@ -3524,14 +3761,14 @@ def trade_loop_enhanced_with_smart_patch():
 
             # إدارة الصفقة المفتوحة
             if STATE["open"]:
-                manage_after_entry_enhanced_with_smart_patch(df, ind, {
+                manage_trade_by_profile(df, ind, {
                     "price": px or info["price"], 
                     "bm": snap["bm"],
                     "flow": snap["flow"],
                     "trend_ctx": trend_ctx,
                     "vol_ok": vol_ok,
                     **info
-                }, performance_stats)
+                })
             
             # Legacy Logging
             if LOG_LEGACY:
