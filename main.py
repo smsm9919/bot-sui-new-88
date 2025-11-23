@@ -1117,7 +1117,7 @@ def fetch_ohlcv(limit=600):
 
 def price_now():
     try:
-        t = with_retry(lambda: ex.fetch_ticker(SYMBOL)
+        t = with_retry(lambda: ex.fetch_ticker(SYMBOL))
         return t.get("last") or t.get("close")
     except Exception: return None
 
@@ -1643,7 +1643,7 @@ def compute_momentum_indicators(df):
     }
 
 def compute_trend_strength(df, ind):
-    close = df['close'].ast(float)
+    close = df['close'].astype(float)
     adx = safe_get(ind, 'adx', 0)
     plus_di = safe_get(ind, 'plus_di', 0)
     minus_di = safe_get(ind, 'minus_di', 0)
@@ -3040,44 +3040,23 @@ STATE = {
 }
 compound_pnl = 0.0
 wait_for_next_signal_side = None
-wait_for_next_bars = 0       # عدد الشموع اللي هنستناها بعد الإغلاق
-WAIT_BARS_AFTER_CLOSE = 1    # تقدر تخليها 2 لو عايز تبريد أكتر
 
 # =================== WAIT FOR NEXT SIGNAL ===================
 def _arm_wait_after_close(prev_side):
-    global wait_for_next_signal_side, wait_for_next_bars
-    wait_for_next_signal_side = "sell" if prev_side == "long" else ("buy" if prev_side == "short" else None)
-    wait_for_next_bars = WAIT_BARS_AFTER_CLOSE
-    log_i(f"🛑 WAIT FOR NEXT SIGNAL: {wait_for_next_signal_side} (bars={wait_for_next_bars})")
+    global wait_for_next_signal_side
+    wait_for_next_signal_side = "sell" if prev_side=="long" else ("buy" if prev_side=="short" else None)
+    log_i(f"🛑 WAIT FOR NEXT SIGNAL: {wait_for_next_signal_side}")
 
 def wait_gate_allow(df, info):
-    global wait_for_next_signal_side, wait_for_next_bars
-
-    # لو مفيش انتظار مفعَّل → ادخل عادي
-    if wait_for_next_signal_side is None:
+    if wait_for_next_signal_side is None: 
         return True, ""
-
-    # لو RF عطَى الإشارة اللي مستنيينها → افتح البوابة وامسح الانتظار
-    need = (
-        (wait_for_next_signal_side == "buy"  and info.get("long")) or
-        (wait_for_next_signal_side == "sell" and info.get("short"))
-    )
+    
+    bar_ts = int(info.get("time") or 0)
+    need = (wait_for_next_signal_side=="buy" and info.get("long")) or (wait_for_next_signal_side=="sell" and info.get("short"))
+    
     if need:
-        log_i(f"✅ WAIT GATE RELEASED by RF({wait_for_next_signal_side})")
-        wait_for_next_signal_side = None
-        wait_for_next_bars = 0
         return True, ""
-
-    # لسه مفيش RF: شغّل عدّاد الشموع
-    if wait_for_next_bars > 0:
-        wait_for_next_bars -= 1
-        return False, f"wait-for-next-RF({wait_for_next_signal_side}) bars_left={wait_for_next_bars}"
-
-    # خلّصنا عدد الشموع المسموح بيها → افتح البوابة أوتوماتيك
-    log_i(f"⏩ WAIT GATE AUTO-RELEASE (no RF, side={wait_for_next_signal_side})")
-    wait_for_next_signal_side = None
-    wait_for_next_bars = 0
-    return True, ""
+    return False, f"wait-for-next-RF({wait_for_next_signal_side})"
 
 # =================== ORDERS ===================
 def _read_position():
