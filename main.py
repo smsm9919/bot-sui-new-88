@@ -469,6 +469,10 @@ OTC_EXIT_MIN_PNL_PCT   = 0.8  # أقل ربح (%) يسمح بالخروج بسب
 VWAP_SCALP_BAND_BPS = 8.0     # قريب من VWAP ⇒ سكالب
 VWAP_TREND_BAND_BPS = 20.0    # بعيد عن VWAP ⇒ ترند
 
+# ===== Trend Mode Tightening =====
+TREND_MODE_ADX_MIN = 18.0      # أقل ADX نسمّيه ترند
+TREND_MODE_DI_SPREAD_MIN = 5.0 # أقل فرق بين DI+ و DI-
+
 # =================== SETTINGS ===================
 SYMBOL     = os.getenv("SYMBOL", "SUI/USDT:USDT")
 INTERVAL   = os.getenv("INTERVAL", "15m")
@@ -996,6 +1000,26 @@ def print_position_snapshot(reason="OPEN", color=None):
             log_i(f"{BOLD}🟡 TP MEDIUM:{RESET} {tp_levels[0]}% (50%) → {tp_levels[1]}% (50%) | {progress} | {tp_reason}")
         elif tp_profile == "strong":
             log_i(f"{BOLD}🟢 TP STRONG:{RESET} {tp_levels[0]}% (30%) → {tp_levels[1]}% (30%) → {tp_levels[2]}% (40%) | {progress} | {tp_reason}")
+        
+        # معلومات الترند المحسنة
+        try:
+            df = fetch_ohlcv(limit=50)
+            trend_info = decide_strategy_mode(df, ind)
+            adx = safe_get(ind, 'adx', 0) if ind else 0
+            di_plus = safe_get(ind, 'plus_di', 0) if ind else 0
+            di_minus = safe_get(ind, 'minus_di', 0) if ind else 0
+            di_spread = abs(di_plus - di_minus)
+            
+            vwap_price = compute_vwap(df)
+            current_price = price_now()
+            vwap_diff_bps = 0
+            if vwap_price and current_price:
+                vwap_diff_bps = abs(current_price - vwap_price) / vwap_price * 10000.0
+                
+            log_i(f"{BOLD}TREND ANALYSIS:{RESET} ADX={adx:.1f} DI_spread={di_spread:.1f} VWAP_diff={vwap_diff_bps:.1f}bps")
+            log_i(f"{BOLD}MODE DECISION:{RESET} {trend_info['mode'].upper()} - {trend_info['why']}")
+        except Exception as e:
+            log_w(f"Trend analysis error in snapshot: {e}")
         
         log_i("—"*72)
     except Exception as e:
@@ -1758,47 +1782,70 @@ def rsi_trend_ctx(df, rsi_len=14, ma_len=9):
         "in_chop": in_chop,
     }
 
-def classify_trade_mode(df, ind):
+def decide_strategy_mode(df, adx=None, di_plus=None, di_minus=None, rsi_ctx=None):
     """
     يقرر هل الصفقة دي SCALP ولا TREND قبل الدخول.
-    يعتمد على: ADX / DI / RSI / تذبذب السوق.
-    يرجّع dict: {mode: 'scalp'|'trend'|'chop', why: '...'}
+    يعتمد على: ADX / DI / RSI / VWAP.
+    يرجّع dict: {mode: 'scalp'|'trend', why: '...'}
     """
-    adx = safe_get(ind, "adx", 0.0)
-    plus_di = safe_get(ind, "plus_di", 0.0)
-    minus_di = safe_get(ind, "minus_di", 0.0)
-
-    di_spread = abs(plus_di - minus_di)
-
-    rctx = rsi_trend_ctx(df)
-    rsi_trend = rctx["trend"]
-    in_chop = rctx["in_chop"]
-
+    if adx is None or di_plus is None or di_minus is None:
+        ind = compute_indicators(df)
+        adx = safe_get(ind, "adx", 0.0)
+        di_plus = safe_get(ind, "plus_di", 0.0)
+        di_minus = safe_get(ind, "minus_di", 0.0)
+    
+    di_spread = abs(di_plus - di_minus)
+    
+    if rsi_ctx is None:
+        rsi_ctx = rsi_ma_context(df)
+    
+    rsi_trend = rsi_ctx.get("trendZ", "none")
+    in_chop = rsi_ctx.get("in_chop", True)
+    
+    # حساب VWAP والمسافة منه
+    vwap_price = compute_vwap(df)
+    current_price = float(df["close"].iloc[-1]) if len(df) > 0 else 0
+    vwap_diff_bps = 0
+    
+    if vwap_price and current_price:
+        vwap_diff_bps = abs(current_price - vwap_price) / vwap_price * 10000.0
+    
+    # 🎯 شروط الترند الحقيقي الصارمة
     strong_trend = (
-        adx >= TREND_ADX_MIN and
-        di_spread >= TREND_DI_SPREAD_MIN
-    ) or (
-        rsi_trend in ("bull", "bear") and not in_chop
+        adx >= TREND_MODE_ADX_MIN and
+        di_spread >= TREND_MODE_DI_SPREAD_MIN and
+        vwap_diff_bps >= VWAP_TREND_BAND_BPS and  # بعيد عن VWAP
+        not in_chop  # ليس في نطاق تذبذب
     )
-
-    # 1) سوق تذبذب → سكالب بس / حذر
-    if adx < CHOP_ADX_MAX or in_chop:
-        return {
-            "mode": "scalp",
-            "why": f"chop_or_low_adx adx={adx:.1f} di_spread={di_spread:.1f} chop={in_chop}"
-        }
-
-    # 2) ترند قوي وواضح
+    
+    # 1) ترند حقيقي قوي
     if strong_trend:
         return {
             "mode": "trend",
-            "why": f"strong_trend adx={adx:.1f} di_spread={di_spread:.1f} rsi_trend={rsi_trend}"
+            "why": f"strong_trend adx={adx:.1f} di_spread={di_spread:.1f} vwap_far={vwap_diff_bps:.1f}bps"
         }
-
-    # 3) منطقة وسطية → نعتبرها سكالب محسّن
+    
+    # 2) سوق تذبذب أو ترند ضعيف → سكالب
+    if adx < TREND_MODE_ADX_MIN or di_spread < TREND_MODE_DI_SPREAD_MIN or in_chop:
+        reasons = []
+        if adx < TREND_MODE_ADX_MIN:
+            reasons.append(f"adx_low({adx:.1f})")
+        if di_spread < TREND_MODE_DI_SPREAD_MIN:
+            reasons.append(f"di_spread_low({di_spread:.1f})")
+        if in_chop:
+            reasons.append("rsi_chop")
+        if vwap_diff_bps < VWAP_TREND_BAND_BPS:
+            reasons.append(f"near_vwap({vwap_diff_bps:.1f}bps)")
+            
+        return {
+            "mode": "scalp",
+            "why": f"weak_trend {'+'.join(reasons)}"
+        }
+    
+    # 3) الإفتراضي سكالب (حماية)
     return {
         "mode": "scalp",
-        "why": f"default_scalp adx={adx:.1f} di_spread={di_spread:.1f} rsi_trend={rsi_trend}"
+        "why": f"default_scalp adx={adx:.1f} di_spread={di_spread:.1f} vwap={vwap_diff_bps:.1f}bps"
     }
 
 # =================== CANDLES MODULE ===================
@@ -2040,28 +2087,6 @@ def golden_zone_check(df, ind=None, side_hint=None):
     except Exception as e:
         log_w(f"golden_zone_check error: {e}")
         return {"ok": False, "score": 0.0, "zone": None, "reasons": [f"error: {str(e)}"]}
-
-def decide_strategy_mode(df, adx=None, di_plus=None, di_minus=None, rsi_ctx=None):
-    if adx is None or di_plus is None or di_minus is None:
-        ind = compute_indicators(df)
-        adx = safe_get(ind, 'adx', 0)
-        di_plus = safe_get(ind, 'plus_di', 0)
-        di_minus = safe_get(ind, 'minus_di', 0)
-    
-    if rsi_ctx is None:
-        rsi_ctx = rsi_ma_context(df)
-    
-    di_spread = abs(di_plus - di_minus)
-    
-    strong_trend = (
-        (adx >= ADX_TREND_MIN and di_spread >= DI_SPREAD_TREND) or
-        (rsi_ctx["trendZ"] in ("bull", "bear") and not rsi_ctx["in_chop"])
-    )
-    
-    mode = "trend" if strong_trend else "scalp"
-    why = "adx/di_trend" if adx >= ADX_TREND_MIN else ("rsi_trendZ" if rsi_ctx["trendZ"] != "none" else "scalp_default")
-    
-    return {"mode": mode, "why": why}
 
 # =================== COUNCIL PROFIT PROFILE SYSTEM ===================
 def build_profit_profile_from_council(mode, council, gz=None, trend_strength=None, flow_ctx=None):
@@ -2848,49 +2873,22 @@ def open_market_enhanced(side, qty, price):
     df = fetch_ohlcv(limit=200)
     ind = compute_indicators(df)
 
-    # --- تحديد المود (scalp / trend) حسب الدالة الحالية ---
-    mode_info = classify_trade_mode(df, ind)
+    # --- تحديد المود (scalp / trend) حسب الشروط الصارمة ---
+    mode_info = decide_strategy_mode(df, ind)
     mode = mode_info.get("mode", "scalp")
     why_mode = mode_info.get("why", "classify_trade_mode")
 
-    # --- تقوية قرار المود بناءً على قوة الترند ---
-    try:
-        trend_info = compute_trend_strength(df, ind)
-        trend_strength = trend_info.get("strength", "flat")
-        adx_val = safe_get(ind, "adx", 0.0)
-        plus_di = safe_get(ind, "plus_di", 0.0)
-        minus_di = safe_get(ind, "minus_di", 0.0)
-        di_spread = abs(plus_di - minus_di)
+    # 📊 لوج تفصيلي لسبب تحديد المود
+    log_i(f"🔍 MODE DECISION: {mode.upper()} | {why_mode}")
 
-        rsi_ctx_local = rsi_ma_context(df)
-        rsi_trendz = rsi_ctx_local.get("trendZ", "none")
-
-        council_preview = super_council_ai_enhanced(df)
-        council_conf = council_preview.get("confidence", 0.0)
-        council_score = max(council_preview.get("score_b", 0.0),
-                           council_preview.get("score_s", 0.0))
-
-        strong_trend = trend_strength in ["strong", "very_strong"]
-        di_ok = di_spread >= 10.0
-        adx_ok = adx_val >= 20.0
-        rsi_ok = rsi_trendz in ["bull", "bear"]
-        council_ok = (council_conf >= 0.6 and council_score >= 15.0)
-
-        if strong_trend and adx_ok and di_ok and rsi_ok and council_ok and mode != "trend":
-            log_i("🧠 PROMOTE → TRADE MODE: scalp → TREND "
-                  f"(trend={trend_strength}, adx={adx_val:.1f}, di_spread={di_spread:.1f}, "
-                  f"rsi_trend={rsi_trendz}, council_score={council_score:.1f}, conf={council_conf:.2f})")
-            mode = "trend"
-            why_mode += " | promote_strong_trend"
-    except Exception as e:
-        log_w(f"trade_mode promotion check error: {e}")
-        trend_info = compute_trend_strength(df, ind)
+    # 🚫 منع الترقية التلقائية للسكالب → ترند (نحافظ على الصرامة)
+    # لا توجد ترقية تلقائية - نلتزم بقرار الدالة الصارم
 
     # ✅ نحسب بيانات المجلس الحقيقية للصفقة
     council_data = super_council_ai_enhanced(df)
 
     # ✅ نحدد Profit Profile المناسب
-    profit_profile = classify_profit_profile(df, ind, council_data, trend_info, mode)
+    profit_profile = classify_profit_profile(df, ind, council_data, compute_trend_strength(df, ind), mode)
 
     # إعدادات الإدارة المبنية على الـ profile الجديد
     management_config = {
@@ -3040,23 +3038,44 @@ STATE = {
 }
 compound_pnl = 0.0
 wait_for_next_signal_side = None
+wait_for_next_bars = 0       # عدد الشموع اللي هنستناها بعد الإغلاق
+WAIT_BARS_AFTER_CLOSE = 1    # تقدر تخليها 2 لو عايز تبريد أكتر
 
 # =================== WAIT FOR NEXT SIGNAL ===================
 def _arm_wait_after_close(prev_side):
-    global wait_for_next_signal_side
-    wait_for_next_signal_side = "sell" if prev_side=="long" else ("buy" if prev_side=="short" else None)
-    log_i(f"🛑 WAIT FOR NEXT SIGNAL: {wait_for_next_signal_side}")
+    global wait_for_next_signal_side, wait_for_next_bars
+    wait_for_next_signal_side = "sell" if prev_side == "long" else ("buy" if prev_side == "short" else None)
+    wait_for_next_bars = WAIT_BARS_AFTER_CLOSE
+    log_i(f"🛑 WAIT FOR NEXT SIGNAL: {wait_for_next_signal_side} (bars={wait_for_next_bars})")
 
 def wait_gate_allow(df, info):
-    if wait_for_next_signal_side is None: 
+    global wait_for_next_signal_side, wait_for_next_bars
+
+    # لو مفيش انتظار مفعَّل → ادخل عادي
+    if wait_for_next_signal_side is None:
         return True, ""
-    
-    bar_ts = int(info.get("time") or 0)
-    need = (wait_for_next_signal_side=="buy" and info.get("long")) or (wait_for_next_signal_side=="sell" and info.get("short"))
-    
+
+    # لو RF عطَى الإشارة اللي مستنيينها → افتح البوابة وامسح الانتظار
+    need = (
+        (wait_for_next_signal_side == "buy"  and info.get("long")) or
+        (wait_for_next_signal_side == "sell" and info.get("short"))
+    )
     if need:
+        log_i(f"✅ WAIT GATE RELEASED by RF({wait_for_next_signal_side})")
+        wait_for_next_signal_side = None
+        wait_for_next_bars = 0
         return True, ""
-    return False, f"wait-for-next-RF({wait_for_next_signal_side})"
+
+    # لسه مفيش RF: شغّل عدّاد الشموع
+    if wait_for_next_bars > 0:
+        wait_for_next_bars -= 1
+        return False, f"wait-for-next-RF({wait_for_next_signal_side}) bars_left={wait_for_next_bars}"
+
+    # خلّصنا عدد الشموع المسموح بيها → افتح البوابة أوتوماتيك
+    log_i(f"⏩ WAIT GATE AUTO-RELEASE (no RF, side={wait_for_next_signal_side})")
+    wait_for_next_signal_side = None
+    wait_for_next_bars = 0
+    return True, ""
 
 # =================== ORDERS ===================
 def _read_position():
@@ -4030,6 +4049,10 @@ def home():
 
 @app.route("/metrics")
 def metrics():
+    df = fetch_ohlcv(limit=50)
+    ind = compute_indicators(df)
+    trend_info = decide_strategy_mode(df, ind)
+    
     return jsonify({
         "exchange": EXCHANGE_NAME,
         "symbol": SYMBOL, "interval": INTERVAL, "mode": "live" if MODE_LIVE else "paper",
@@ -4045,11 +4068,25 @@ def metrics():
         "tp_profile_system": True,
         "council_strong_entry": COUNCIL_STRONG_ENTRY,
         "otc_enabled": OTC_ENABLED,
-        "vwap_context": True
+        "vwap_context": True,
+        "trend_analysis": {
+            "mode": trend_info["mode"],
+            "reason": trend_info["why"],
+            "adx": safe_get(ind, "adx", 0),
+            "di_spread": abs(safe_get(ind, "plus_di", 0) - safe_get(ind, "minus_di", 0)),
+            "trend_thresholds": {
+                "min_adx": TREND_MODE_ADX_MIN,
+                "min_di_spread": TREND_MODE_DI_SPREAD_MIN
+            }
+        }
     })
 
 @app.route("/health")
 def health():
+    df = fetch_ohlcv(limit=50)
+    ind = compute_indicators(df)
+    trend_info = decide_strategy_mode(df, ind)
+    
     return jsonify({
         "ok": True, "exchange": EXCHANGE_NAME, "mode": "live" if MODE_LIVE else "paper",
         "open": STATE["open"], "side": STATE["side"], "qty": STATE["qty"],
@@ -4062,7 +4099,11 @@ def health():
         "tp_profile_system": True,
         "council_strong_entry": COUNCIL_STRONG_ENTRY,
         "otc_enabled": OTC_ENABLED,
-        "vwap_context": True
+        "vwap_context": True,
+        "trend_analysis": {
+            "mode": trend_info["mode"],
+            "reason": trend_info["why"]
+        }
     }), 200
 
 # ============================================
@@ -4110,6 +4151,10 @@ def smart_stats():
             "enabled": True,
             "scalp_band_bps": VWAP_SCALP_BAND_BPS,
             "trend_band_bps": VWAP_TREND_BAND_BPS
+        },
+        "trend_mode_tightening": {
+            "min_adx": TREND_MODE_ADX_MIN,
+            "min_di_spread": TREND_MODE_DI_SPREAD_MIN
         }
     })
 
@@ -4155,6 +4200,7 @@ def verify_execution_environment():
     print(f"🎯 GOLDEN ENTRY: score={GOLDEN_ENTRY_SCORE} | ADX={GOLDEN_ENTRY_ADX}", flush=True)
     print(f"🚀 SMART PATCH: OB/FVG + SMC + Golden Zones + Volume Confirmation + SMART PROFIT AI + TP PROFILE + COUNCIL STRONG ENTRY + OTC + VWAP", flush=True)
     print(f"🧠 SMART PROFIT AI: Scalp + Trend + Volume Analysis + TP Profile (1→2→3) + Council Strong Entry + OTC + VWAP Activated", flush=True)
+    print(f"🔒 TREND MODE TIGHTENING: ADX ≥ {TREND_MODE_ADX_MIN} | DI Spread ≥ {TREND_MODE_DI_SPREAD_MIN} | Far from VWAP", flush=True)
 
 if __name__ == "__main__":
     verify_execution_environment()
@@ -4166,5 +4212,6 @@ if __name__ == "__main__":
     log_i(f"🚀 SUI ULTRA PRO AI BOT STARTED - {BOT_VERSION}")
     log_i(f"🎯 SYMBOL: {SYMBOL} | INTERVAL: {INTERVAL} | LEVERAGE: {LEVERAGE}x")
     log_i(f"💡 SMART PATCH ACTIVATED: Golden Zones + SMC + OB/FVG + Zero Reversal Scalping + SMART PROFIT AI + TP PROFILE + COUNCIL STRONG ENTRY + OTC + VWAP")
+    log_i(f"🔒 TREND MODE TIGHTENING: ADX ≥ {TREND_MODE_ADX_MIN} | DI Spread ≥ {TREND_MODE_DI_SPREAD_MIN} | Far from VWAP")
     
     app.run(host="0.0.0.0", port=PORT, debug=False)
