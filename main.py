@@ -33,6 +33,9 @@ except Exception:
 #  SMART PATCH — HQ Trading Intelligence Engine
 # ============================================
 
+# حالة RF B&S زي CondIni في Pine
+RF_COND_STATE = 0  # 1 = آخر حالة long ، -1 = آخر حالة short ، 0 = لسه مفيش
+
 # ---------- Z-SCORE بدون SciPy ----------
 def simple_zscore(values, window=50):
     try:
@@ -476,7 +479,7 @@ RF_SOURCE = "close"
 RF_PERIOD = int(os.getenv("RF_PERIOD", 18))
 RF_MULT   = float(os.getenv("RF_MULT", 3.0))
 RF_LIVE_ONLY = True
-RF_HYST_BPS  = 6.0
+RF_HYST_BPS  = 0.0  # إزالة الـ Hysteresis للمطابقة التامة مع TradingView
 
 # Indicators
 RSI_LEN = 14
@@ -666,7 +669,7 @@ TREND_STRONG_TH    = 4
 # ============================================
 #  COUNCIL STRONG ENTRY CONFIG
 # ============================================
-COUNCIL_STRONG_ENTRY   = True    # تفعيل دخول مجلس الإدارة في مناطق قوية
+COUNCIL_STRONG_ENTRY   = False   # تعطيل دخول مجلس الإدارة في مناطق قوية - التركيز على RF فقط
 COUNCIL_STRONG_CONF    = 0.68    # حد أدنى للثقة
 COUNCIL_STRONG_SCORE   = 20.0    # مجموع score_b + score_s
 COUNCIL_STRONG_VOTES   = 10      # عدد أصوات BUY أو SELL في اتجاه واحد
@@ -742,6 +745,7 @@ def log_i(msg): print(f"ℹ️ {msg}", flush=True)
 def log_g(msg): print(f"✅ {msg}", flush=True)
 def log_w(msg): print(f"🟨 {msg}", flush=True)
 def log_e(msg): print(f"❌ {msg}", flush=True)
+def log_y(msg): print(f"🟡 {msg}", flush=True)
 
 def log_banner(text): print(f"\n{'—'*12} {text} {'—'*12}\n", flush=True)
 
@@ -1104,7 +1108,7 @@ def fetch_ohlcv(limit=600):
 
 def price_now():
     try:
-        t = with_retry(lambda: ex.fetch_ticker(SYMBOL))
+        t = with_retry(lambda: ex.fetch_ticker(SYMBOL)
         return t.get("last") or t.get("close")
     except Exception: return None
 
@@ -2886,24 +2890,21 @@ def open_market_enhanced(side, qty, price):
             "opened_at": int(time.time())
         })
 
-        # لوج ملوّن واضح
-        profile_label = profit_profile.get("label", "")
-        if profile_label == "TREND_STRONG":
-            profile_color = "🟢"
-        elif profile_label == "TREND_MEDIUM":
-            profile_color = "🟡"
-        else:
-            profile_color = "🔵"
-
-        tp_msg = f"TPs: {profit_profile['tp1_pct']}%"
-        if profit_profile.get("tp2_pct"):
-            tp_msg += f" → {profit_profile['tp2_pct']}%"
-        if profit_profile.get("tp3_pct"):
-            tp_msg += f" → {profit_profile['tp3_pct']}%"
-
+        # 🔔 LOG: صفقة جديدة مفتوحة (باي / سيل + سكالب / ترند)
+        lamp = "🟩 LONG" if trade_side == "long" else "🟥 SHORT"
         log_g(
-            f"{profile_color} COUNCIL TRADE OPENED | {side.upper()} {qty:.4f} @ {price:.6f} "
-            f"| {mode.upper()} | {profile_label} | {tp_msg}"
+            f"{lamp} COUNCIL TRADE OPENED | "
+            f"MODE={mode.upper()} | PROFILE={profit_profile['label']} | "
+            f"entry={_fmt(price)} | qty={_fmt(qty,4)} | "
+            f"ADX={safe_get(ind, 'adx', 0):.1f}"
+        )
+        log_i(
+            f"🧾 DETAILS | why={why_mode} | "
+            f"tp1={management_config['tp1_pct']}% "
+            f"tp2={management_config.get('tp2_pct')}% "
+            f"tp3={management_config.get('tp3_pct')}% | "
+            f"trail_start={management_config['trail_activate_pct']}% "
+            f"profile_desc={management_config['profile_desc']}"
         )
         
         print_position_snapshot(reason=f"OPEN - {mode.upper()}[{profit_profile['label']}]")
@@ -2961,26 +2962,96 @@ def _rng_filter(src: pd.Series, rsize: pd.Series):
 def _ema(s, n): return s.ewm(span=n, adjust=False).mean()
 
 def rf_signal_live(df: pd.DataFrame):
+    """
+    Range Filter B&S Signals — نسخة مطابقة لـ سكربت Pine اللي المستخدم أرسله
+    longCondition / shortCondition + CondIni
+    """
+    global RF_COND_STATE
+
     if len(df) < RF_PERIOD + 3:
-        i = -1
-        price = float(df["close"].iloc[i]) if len(df) else None
-        return {"time": int(df["time"].iloc[i]) if len(df) else int(time.time()*1000),
-                "price": price or 0.0, "long": False, "short": False,
-                "filter": price or 0.0, "hi": price or 0.0, "lo": price or 0.0}
+        price = float(df["close"].iloc[-1])
+        return {
+            "time": int(df["time"].iloc[-1]),
+            "price": price,
+            "long": False,
+            "short": False,
+            "filter": price,
+            "hi": price,
+            "lo": price,
+        }
+
+    # نفس rng_src / period / qty
     src = df[RF_SOURCE].astype(float)
     hi, lo, filt = _rng_filter(src, _rng_size(src, RF_MULT, RF_PERIOD))
-    def _bps(a,b):
-        try: return abs((a-b)/b)*10000.0
-        except Exception: return 0.0
-    p_now = float(src.iloc[-1]); p_prev = float(src.iloc[-2])
-    f_now = float(filt.iloc[-1]); f_prev = float(filt.iloc[-2])
-    long_flip  = (p_prev <= f_prev and p_now > f_now and _bps(p_now, f_now) >= RF_HYST_BPS)
-    short_flip = (p_prev >= f_prev and p_now < f_now and _bps(p_now, f_now) >= RF_HYST_BPS)
+
+    # حساب fdir (اتجاه الفلتر)
+    fdir = 0.0
+    for i in range(1, len(filt)):
+        if filt.iloc[i] > filt.iloc[i - 1]:
+            fdir = 1.0
+        elif filt.iloc[i] < filt.iloc[i - 1]:
+            fdir = -1.0
+
+    upward = (fdir == 1.0)
+    downward = (fdir == -1.0)
+
+    # آخر شمعة
+    p_now = float(src.iloc[-1])
+    p_prev = float(src.iloc[-2])
+    f_now = float(filt.iloc[-1])
+
+    # longCond + shortCond (نفس كود الباين)
+    longCond = (
+        (p_now > f_now and p_now > p_prev and upward) or
+        (p_now > f_now and p_now < p_prev and upward)
+    )
+
+    shortCond = (
+        (p_now < f_now and p_now < p_prev and downward) or
+        (p_now < f_now and p_now > p_prev and downward)
+    )
+
+    prev_state = RF_COND_STATE
+
+    if longCond:
+        RF_COND_STATE = 1
+    elif shortCond:
+        RF_COND_STATE = -1
+
+    long_signal = bool(longCond and prev_state == -1)
+    short_signal = bool(shortCond and prev_state == 1)
+
     return {
-        "time": int(df["time"].iloc[-1]), "price": p_now,
-        "long": bool(long_flip), "short": bool(short_flip),
-        "filter": f_now, "hi": float(hi.iloc[-1]), "lo": float(lo.iloc[-1])
+        "time": int(df["time"].iloc[-1]),
+        "price": p_now,
+        "long": long_signal,
+        "short": short_signal,
+        "filter": f_now,
+        "hi": float(hi.iloc[-1]),
+        "lo": float(lo.iloc[-1]),
     }
+
+# =================== ALLOW TRADE IN LOW ADX FUNCTION ===================
+def allow_trade_in_low_adx(ind, council_data, candle_data):
+    """
+    منطق Override يسمح للبوت يدخل حتى لو ADX ضعيف (سوق نايم)
+    """
+    adx_val = ind.get("adx", 0)
+
+    # شرط إن السوق نايم فعلاً
+    if adx_val >= 17:
+        return True  # مفيش مشكلة
+
+    # لو ADX < 17، نسمح فقط لو في سبب قوي للدخول
+    golden_ok = council_data.get("golden_zone", False)
+    strong_candle = candle_data.get("strong_bullish") or candle_data.get("strong_bearish")
+    volume_spike = ind.get("volume", 0) > ind.get("vol_ma20", 0) * 1.4
+    trendZ = council_data.get("trendZ_score", 0) >= 1.2  # اتجاه واضح رغم ADX ضعيف
+
+    if golden_ok or strong_candle or volume_spike or trendZ:
+        return True  # في سبب قوي يسمح بالدخول رغم ADX ضعيف
+
+    return False
 
 # =================== STATE ===================
 STATE = {
@@ -3130,7 +3201,7 @@ def manage_trade_by_profile(df, ind, info):
         if not STATE.get("tp1_done") and pnl_pct >= tp1:
             close_qty = safe_qty(STATE["qty"] * 0.3)  # إغلاق 30% عند TP1
             if close_qty > 0:
-                close_side = "sell" if side == "long" else "buy"
+                close_side = "sell" if STATE["side"] == "long" else "buy"
                 if MODE_LIVE and EXECUTE_ORDERS and not DRY_RUN:
                     try:
                         params = exchange_specific_params(close_side, is_close=True)
@@ -3144,7 +3215,7 @@ def manage_trade_by_profile(df, ind, info):
         elif STATE.get("tp1_done") and not STATE.get("tp2_done") and pnl_pct >= tp2:
             close_qty = safe_qty(STATE["qty"] * 0.3)  # إغلاق 30% أخرى عند TP2
             if close_qty > 0:
-                close_side = "sell" if side == "long" else "buy"
+                close_side = "sell" if STATE["side"] == "long" else "buy"
                 if MODE_LIVE and EXECUTE_ORDERS and not DRY_RUN:
                     try:
                         params = exchange_specific_params(close_side, is_close=True)
@@ -3590,6 +3661,22 @@ def trade_loop_enhanced_with_smart_patch():
             info = rf_signal_live(df)
             ind = compute_indicators(df)
             spread_bps = orderbook_spread_bps()
+            
+            # ---- ADX Sleep Gate: لو السوق نايم ما نفتحش صفقات جديدة ----
+            adx_val = safe_get(ind, "adx", 0.0)
+            if adx_val < ADX_GATE and not STATE["open"]:
+                log_w(f"😴 ADX={adx_val:.1f} < {ADX_GATE} — السوق نايم، منع أي دخول جديد في هذه الشمعة")
+                time.sleep(BASE_SLEEP)
+                continue
+
+            # ---- RF Status Logging ----
+            rf_side = "BUY" if info.get("long") else "SELL" if info.get("short") else "FLAT"
+            log_i(
+                f"📡 RF_STATUS | {rf_side} | "
+                f"price={_fmt(info.get('price'))} | filt={_fmt(info.get('filter'))} | "
+                f"hi={_fmt(info.get('hi'))} | lo={_fmt(info.get('lo'))} | "
+                f"ADX={adx_val:.1f}"
+            )
             
             # تحديث orderbook للـFlow Boost
             try:
