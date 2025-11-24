@@ -1108,7 +1108,7 @@ def fetch_ohlcv(limit=600):
 
 def price_now():
     try:
-        t = with_retry(lambda: ex.fetch_ticker(SYMBOL)
+        t = with_retry(lambda: ex.fetch_ticker(SYMBOL))
         return t.get("last") or t.get("close")
     except Exception: return None
 
@@ -1869,7 +1869,7 @@ def golden_zone_check(df, ind=None, side_hint=None):
         h = df['high'].astype(float)
         l = df['low'].astype(float)
         c = df['close'].astype(float)
-        o = df['open'].astype(float)
+        o = df['open'].ast(float)
         v = df['volume'].astype(float)
         
         impulse_data = _last_impulse_gz(df)
@@ -2963,62 +2963,67 @@ def _ema(s, n): return s.ewm(span=n, adjust=False).mean()
 
 def rf_signal_live(df: pd.DataFrame):
     """
-    Range Filter B&S Signals — نسخة مطابقة لـ سكربت Pine اللي المستخدم أرسله
-    longCondition / shortCondition + CondIni
+    Range Filter - B&S Signals port
+    مطابق لمنطق:
+    longCondition / shortCondition + CondIni في سكربت TradingView اللي انت بعتهولي
     """
     global RF_COND_STATE
 
+    # أمان لو البيانات قليلة
     if len(df) < RF_PERIOD + 3:
-        price = float(df["close"].iloc[-1])
+        i = -1
+        price = float(df["close"].iloc[i]) if len(df) else None
         return {
-            "time": int(df["time"].iloc[-1]),
-            "price": price,
+            "time": int(df["time"].iloc[i]) if len(df) else int(time.time()*1000),
+            "price": price or 0.0,
             "long": False,
             "short": False,
-            "filter": price,
-            "hi": price,
-            "lo": price,
+            "filter": price or 0.0,
+            "hi": price or 0.0,
+            "lo": price or 0.0,
         }
 
-    # نفس rng_src / period / qty
+    # نفس rng_src / rng_per / rng_qty
     src = df[RF_SOURCE].astype(float)
     hi, lo, filt = _rng_filter(src, _rng_size(src, RF_MULT, RF_PERIOD))
 
-    # حساب fdir (اتجاه الفلتر)
+    # -------- fdir / upward / downward زي Pine --------
     fdir = 0.0
     for i in range(1, len(filt)):
-        if filt.iloc[i] > filt.iloc[i - 1]:
+        if filt.iloc[i] > filt.iloc[i-1]:
             fdir = 1.0
-        elif filt.iloc[i] < filt.iloc[i - 1]:
+        elif filt.iloc[i] < filt.iloc[i-1]:
             fdir = -1.0
+        # لو مساوي يفضل آخر قيمة
 
-    upward = (fdir == 1.0)
+    upward   = (fdir == 1.0)
     downward = (fdir == -1.0)
 
-    # آخر شمعة
-    p_now = float(src.iloc[-1])
+    # آخر شمعة مغلقة
+    p_now  = float(src.iloc[-1])
     p_prev = float(src.iloc[-2])
-    f_now = float(filt.iloc[-1])
+    f_now  = float(filt.iloc[-1])
 
-    # longCond + shortCond (نفس كود الباين)
+    # -------- longCond / shortCond بالمنطق اللي في السكربت --------
     longCond = (
         (p_now > f_now and p_now > p_prev and upward) or
         (p_now > f_now and p_now < p_prev and upward)
     )
-
     shortCond = (
         (p_now < f_now and p_now < p_prev and downward) or
         (p_now < f_now and p_now > p_prev and downward)
     )
 
+    # CondIni: RF_COND_STATE = 1 (long), -1 (short)
     prev_state = RF_COND_STATE
 
     if longCond:
         RF_COND_STATE = 1
     elif shortCond:
         RF_COND_STATE = -1
+    # لو مفيش ولا واحدة → يفضل زي ما هو
 
-    long_signal = bool(longCond and prev_state == -1)
+    long_signal  = bool(longCond and prev_state == -1)
     short_signal = bool(shortCond and prev_state == 1)
 
     return {
@@ -3201,7 +3206,7 @@ def manage_trade_by_profile(df, ind, info):
         if not STATE.get("tp1_done") and pnl_pct >= tp1:
             close_qty = safe_qty(STATE["qty"] * 0.3)  # إغلاق 30% عند TP1
             if close_qty > 0:
-                close_side = "sell" if STATE["side"] == "long" else "buy"
+                close_side = "sell" if side == "long" else "buy"
                 if MODE_LIVE and EXECUTE_ORDERS and not DRY_RUN:
                     try:
                         params = exchange_specific_params(close_side, is_close=True)
@@ -3215,7 +3220,7 @@ def manage_trade_by_profile(df, ind, info):
         elif STATE.get("tp1_done") and not STATE.get("tp2_done") and pnl_pct >= tp2:
             close_qty = safe_qty(STATE["qty"] * 0.3)  # إغلاق 30% أخرى عند TP2
             if close_qty > 0:
-                close_side = "sell" if STATE["side"] == "long" else "buy"
+                close_side = "sell" if side == "long" else "buy"
                 if MODE_LIVE and EXECUTE_ORDERS and not DRY_RUN:
                     try:
                         params = exchange_specific_params(close_side, is_close=True)
@@ -3672,9 +3677,11 @@ def trade_loop_enhanced_with_smart_patch():
             # ---- RF Status Logging ----
             rf_side = "BUY" if info.get("long") else "SELL" if info.get("short") else "FLAT"
             log_i(
-                f"📡 RF_STATUS | {rf_side} | "
-                f"price={_fmt(info.get('price'))} | filt={_fmt(info.get('filter'))} | "
-                f"hi={_fmt(info.get('hi'))} | lo={_fmt(info.get('lo'))} | "
+                f"🧮 RF_STATUS | {rf_side} | "
+                f"price={_fmt(info.get('price'))} "
+                f"filt={_fmt(info.get('filter'))} "
+                f"hi={_fmt(info.get('hi'))} "
+                f"lo={_fmt(info.get('lo'))} | "
                 f"ADX={adx_val:.1f}"
             )
             
