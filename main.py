@@ -2086,10 +2086,13 @@ def build_profit_profile_from_council(mode, council, gz=None, trend_strength=Non
     return profile
 
 # =================== PROFIT PROFILE CLASSIFICATION ===================
-def classify_profit_profile(df, ind, council_data, trend_info, mode: str):
+def classify_profit_profile(df, ind, council_data, trend_info, mode: str, side: str):
     """
     يحدد نوع الصفقة (سكالب صغير / ترند متوسط / ترند قوي)
-    عشان إدارة الصفقة تمشي على نفس الـ profile من أول شمعة لآخر شمعة.
+    بناءً على:
+    - قوة الترند العامة
+    - قوة مجلس الإدارة في اتجاه الصفقة نفسها (BUY / SELL)
+    - نوع المود (scalp / trend)
     """
     strength = trend_info.get("strength", "flat")      # weak / medium / strong / very_strong
     adx_val = safe_get(ind, "adx", 0.0)
@@ -2100,24 +2103,44 @@ def classify_profit_profile(df, ind, council_data, trend_info, mode: str):
     score_s = council_data.get("score_s", 0.0)
     conf    = council_data.get("confidence", 0.0)
 
-    dom_score = max(score_b, score_s)
-    dom_votes = max(votes_b, votes_s)
+    # نستخدم قوة المجلس في اتجاه الصفقة نفسها
+    side = (side or "").lower()
+    if side.startswith("b"):
+        side_score = score_b
+        side_votes = votes_b
+    else:
+        side_score = score_s
+        side_votes = votes_s
 
-    # 1) سكالب صغير: ترند ضعيف أو متوسط + مود "scalp"
-    if mode == "scalp" and (strength in ["weak", "flat"] or adx_val < 20 or dom_score < 15):
+    dom_score = side_score
+    dom_votes = side_votes
+
+    # 1) سكالب صغير: ترند ضعيف أو ADX ضعيف أو مجلس ضعيف في اتجاه الصفقة
+    if mode == "scalp" and (strength in ["weak", "flat"] or adx_val < 20 or dom_score < 15 or conf < 0.5):
         profile = PROFIT_PROFILE_CONFIG["SCALP_SMALL"]
-        log_i(f"🎯 PROFILE: SCALP_SMALL | strength={strength}, adx={adx_val:.1f}, score={dom_score:.1f}")
+        log_i(
+            f"🎯 PROFILE: SCALP_SMALL | side={side}, strength={strength}, "
+            f"adx={adx_val:.1f}, score={dom_score:.1f}, conf={conf:.2f}"
+        )
 
-    # 2) ترند قوي: strength قوي + ADX محترم + أصوات مجلس قوية
-    elif strength in ["strong", "very_strong"] and adx_val >= 20 and dom_score >= 25 and dom_votes >= 10:
+    # 2) ترند قوي: strength قوي + ADX محترم + أصوات مجلس قوية في اتجاه الصفقة
+    elif strength in ["strong", "very_strong"] and adx_val >= 20 and dom_score >= 25 and dom_votes >= 10 and conf >= 0.6:
         profile = PROFIT_PROFILE_CONFIG["TREND_STRONG"]
-        log_i(f"🎯 PROFILE: TREND_STRONG | strength={strength}, adx={adx_val:.1f}, score={dom_score:.1f}, votes={dom_votes}")
+        log_i(
+            f"🎯 PROFILE: TREND_STRONG | side={side}, strength={strength}, "
+            f"adx={adx_val:.1f}, score={dom_score:.1f}, votes={dom_votes}, conf={conf:.2f}"
+        )
 
     # 3) الباقي: ترند متوسط
     else:
         profile = PROFIT_PROFILE_CONFIG["TREND_MEDIUM"]
-        log_i(f"🎯 PROFILE: TREND_MEDIUM | strength={strength}, adx={adx_val:.1f}, score={dom_score:.1f}")
+        log_i(
+            f"🎯 PROFILE: TREND_MEDIUM | side={side}, strength={strength}, "
+            f"adx={adx_val:.1f}, score={dom_score:.1f}, votes={dom_votes}, conf={conf:.2f}"
+        )
 
+    # تأكد أن label موجود
+    profile["label"] = profile.get("label", profile.get("name", "UNKNOWN"))
     return profile
 
 # =================== SUPER COUNCIL AI - ENHANCED VERSION ===================
@@ -2794,8 +2817,21 @@ def open_market_enhanced(side, qty, price):
     # ✅ نحسب بيانات المجلس الحقيقية للصفقة
     council_data = super_council_ai_enhanced(df)
 
-    # ✅ نحدد Profit Profile المناسب
-    profit_profile = classify_profit_profile(df, ind, council_data, trend_info, mode)
+    # ✅ نحدد Profit Profile المناسب بناءً على اتجاه الصفقة (BUY/SELL)
+    profit_profile = classify_profit_profile(df, ind, council_data, trend_info, mode, side)
+
+    # لوج بسيط يوضح قوة الإشارة: سكالب/ترند
+    signal_label = profit_profile.get("label", "UNKNOWN")
+    if signal_label == "SCALP_SMALL":
+        strength_desc = "weak → SCALP"
+    elif signal_label == "TREND_MEDIUM":
+        strength_desc = "medium → TREND"
+    elif signal_label == "TREND_STRONG":
+        strength_desc = "strong → TREND"
+    else:
+        strength_desc = "unknown"
+
+    log_i(f"📊 SIGNAL STRENGTH [{side.upper()}] = {signal_label} ({strength_desc})")
 
     # إعدادات الإدارة المبنية على الـ profile الجديد
     management_config = {
@@ -2851,13 +2887,23 @@ def open_market_enhanced(side, qty, price):
         })
 
         # لوج ملوّن واضح
-        profile_color = "🟢" if profit_profile["label"] == "TREND_STRONG" else "🟡" if profit_profile["label"] == "TREND_MEDIUM" else "🔵"
+        profile_label = profit_profile.get("label", "")
+        if profile_label == "TREND_STRONG":
+            profile_color = "🟢"
+        elif profile_label == "TREND_MEDIUM":
+            profile_color = "🟡"
+        else:
+            profile_color = "🔵"
+
+        tp_msg = f"TPs: {profit_profile['tp1_pct']}%"
+        if profit_profile.get("tp2_pct"):
+            tp_msg += f" → {profit_profile['tp2_pct']}%"
+        if profit_profile.get("tp3_pct"):
+            tp_msg += f" → {profit_profile['tp3_pct']}%"
+
         log_g(
             f"{profile_color} COUNCIL TRADE OPENED | {side.upper()} {qty:.4f} @ {price:.6f} "
-            f"| {mode.upper()} | {profit_profile['label']} | "
-            f"TPs: {profit_profile['tp1_pct']}%"
-            f"{f' → {profit_profile["tp2_pct"]}%' if profit_profile['tp2_pct'] else ''}"
-            f"{f' → {profit_profile["tp3_pct"]}%' if profit_profile['tp3_pct'] else ''}"
+            f"| {mode.upper()} | {profile_label} | {tp_msg}"
         )
         
         print_position_snapshot(reason=f"OPEN - {mode.upper()}[{profit_profile['label']}]")
@@ -3848,7 +3894,7 @@ def pretty_snapshot(bal, info, ind, spread_bps, reason=None, df=None):
     if LOG_LEGACY:
         left_s = time_to_candle_close(df) if df is not None else 0
         print(colored("─"*100,"cyan"))
-        print(colored(f"📊 {SYMBOL} {INTERVAL} • {EXCHANGE_NAME.upper()} • {'LIVE' if MODE_LIVE else 'PAPER'} • {datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S')} UTC","cyan"))
+        print(colored(f"📊 {SYMBOL} {INTERVAL} • {EXCHANGE_NAME.upper()} • {'LIVE' if MODE_LIVE else 'PAPER'} • {datetime.utcnow().strftime('%Y-%m-d %H:%M:%S')} UTC","cyan"))
         print(colored("─"*100,"cyan"))
         print("📈 INDICATORS & RF")
         print(f"   💲 Price {fmt(info.get('price'))} | RF filt={fmt(info.get('filter'))}  hi={fmt(info.get('hi'))} lo={fmt(info.get('lo'))}")
