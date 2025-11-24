@@ -33,9 +33,6 @@ except Exception:
 #  SMART PATCH — HQ Trading Intelligence Engine
 # ============================================
 
-# حالة RF B&S زي CondIni في Pine
-RF_COND_STATE = 0  # 1 = آخر حالة long ، -1 = آخر حالة short ، 0 = لسه مفيش
-
 # ---------- Z-SCORE بدون SciPy ----------
 def simple_zscore(values, window=50):
     try:
@@ -479,7 +476,7 @@ RF_SOURCE = "close"
 RF_PERIOD = int(os.getenv("RF_PERIOD", 18))
 RF_MULT   = float(os.getenv("RF_MULT", 3.0))
 RF_LIVE_ONLY = True
-RF_HYST_BPS  = 0.0  # إزالة الـ Hysteresis للمطابقة التامة مع TradingView
+RF_HYST_BPS  = 6.0
 
 # Indicators
 RSI_LEN = 14
@@ -669,7 +666,7 @@ TREND_STRONG_TH    = 4
 # ============================================
 #  COUNCIL STRONG ENTRY CONFIG
 # ============================================
-COUNCIL_STRONG_ENTRY   = False   # تعطيل دخول مجلس الإدارة في مناطق قوية - التركيز على RF فقط
+COUNCIL_STRONG_ENTRY   = True    # تفعيل دخول مجلس الإدارة في مناطق قوية
 COUNCIL_STRONG_CONF    = 0.68    # حد أدنى للثقة
 COUNCIL_STRONG_SCORE   = 20.0    # مجموع score_b + score_s
 COUNCIL_STRONG_VOTES   = 10      # عدد أصوات BUY أو SELL في اتجاه واحد
@@ -745,7 +742,6 @@ def log_i(msg): print(f"ℹ️ {msg}", flush=True)
 def log_g(msg): print(f"✅ {msg}", flush=True)
 def log_w(msg): print(f"🟨 {msg}", flush=True)
 def log_e(msg): print(f"❌ {msg}", flush=True)
-def log_y(msg): print(f"🟡 {msg}", flush=True)
 
 def log_banner(text): print(f"\n{'—'*12} {text} {'—'*12}\n", flush=True)
 
@@ -1869,7 +1865,7 @@ def golden_zone_check(df, ind=None, side_hint=None):
         h = df['high'].astype(float)
         l = df['low'].astype(float)
         c = df['close'].astype(float)
-        o = df['open'].ast(float)
+        o = df['open'].astype(float)
         v = df['volume'].astype(float)
         
         impulse_data = _last_impulse_gz(df)
@@ -2090,13 +2086,10 @@ def build_profit_profile_from_council(mode, council, gz=None, trend_strength=Non
     return profile
 
 # =================== PROFIT PROFILE CLASSIFICATION ===================
-def classify_profit_profile(df, ind, council_data, trend_info, mode: str, side: str):
+def classify_profit_profile(df, ind, council_data, trend_info, mode: str):
     """
     يحدد نوع الصفقة (سكالب صغير / ترند متوسط / ترند قوي)
-    بناءً على:
-    - قوة الترند العامة
-    - قوة مجلس الإدارة في اتجاه الصفقة نفسها (BUY / SELL)
-    - نوع المود (scalp / trend)
+    عشان إدارة الصفقة تمشي على نفس الـ profile من أول شمعة لآخر شمعة.
     """
     strength = trend_info.get("strength", "flat")      # weak / medium / strong / very_strong
     adx_val = safe_get(ind, "adx", 0.0)
@@ -2107,44 +2100,24 @@ def classify_profit_profile(df, ind, council_data, trend_info, mode: str, side: 
     score_s = council_data.get("score_s", 0.0)
     conf    = council_data.get("confidence", 0.0)
 
-    # نستخدم قوة المجلس في اتجاه الصفقة نفسها
-    side = (side or "").lower()
-    if side.startswith("b"):
-        side_score = score_b
-        side_votes = votes_b
-    else:
-        side_score = score_s
-        side_votes = votes_s
+    dom_score = max(score_b, score_s)
+    dom_votes = max(votes_b, votes_s)
 
-    dom_score = side_score
-    dom_votes = side_votes
-
-    # 1) سكالب صغير: ترند ضعيف أو ADX ضعيف أو مجلس ضعيف في اتجاه الصفقة
-    if mode == "scalp" and (strength in ["weak", "flat"] or adx_val < 20 or dom_score < 15 or conf < 0.5):
+    # 1) سكالب صغير: ترند ضعيف أو متوسط + مود "scalp"
+    if mode == "scalp" and (strength in ["weak", "flat"] or adx_val < 20 or dom_score < 15):
         profile = PROFIT_PROFILE_CONFIG["SCALP_SMALL"]
-        log_i(
-            f"🎯 PROFILE: SCALP_SMALL | side={side}, strength={strength}, "
-            f"adx={adx_val:.1f}, score={dom_score:.1f}, conf={conf:.2f}"
-        )
+        log_i(f"🎯 PROFILE: SCALP_SMALL | strength={strength}, adx={adx_val:.1f}, score={dom_score:.1f}")
 
-    # 2) ترند قوي: strength قوي + ADX محترم + أصوات مجلس قوية في اتجاه الصفقة
-    elif strength in ["strong", "very_strong"] and adx_val >= 20 and dom_score >= 25 and dom_votes >= 10 and conf >= 0.6:
+    # 2) ترند قوي: strength قوي + ADX محترم + أصوات مجلس قوية
+    elif strength in ["strong", "very_strong"] and adx_val >= 20 and dom_score >= 25 and dom_votes >= 10:
         profile = PROFIT_PROFILE_CONFIG["TREND_STRONG"]
-        log_i(
-            f"🎯 PROFILE: TREND_STRONG | side={side}, strength={strength}, "
-            f"adx={adx_val:.1f}, score={dom_score:.1f}, votes={dom_votes}, conf={conf:.2f}"
-        )
+        log_i(f"🎯 PROFILE: TREND_STRONG | strength={strength}, adx={adx_val:.1f}, score={dom_score:.1f}, votes={dom_votes}")
 
     # 3) الباقي: ترند متوسط
     else:
         profile = PROFIT_PROFILE_CONFIG["TREND_MEDIUM"]
-        log_i(
-            f"🎯 PROFILE: TREND_MEDIUM | side={side}, strength={strength}, "
-            f"adx={adx_val:.1f}, score={dom_score:.1f}, votes={dom_votes}, conf={conf:.2f}"
-        )
+        log_i(f"🎯 PROFILE: TREND_MEDIUM | strength={strength}, adx={adx_val:.1f}, score={dom_score:.1f}")
 
-    # تأكد أن label موجود
-    profile["label"] = profile.get("label", profile.get("name", "UNKNOWN"))
     return profile
 
 # =================== SUPER COUNCIL AI - ENHANCED VERSION ===================
@@ -2821,21 +2794,8 @@ def open_market_enhanced(side, qty, price):
     # ✅ نحسب بيانات المجلس الحقيقية للصفقة
     council_data = super_council_ai_enhanced(df)
 
-    # ✅ نحدد Profit Profile المناسب بناءً على اتجاه الصفقة (BUY/SELL)
-    profit_profile = classify_profit_profile(df, ind, council_data, trend_info, mode, side)
-
-    # لوج بسيط يوضح قوة الإشارة: سكالب/ترند
-    signal_label = profit_profile.get("label", "UNKNOWN")
-    if signal_label == "SCALP_SMALL":
-        strength_desc = "weak → SCALP"
-    elif signal_label == "TREND_MEDIUM":
-        strength_desc = "medium → TREND"
-    elif signal_label == "TREND_STRONG":
-        strength_desc = "strong → TREND"
-    else:
-        strength_desc = "unknown"
-
-    log_i(f"📊 SIGNAL STRENGTH [{side.upper()}] = {signal_label} ({strength_desc})")
+    # ✅ نحدد Profit Profile المناسب
+    profit_profile = classify_profit_profile(df, ind, council_data, trend_info, mode)
 
     # إعدادات الإدارة المبنية على الـ profile الجديد
     management_config = {
@@ -2890,21 +2850,14 @@ def open_market_enhanced(side, qty, price):
             "opened_at": int(time.time())
         })
 
-        # 🔔 LOG: صفقة جديدة مفتوحة (باي / سيل + سكالب / ترند)
-        lamp = "🟩 LONG" if trade_side == "long" else "🟥 SHORT"
+        # لوج ملوّن واضح
+        profile_color = "🟢" if profit_profile["label"] == "TREND_STRONG" else "🟡" if profit_profile["label"] == "TREND_MEDIUM" else "🔵"
         log_g(
-            f"{lamp} COUNCIL TRADE OPENED | "
-            f"MODE={mode.upper()} | PROFILE={profit_profile['label']} | "
-            f"entry={_fmt(price)} | qty={_fmt(qty,4)} | "
-            f"ADX={safe_get(ind, 'adx', 0):.1f}"
-        )
-        log_i(
-            f"🧾 DETAILS | why={why_mode} | "
-            f"tp1={management_config['tp1_pct']}% "
-            f"tp2={management_config.get('tp2_pct')}% "
-            f"tp3={management_config.get('tp3_pct')}% | "
-            f"trail_start={management_config['trail_activate_pct']}% "
-            f"profile_desc={management_config['profile_desc']}"
+            f"{profile_color} COUNCIL TRADE OPENED | {side.upper()} {qty:.4f} @ {price:.6f} "
+            f"| {mode.upper()} | {profit_profile['label']} | "
+            f"TPs: {profit_profile['tp1_pct']}%"
+            f"{f' → {profit_profile["tp2_pct"]}%' if profit_profile['tp2_pct'] else ''}"
+            f"{f' → {profit_profile["tp3_pct"]}%' if profit_profile['tp3_pct'] else ''}"
         )
         
         print_position_snapshot(reason=f"OPEN - {mode.upper()}[{profit_profile['label']}]")
@@ -2962,101 +2915,26 @@ def _rng_filter(src: pd.Series, rsize: pd.Series):
 def _ema(s, n): return s.ewm(span=n, adjust=False).mean()
 
 def rf_signal_live(df: pd.DataFrame):
-    """
-    Range Filter - B&S Signals port
-    مطابق لمنطق:
-    longCondition / shortCondition + CondIni في سكربت TradingView اللي انت بعتهولي
-    """
-    global RF_COND_STATE
-
-    # أمان لو البيانات قليلة
     if len(df) < RF_PERIOD + 3:
         i = -1
         price = float(df["close"].iloc[i]) if len(df) else None
-        return {
-            "time": int(df["time"].iloc[i]) if len(df) else int(time.time()*1000),
-            "price": price or 0.0,
-            "long": False,
-            "short": False,
-            "filter": price or 0.0,
-            "hi": price or 0.0,
-            "lo": price or 0.0,
-        }
-
-    # نفس rng_src / rng_per / rng_qty
+        return {"time": int(df["time"].iloc[i]) if len(df) else int(time.time()*1000),
+                "price": price or 0.0, "long": False, "short": False,
+                "filter": price or 0.0, "hi": price or 0.0, "lo": price or 0.0}
     src = df[RF_SOURCE].astype(float)
     hi, lo, filt = _rng_filter(src, _rng_size(src, RF_MULT, RF_PERIOD))
-
-    # -------- fdir / upward / downward زي Pine --------
-    fdir = 0.0
-    for i in range(1, len(filt)):
-        if filt.iloc[i] > filt.iloc[i-1]:
-            fdir = 1.0
-        elif filt.iloc[i] < filt.iloc[i-1]:
-            fdir = -1.0
-        # لو مساوي يفضل آخر قيمة
-
-    upward   = (fdir == 1.0)
-    downward = (fdir == -1.0)
-
-    # آخر شمعة مغلقة
-    p_now  = float(src.iloc[-1])
-    p_prev = float(src.iloc[-2])
-    f_now  = float(filt.iloc[-1])
-
-    # -------- longCond / shortCond بالمنطق اللي في السكربت --------
-    longCond = (
-        (p_now > f_now and p_now > p_prev and upward) or
-        (p_now > f_now and p_now < p_prev and upward)
-    )
-    shortCond = (
-        (p_now < f_now and p_now < p_prev and downward) or
-        (p_now < f_now and p_now > p_prev and downward)
-    )
-
-    # CondIni: RF_COND_STATE = 1 (long), -1 (short)
-    prev_state = RF_COND_STATE
-
-    if longCond:
-        RF_COND_STATE = 1
-    elif shortCond:
-        RF_COND_STATE = -1
-    # لو مفيش ولا واحدة → يفضل زي ما هو
-
-    long_signal  = bool(longCond and prev_state == -1)
-    short_signal = bool(shortCond and prev_state == 1)
-
+    def _bps(a,b):
+        try: return abs((a-b)/b)*10000.0
+        except Exception: return 0.0
+    p_now = float(src.iloc[-1]); p_prev = float(src.iloc[-2])
+    f_now = float(filt.iloc[-1]); f_prev = float(filt.iloc[-2])
+    long_flip  = (p_prev <= f_prev and p_now > f_now and _bps(p_now, f_now) >= RF_HYST_BPS)
+    short_flip = (p_prev >= f_prev and p_now < f_now and _bps(p_now, f_now) >= RF_HYST_BPS)
     return {
-        "time": int(df["time"].iloc[-1]),
-        "price": p_now,
-        "long": long_signal,
-        "short": short_signal,
-        "filter": f_now,
-        "hi": float(hi.iloc[-1]),
-        "lo": float(lo.iloc[-1]),
+        "time": int(df["time"].iloc[-1]), "price": p_now,
+        "long": bool(long_flip), "short": bool(short_flip),
+        "filter": f_now, "hi": float(hi.iloc[-1]), "lo": float(lo.iloc[-1])
     }
-
-# =================== ALLOW TRADE IN LOW ADX FUNCTION ===================
-def allow_trade_in_low_adx(ind, council_data, candle_data):
-    """
-    منطق Override يسمح للبوت يدخل حتى لو ADX ضعيف (سوق نايم)
-    """
-    adx_val = ind.get("adx", 0)
-
-    # شرط إن السوق نايم فعلاً
-    if adx_val >= 17:
-        return True  # مفيش مشكلة
-
-    # لو ADX < 17، نسمح فقط لو في سبب قوي للدخول
-    golden_ok = council_data.get("golden_zone", False)
-    strong_candle = candle_data.get("strong_bullish") or candle_data.get("strong_bearish")
-    volume_spike = ind.get("volume", 0) > ind.get("vol_ma20", 0) * 1.4
-    trendZ = council_data.get("trendZ_score", 0) >= 1.2  # اتجاه واضح رغم ADX ضعيف
-
-    if golden_ok or strong_candle or volume_spike or trendZ:
-        return True  # في سبب قوي يسمح بالدخول رغم ADX ضعيف
-
-    return False
 
 # =================== STATE ===================
 STATE = {
@@ -3667,24 +3545,6 @@ def trade_loop_enhanced_with_smart_patch():
             ind = compute_indicators(df)
             spread_bps = orderbook_spread_bps()
             
-            # ---- ADX Sleep Gate: لو السوق نايم ما نفتحش صفقات جديدة ----
-            adx_val = safe_get(ind, "adx", 0.0)
-            if adx_val < ADX_GATE and not STATE["open"]:
-                log_w(f"😴 ADX={adx_val:.1f} < {ADX_GATE} — السوق نايم، منع أي دخول جديد في هذه الشمعة")
-                time.sleep(BASE_SLEEP)
-                continue
-
-            # ---- RF Status Logging ----
-            rf_side = "BUY" if info.get("long") else "SELL" if info.get("short") else "FLAT"
-            log_i(
-                f"🧮 RF_STATUS | {rf_side} | "
-                f"price={_fmt(info.get('price'))} "
-                f"filt={_fmt(info.get('filter'))} "
-                f"hi={_fmt(info.get('hi'))} "
-                f"lo={_fmt(info.get('lo'))} | "
-                f"ADX={adx_val:.1f}"
-            )
-            
             # تحديث orderbook للـFlow Boost
             try:
                 STATE["last_orderbook"] = ex.fetch_order_book(SYMBOL, limit=FLOW_STACK_DEPTH)
@@ -3988,7 +3848,7 @@ def pretty_snapshot(bal, info, ind, spread_bps, reason=None, df=None):
     if LOG_LEGACY:
         left_s = time_to_candle_close(df) if df is not None else 0
         print(colored("─"*100,"cyan"))
-        print(colored(f"📊 {SYMBOL} {INTERVAL} • {EXCHANGE_NAME.upper()} • {'LIVE' if MODE_LIVE else 'PAPER'} • {datetime.utcnow().strftime('%Y-%m-d %H:%M:%S')} UTC","cyan"))
+        print(colored(f"📊 {SYMBOL} {INTERVAL} • {EXCHANGE_NAME.upper()} • {'LIVE' if MODE_LIVE else 'PAPER'} • {datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S')} UTC","cyan"))
         print(colored("─"*100,"cyan"))
         print("📈 INDICATORS & RF")
         print(f"   💲 Price {fmt(info.get('price'))} | RF filt={fmt(info.get('filter'))}  hi={fmt(info.get('hi'))} lo={fmt(info.get('lo'))}")
