@@ -3580,6 +3580,34 @@ def decide_tp_profile(council_conf, council_total_score, trend_strength, mode="t
     reason = f"مجلس جيد ({council_conf:.1%}) | تصويت ({council_total_score:.1f})"
     return "medium", TP_MED_LEVELS, TP_MED_WEIGHTS, "🟡", reason
 
+# =================== EXECUTE TRADE DECISION FUNCTION ===================
+def execute_trade_decision(side, price, qty, mode, council_data, gz_data):
+    """تنفيذ قرار التداول مع التحقق من الشروط"""
+    try:
+        if not MODE_LIVE or not EXECUTE_ORDERS or DRY_RUN:
+            log_i(f"DRY_RUN: Would execute {side} {qty} @ {price} in mode {mode}")
+            return True
+
+        # التحقق من الشروط الأساسية
+        if not side or not price or qty <= 0:
+            log_e("❌ Invalid trade parameters")
+            return False
+
+        # تنفيذ الأمر الفعلي
+        params = exchange_specific_params(side, is_close=False)
+        order = ex.create_order(SYMBOL, "market", side, qty, None, params)
+        
+        if order and order.get('id'):
+            log_g(f"✅ TRADE EXECUTED: {side.upper()} {qty:.4f} @ {price:.6f} | Mode: {mode}")
+            return True
+        else:
+            log_e("❌ Trade execution failed - no order ID")
+            return False
+
+    except Exception as e:
+        log_e(f"❌ Trade execution error: {e}")
+        return False
+
 # =================== ENHANCED TRADE EXECUTION ===================
 def open_market_enhanced(side, qty, price):
     """نسخة محسنة من فتح الصفقة مع الحجم الثابت 60% × 10x"""
