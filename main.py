@@ -2119,7 +2119,7 @@ def detect_breakout_opportunity(df, ind):
         
         close = df['close'].astype(float)
         high = df['high'].astype(float)
-        low = df['low'].ast(float)
+        low = df['low'].astype(float)  # ✅ تم إصلاح الخطأ هنا
         volume = df['volume'].astype(float)
         
         # مستويات المقاومة والدعم
