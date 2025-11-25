@@ -919,9 +919,12 @@ def analyze_comprehensive_strength(df, ind, council_data, entry_zones):
             total_score += 2
             reasons.append("rsi_extreme")
         
-        # 4. قوة الحجم
+        # 4. قوة الحجم - تم إصلاح الخطأ هنا
         volume_profile = compute_volume_profile(df)
-        if volume_profile.get('volume_spike'):
+        volume_spike = volume_profile.get('volume_spike', False)
+        
+        # التحقق من أن volume_spike هي boolean وليست Series
+        if isinstance(volume_spike, (bool, np.bool_)) and volume_spike:
             total_score += 1
             reasons.append("volume_spike")
         
@@ -2116,7 +2119,7 @@ def detect_breakout_opportunity(df, ind):
         
         close = df['close'].astype(float)
         high = df['high'].astype(float)
-        low = df['low'].astype(float)
+        low = df['low'].ast(float)
         volume = df['volume'].astype(float)
         
         # مستويات المقاومة والدعم
@@ -2374,18 +2377,30 @@ def compute_stochastic(high, low, close, n=14, d=3):
     return k, d_line
 
 def compute_volume_profile(df, period=20):
-    volume = df['volume'].astype(float)
-    high = df['high'].astype(float)
-    low = df['low'].astype(float)
-    
-    price_range = high - low
-    volume_per_price = volume / (price_range.replace(0, 1e-12))
-    
-    return {
-        'volume_ma': sma(volume, period),
-        'volume_spike': volume > sma(volume, period) * 1.5,
-        'volume_trend': 'up' if volume.iloc[-1] > volume.iloc[-2] else 'down'
-    }
+    """إصلاح: إرجاع قيم scalar بدلاً من Series"""
+    try:
+        volume = df['volume'].astype(float)
+        high = df['high'].astype(float)
+        low = df['low'].astype(float)
+        
+        price_range = high - low
+        volume_per_price = volume / (price_range.replace(0, 1e-12))
+        
+        # إرجاع قيم scalar للشمعة الحالية فقط
+        volume_ma = sma(volume, period).iloc[-1] if len(volume) >= period else volume.mean()
+        current_volume = volume.iloc[-1] if len(volume) > 0 else 0
+        volume_spike = bool(current_volume > volume_ma * 1.5)  # تحويل إلى boolean
+        
+        volume_trend = 'up' if (len(volume) >= 2 and volume.iloc[-1] > volume.iloc[-2]) else 'down'
+        
+        return {
+            'volume_ma': volume_ma,
+            'volume_spike': volume_spike,  # قيمة boolean بدلاً من Series
+            'volume_trend': volume_trend
+        }
+    except Exception as e:
+        log_w(f"Volume profile computation error: {e}")
+        return {'volume_ma': 0, 'volume_spike': False, 'volume_trend': 'unknown'}
 
 def compute_momentum_indicators(df):
     close = df['close'].astype(float)
@@ -3094,14 +3109,11 @@ def super_council_ai_enhanced(df):
 
         # 2. تأكيد الحجم - إصلاح المعالجة
         if VOLUME_CONFIRMATION:
-            volume_spike = volume_profile.get('volume_spike', False)
-            volume_trend_label = volume_profile.get('volume_trend', '')  # "up" / "down"
+            volume_profile_data = compute_volume_profile(df)
+            volume_spike = volume_profile_data.get('volume_spike', False)
+            volume_trend_label = volume_profile_data.get('volume_trend', '')  # "up" / "down"
             
-            # إصلاح: تحويل volume_spike إلى boolean بشكل آمن
-            if hasattr(volume_spike, '__iter__'):
-                volume_spike = last_scalar(volume_spike, False)
-            
-            # استخدم volume_trend_label مباشرة كمقارنة نصية
+            # volume_spike الآن boolean مباشرة، لا حاجة لـ last_scalar
             if volume_spike and volume_trend_label == 'up':
                 if current_price > float(df['open'].iloc[-1]):
                     score_b += WEIGHT_VOLUME * 1.2
