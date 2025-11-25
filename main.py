@@ -4376,8 +4376,8 @@ def ultimate_trade_execution_loop():
             # ✅ التحضير لفرص جديدة (فقط إذا لم توجد صفقة مفتوحة)
             if not STATE.get("open"):
                 # تحديث جميع المحركات الذكية
-                close_prices = df['close'].astype(float).tolist()
-                volumes = df['volume'].astype(float].tolist()
+                close_prices = df["close"].astype(float).tolist()
+                volumes = df["volume"].astype(float].tolist()
                 
                 trend_ctx.update(close_prices[-1] if close_prices else 0)
                 smc_detector.detect_swings(df)
