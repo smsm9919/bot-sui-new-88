@@ -2,9 +2,9 @@
 """
 SUI ULTRA PRO AI BOT - الإصدار المحترف الذكي المتقدم
 • نظام دخول مرتب بمستويات Tier A/B/C
-• مجلس إدارة محترف مع تقييم جودة الدخول
+• حارس صارم يمنع الصفقات الضعيفة
 • إدارة ذكية للمراكز بناءً على قوة الإشارات
-• تنظيف كامل للكود من المنطق القديم
+• الحفاظ على الدوال الأساسية واللوج الملون
 """
 
 import os, time, math, random, signal, sys, traceback, logging, json
@@ -23,7 +23,13 @@ try:
 except Exception:
     def colored(t,*a,**k): return t
 
-# =================== SMART ENTRY QUALITY ENGINE ===================
+# =================== STRICT ENTRY GUARDS CONFIG ===================
+
+# عتبات الدخول الصارمة
+STRICT_SCALP_MIN_SCORE = 7        # ✅ سكالب قوي فقط
+STRICT_TREND_MIN_SCORE = 10       # ✅ ترند قوي فقط
+STRICT_TREND_TIER_A_MIN = 1       # ✅ لازم Tier A للترند
+STRICT_TIER_B_MIN = 2             # ✅ لازم إشارتين Tier B على الأقل
 
 # أوزان الطبقات
 TIER_A_WEIGHT = 4      # Golden / SMC قوي / Liquidity Sweep كبيرة
@@ -52,7 +58,7 @@ SELF_URL = os.getenv("SELF_URL", "") or os.getenv("RENDER_EXTERNAL_URL", "")
 PORT = int(os.getenv("PORT", 5000))
 
 # ==== Run mode / Logging toggles ====
-LOG_LEGACY = False
+LOG_LEGACY = True  # تفعيل اللوج الملون القديم
 LOG_ADDONS = True
 
 # ==== Execution Switches ====
@@ -61,7 +67,7 @@ SHADOW_MODE_DASHBOARD = False
 DRY_RUN = False
 
 # ==== Addon: Logging + Recovery Settings ====
-BOT_VERSION = f"SUI ULTRA PRO AI v8.0 — {EXCHANGE_NAME.upper()} - PROFESSIONAL TIER SYSTEM"
+BOT_VERSION = f"SUI ULTRA PRO AI v8.0 — {EXCHANGE_NAME.upper()} - PROFESSIONAL STRICT SYSTEM"
 print("🚀 Booting:", BOT_VERSION, flush=True)
 
 STATE_PATH = "./bot_state.json"
@@ -587,7 +593,7 @@ def detect_fvg(candles):
 
     return None
 
-# =================== SMART ENTRY QUALITY ENGINE ===================
+# =================== STRICT ENTRY QUALITY ENGINE ===================
 def evaluate_entry_quality(direction, council_data, current_price=None):
     """
     🎯 أقوى نظام تقييم دخول - يجمع كل الإستراتيجيات في Score واحد
@@ -688,7 +694,7 @@ def master_entry_engine(council_data, current_price):
     """
     # استخراج اتجاه مجلس الإدارة
     score_buy = council_data.get("score_b", 0)
-    score_sell = council_data.get("score_sell", 0)
+    score_sell = council_data.get("score_s", 0)
     votes_buy = council_data.get("b", 0)
     votes_sell = council_data.get("s", 0)
     
@@ -760,11 +766,94 @@ def master_entry_engine(council_data, current_price):
         }
     }
 
+def apply_strict_entry_guards(entry_decision, current_price=None):
+    """
+    🛡️ حارس صارم يمنع الصفقات الضعيفة - الإصدار المحترف
+    """
+    if not entry_decision["allow"]:
+        return entry_decision
+    
+    mode = entry_decision["mode"]
+    direction = entry_decision["direction"]
+    quality = entry_decision["quality"]
+    score = quality["score"]
+    tier_a_count = len(quality["tier_a"])
+    tier_b_count = len(quality["tier_b"])
+    
+    reasons = []
+    blocked = False
+    
+    # 🔥 الحارس 1: السكالب الضعيف
+    if mode == "scalp" and score < STRICT_SCALP_MIN_SCORE:
+        blocked = True
+        reasons.append(f"scalp_score_too_low({score} < {STRICT_SCALP_MIN_SCORE})")
+    
+    # 🔥 الحارس 2: الترند بدون Tier A
+    if mode == "trend" and tier_a_count < STRICT_TREND_TIER_A_MIN:
+        blocked = True
+        reasons.append(f"trend_missing_tier_a({tier_a_count} < {STRICT_TREND_TIER_A_MIN})")
+    
+    # 🔥 الحارس 3: اتجاه غير واضح
+    council_data = entry_decision.get("details", {})
+    score_buy = council_data.get("score_buy", 0)
+    score_sell = council_data.get("score_sell", 0)
+    
+    if direction == "buy" and score_buy <= score_sell:
+        blocked = True
+        reasons.append(f"weak_buy_signal({score_buy} <= {score_sell})")
+    elif direction == "sell" and score_sell <= score_buy:
+        blocked = True
+        reasons.append(f"weak_sell_signal({score_sell} <= {score_buy})")
+    
+    # 🔥 الحارس 4: SMC ضعيف + VWAP غير محاذي + FVG ضعيف
+    weak_structure = (
+        tier_a_count == 0 and  # لا يوجد Tier A
+        tier_b_count < STRICT_TIER_B_MIN and  # أقل من إشارتين Tier B
+        score < 8  # درجة عامة ضعيفة
+    )
+    
+    if weak_structure:
+        blocked = True
+        reasons.append("weak_structure_analysis")
+    
+    if blocked:
+        return {
+            "allow": False,
+            "reason": "strict_guard_blocked",
+            "details": quality,
+            "reasons": reasons,
+            "original_decision": entry_decision
+        }
+    
+    return entry_decision
+
+def enhanced_master_entry_engine(council_data, current_price):
+    """
+    🧠 المحرك المحسن للدخول مع الحارس الصارم
+    """
+    # القرار الأساسي من المحرك الرئيسي
+    base_decision = master_entry_engine(council_data, current_price)
+    
+    # تطبيق الحارس الصارم
+    final_decision = apply_strict_entry_guards(base_decision, current_price)
+    
+    return final_decision
+
 # =================== PROFESSIONAL TRADE EXECUTION ===================
 def open_market_enhanced(side, qty, price):
     """نسخة محسنة من فتح الصفقة مع النظام الجديد"""
     if qty <= 0 or price is None:
         log_e("❌ كمية أو سعر غير صالح")
+        return False
+
+    # 🔥 الحارس النهائي قبل التنفيذ
+    df = fetch_ohlcv(limit=200)
+    council_data = super_council_ai_enhanced(df)
+    entry_decision = enhanced_master_entry_engine(council_data, price)
+    
+    if not entry_decision["allow"]:
+        reasons = entry_decision.get("reasons", [])
+        print(colored(f"🛑 FINAL GUARD BLOCKED: {', '.join(reasons)}", "red"))
         return False
 
     # تحقق إضافي من الحجم
@@ -782,13 +871,6 @@ def open_market_enhanced(side, qty, price):
     trend_info = compute_trend_strength(df, ind)
     trend_strength = trend_info.get("strength", "flat")
     
-    council_data = super_council_ai_enhanced(df)
-    entry_decision = master_entry_engine(council_data, price)
-    
-    if not entry_decision["allow"]:
-        log_w(f"⛔ الدخول مرفوض: {entry_decision.get('reason', 'unknown')}")
-        return False
-
     mode = entry_decision["mode"]
     quality = entry_decision["quality"]
 
@@ -847,8 +929,9 @@ def open_market_enhanced(side, qty, price):
             "opened_at": int(time.time())
         })
 
-        # لوج ملوّن واضح
+        # 🎯 اللوج الملون القديم مع المعلومات الجديدة
         profile_color = "🟢" if profit_profile["label"] == "TREND_STRONG" else "🟡" if profit_profile["label"] == "TREND_MEDIUM" else "🔵"
+        print(colored(f"🎯 EXECUTED: {side.upper()} {qty:.4f} @ {price:.6f} | {mode.upper()} | Score: {quality['score']:.1f}", "green"))
         log_g(
             f"{profile_color} PROFESSIONAL TRADE OPENED | {side.upper()} {qty:.4f} @ {price:.6f} "
             f"| {mode.upper()} | {profit_profile['label']} | "
@@ -1404,13 +1487,13 @@ def professional_trade_loop():
             # ============================================
             #  PROFESSIONAL ENTRY DECISION ENGINE
             # ============================================
-            
+
             if not STATE["open"]:
                 # جمع بيانات مجلس الإدارة
                 council_data = super_council_ai_enhanced(df)
                 
-                # استخدام المحرك الرئيسي للدخول
-                entry_decision = master_entry_engine(council_data, px or info["price"])
+                # استخدام المحرك المحسن مع الحارس الصارم
+                entry_decision = enhanced_master_entry_engine(council_data, px or info["price"])
                 
                 if entry_decision["allow"]:
                     direction = entry_decision["direction"]
@@ -1423,23 +1506,31 @@ def professional_trade_loop():
                         # فتح الصفقة
                         success = open_market_enhanced(direction, qty, px or info["price"])
                         if success:
+                            # 🎯 اللوج الملون القديم مع المعلومات الجديدة
+                            print(colored(f"🎯 EXECUTED: {direction.upper()} {qty:.4f} @ {px:.6f} | {mode.upper()} | Score: {quality['score']:.1f}", "green"))
                             log_i(f"🎯 PROFESSIONAL ENTRY EXECUTED | {direction.upper()} {mode.upper()} | "
                                   f"Quality Score: {quality['score']:.1f} | "
                                   f"Tier A: {', '.join(quality['tier_a']) or 'None'} | "
-                                  f"Tier B: {', '.join(quality['tier_b']) or 'None'} | "
-                                  f"Tier C: {', '.join(quality['tier_c']) or 'None'}")
+                                  f"Tier B: {', '.join(quality['tier_b']) or 'None'}")
                         else:
                             log_e("❌ Failed to execute professional entry")
                     else:
                         log_w("❌ Invalid quantity for professional entry")
                         
                 else:
-                    # تسجيل سبب الرفض
+                    # 🎯 اللوج الملون القديم لأسباب الرفض
                     quality = entry_decision.get("quality", {})
-                    log_i(f"⛔ PROFESSIONAL ENTRY REJECTED | {entry_decision.get('reason', 'unknown')} | "
+                    reasons = entry_decision.get("reasons", [])
+                    
+                    if "strict_guard_blocked" in entry_decision.get("reason", ""):
+                        print(colored(f"⛔ BLOCKED: {', '.join(reasons)} | Score: {quality.get('score', 0):.1f}", "red"))
+                    else:
+                        print(colored(f"⛔ REJECTED: {entry_decision.get('reason', 'unknown')} | Score: {quality.get('score', 0):.1f}", "yellow"))
+                    
+                    log_i(f"⛔ ENTRY REJECTED | {entry_decision.get('reason', 'unknown')} | "
                           f"Score: {quality.get('score', 0):.1f} | "
                           f"Tier A: {', '.join(quality.get('tier_a', [])) or 'None'} | "
-                          f"Reasons: {', '.join(entry_decision.get('reasons', []))}")
+                          f"Reasons: {', '.join(reasons)}")
 
             # إدارة الصفقة المفتوحة
             if STATE["open"]:
@@ -1448,6 +1539,10 @@ def professional_trade_loop():
                     "trend_ctx": trend_ctx
                 })
             
+            # 🎯 اللوج الملون القديم
+            if LOG_LEGACY:
+                pretty_snapshot(bal, {"price": px or info["price"], **info}, ind, spread_bps, "Professional Strict System", df)
+            
             loop_i += 1
             sleep_s = NEAR_CLOSE_S if time_to_candle_close(df) <= 10 else BASE_SLEEP
             time.sleep(sleep_s)
@@ -1455,6 +1550,39 @@ def professional_trade_loop():
         except Exception as e:
             log_e(f"Professional trade loop error: {e}\n{traceback.format_exc()}")
             time.sleep(BASE_SLEEP)
+
+# =================== LEGACY COLORED SNAPSHOT ===================
+def pretty_snapshot(bal, info, ind, spread_bps, reason=None, df=None):
+    """
+    🎯 اللوج الملون القديم - تم الحفاظ عليه مع إضافة معلومات الجودة
+    """
+    if LOG_LEGACY:
+        left_s = time_to_candle_close(df) if df is not None else 0
+        print(colored("─"*100,"cyan"))
+        print(colored(f"📊 {SYMBOL} {INTERVAL} • {EXCHANGE_NAME.upper()} • {'LIVE' if MODE_LIVE else 'PAPER'} • {datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S')} UTC","cyan"))
+        print(colored("─"*100,"cyan"))
+        print("📈 INDICATORS & RF")
+        print(f"   💲 Price {fmt(info.get('price'))} | RF filt={fmt(info.get('filter'))}  hi={fmt(info.get('hi'))} lo={fmt(info.get('lo'))}")
+        print(f"   🧮 RSI={fmt(safe_get(ind, 'rsi'))}  +DI={fmt(safe_get(ind, 'plus_di'))}  -DI={fmt(safe_get(ind, 'minus_di'))}  ADX={fmt(safe_get(ind, 'adx'))}  ATR={fmt(safe_get(ind, 'atr'))}")
+        print(f"   🎯 ENTRY: PROFESSIONAL STRICT SYSTEM | spread_bps={fmt(spread_bps,2)}")
+        print(f"   ⏱️ closes_in ≈ {left_s}s")
+        print("\n🧭 POSITION")
+        bal_line = f"Balance={fmt(bal,2)}  Risk={int(RISK_ALLOC*100)}%×{LEVERAGE}x  CompoundPnL={fmt(compound_pnl)}  Eq~{fmt((bal or 0)+compound_pnl,2)}"
+        print(colored(f"   {bal_line}", "yellow"))
+        if STATE["open"]:
+            lamp='🟩 LONG' if STATE['side']=='long' else '🟥 SHORT'
+            print(f"   {lamp}  Entry={fmt(STATE['entry'])}  Qty={fmt(STATE['qty'],4)}  Bars={STATE['bars']}  Trail={fmt(STATE['trail'])}  BE={fmt(STATE['breakeven'])}")
+            print(f"   🎯 TP_done={STATE['profit_targets_achieved']}  HP={fmt(STATE['highest_profit_pct'],2)}%")
+            print(f"   🎯 MODE={STATE.get('mode', 'trend')}  PROFILE={STATE.get('profit_profile', 'none')}")
+            
+            # إضافة معلومات الجودة إذا كانت متاحة
+            quality = STATE.get("entry_quality", {})
+            if quality:
+                print(f"   🏆 QUALITY: Score={quality.get('score', 0):.1f} | Tier A: {len(quality.get('tier_a', []))} | Tier B: {len(quality.get('tier_b', []))}")
+        else:
+            print("   ⚪ FLAT")
+        if reason: print(colored(f"   ℹ️ reason: {reason}", "white"))
+        print(colored("─"*100,"cyan"))
 
 # =================== API / KEEPALIVE ===================
 app = Flask(__name__)
@@ -1470,7 +1598,7 @@ def mark_position(color):
 @app.route("/")
 def home():
     mode='LIVE' if MODE_LIVE else 'PAPER'
-    return f"✅ SUI ULTRA PRO AI BOT — {EXCHANGE_NAME.upper()} — {SYMBOL} {INTERVAL} — {mode} — PROFESSIONAL TIER SYSTEM"
+    return f"✅ SUI ULTRA PRO AI BOT — {EXCHANGE_NAME.upper()} — {SYMBOL} {INTERVAL} — {mode} — PROFESSIONAL STRICT SYSTEM"
 
 @app.route("/metrics")
 def metrics():
@@ -1479,15 +1607,12 @@ def metrics():
         "symbol": SYMBOL, "interval": INTERVAL, "mode": "live" if MODE_LIVE else "paper",
         "leverage": LEVERAGE, "risk_alloc": RISK_ALLOC, "price": price_now(),
         "state": STATE, "compound_pnl": compound_pnl,
-        "entry_system": "PROFESSIONAL_TIER_SYSTEM",
-        "tier_weights": {
-            "tier_a": TIER_A_WEIGHT,
-            "tier_b": TIER_B_WEIGHT, 
-            "tier_c": TIER_C_WEIGHT
-        },
-        "min_scores": {
-            "trend": TREND_MIN_SCORE,
-            "scalp": SCALP_MIN_SCORE
+        "entry_system": "PROFESSIONAL_STRICT_SYSTEM",
+        "strict_guards": {
+            "scalp_min_score": STRICT_SCALP_MIN_SCORE,
+            "trend_min_score": STRICT_TREND_MIN_SCORE,
+            "trend_tier_a_min": STRICT_TREND_TIER_A_MIN,
+            "tier_b_min": STRICT_TIER_B_MIN
         }
     })
 
@@ -1497,7 +1622,7 @@ def health():
         "ok": True, "exchange": EXCHANGE_NAME, "mode": "live" if MODE_LIVE else "paper",
         "open": STATE["open"], "side": STATE["side"], "qty": STATE["qty"],
         "compound_pnl": compound_pnl, "timestamp": datetime.utcnow().isoformat(),
-        "entry_system": "PROFESSIONAL_TIER_SYSTEM"
+        "entry_system": "PROFESSIONAL_STRICT_SYSTEM"
     }), 200
 
 @app.route("/entry_quality")
@@ -1506,10 +1631,11 @@ def get_entry_quality():
     current_quality = STATE.get("entry_quality", {})
     return jsonify({
         "current_quality": current_quality,
-        "thresholds": {
-            "trend_min_score": TREND_MIN_SCORE,
-            "scalp_min_score": SCALP_MIN_SCORE,
-            "trend_need_tier_a": TREND_NEED_TIER_A
+        "strict_guards": {
+            "scalp_min_score": STRICT_SCALP_MIN_SCORE,
+            "trend_min_score": STRICT_TREND_MIN_SCORE,
+            "trend_tier_a_min": STRICT_TREND_TIER_A_MIN,
+            "tier_b_min": STRICT_TIER_B_MIN
         }
     })
 
@@ -1542,13 +1668,14 @@ def keepalive_loop():
 
 # =================== EXECUTION VERIFICATION ===================
 def verify_execution_environment():
-    print(f"⚙️ PROFESSIONAL EXECUTION ENVIRONMENT", flush=True)
+    print(f"⚙️ PROFESSIONAL STRICT EXECUTION ENVIRONMENT", flush=True)
     print(f"🔧 EXCHANGE: {EXCHANGE_NAME.upper()} | SYMBOL: {SYMBOL}", flush=True)
     print(f"🔧 EXECUTE_ORDERS: {EXECUTE_ORDERS} | DRY_RUN: {DRY_RUN}", flush=True)
-    print(f"🎯 PROFESSIONAL TIER SYSTEM ACTIVATED", flush=True)
-    print(f"   Tier A Weight: {TIER_A_WEIGHT} | Tier B Weight: {TIER_B_WEIGHT} | Tier C Weight: {TIER_C_WEIGHT}", flush=True)
-    print(f"   Trend Min Score: {TREND_MIN_SCORE} | Scalp Min Score: {SCALP_MIN_SCORE}", flush=True)
-    print(f"   Trend Requires Tier A: {TREND_NEED_TIER_A}", flush=True)
+    print(f"🎯 PROFESSIONAL STRICT SYSTEM ACTIVATED", flush=True)
+    print(f"   Strict Scalp Min Score: {STRICT_SCALP_MIN_SCORE}", flush=True)
+    print(f"   Strict Trend Min Score: {STRICT_TREND_MIN_SCORE}", flush=True)
+    print(f"   Strict Trend Tier A Min: {STRICT_TREND_TIER_A_MIN}", flush=True)
+    print(f"   Strict Tier B Min: {STRICT_TIER_B_MIN}", flush=True)
 
 if __name__ == "__main__":
     verify_execution_environment()
@@ -1559,9 +1686,9 @@ if __name__ == "__main__":
     
     log_i(f"🚀 SUI ULTRA PRO AI BOT STARTED - {BOT_VERSION}")
     log_i(f"🎯 SYMBOL: {SYMBOL} | INTERVAL: {INTERVAL} | LEVERAGE: {LEVERAGE}x")
-    log_i(f"💡 PROFESSIONAL TIER SYSTEM ACTIVATED")
-    log_i(f"   • Tier A: Golden/SMC/Liquidity (Required for Trend)")
-    log_i(f"   • Tier B: FVG/OB/Structure (Strong Support)") 
-    log_i(f"   • Tier C: RSI/ADX/Candles (Optimization)")
+    log_i(f"💡 PROFESSIONAL STRICT SYSTEM ACTIVATED")
+    log_i(f"   • السكالب: يحتاج score ≥ {STRICT_SCALP_MIN_SCORE}")
+    log_i(f"   • الترند: يحتاج score ≥ {STRICT_TREND_MIN_SCORE} + Tier A ≥ {STRICT_TREND_TIER_A_MIN}")
+    log_i(f"   • الحارس الصارم: يمنع الصفقات الضعيفة تلقائياً")
     
     app.run(host="0.0.0.0", port=PORT, debug=False)
