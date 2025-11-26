@@ -1,546 +1,892 @@
-# =================== SMART MONEY CONCEPTS (SMC) ENGINE ===================
+# -*- coding: utf-8 -*-
+"""
+SUI ULTRA PRO AI BOT - الإصدار المحترف الذكي المتقدم
+• نظام دخول مرتب بمستويات Tier A/B/C
+• مجلس إدارة محترف مع تقييم جودة الدخول
+• إدارة ذكية للمراكز بناءً على قوة الإشارات
+• تنظيف كامل للكود من المنطق القديم
+"""
 
-class SmartMoneyConcepts:
-    def __init__(self):
-        self.pivot_highs = deque(maxlen=20)
-        self.pivot_lows = deque(maxlen=20)
-        self.order_blocks = deque(maxlen=15)
-        self.fair_value_gaps = deque(maxlen=15)
-        self.liquidity_zones = deque(maxlen=10)
-        
-    def detect_pivot_points(self, df, left_bars=5, right_bars=5):
-        """كشف القمم والقيعان المحورية"""
-        if len(df) < left_bars + right_bars + 1:
-            return
-            
-        highs = df['high'].astype(float)
-        lows = df['low'].astype(float)
-        
-        for i in range(left_bars, len(df) - right_bars):
-            # كشف القمة المحورية
-            if highs.iloc[i] == highs.iloc[i-left_bars:i+right_bars+1].max():
-                self.pivot_highs.append({
-                    'index': i,
-                    'price': highs.iloc[i],
-                    'timestamp': df['time'].iloc[i],
-                    'strength': self._calculate_pivot_strength(highs, i, left_bars, right_bars)
-                })
-            
-            # كشف القاع المحوري
-            if lows.iloc[i] == lows.iloc[i-left_bars:i+right_bars+1].min():
-                self.pivot_lows.append({
-                    'index': i,
-                    'price': lows.iloc[i],
-                    'timestamp': df['time'].iloc[i],
-                    'strength': self._calculate_pivot_strength(lows, i, left_bars, right_bars, False)
-                })
-    
-    def _calculate_pivot_strength(self, series, idx, left, right, is_high=True):
-        """حساب قوة القمة/القاع المحوري"""
-        if is_high:
-            left_min = series.iloc[idx-left:idx].min()
-            right_min = series.iloc[idx+1:idx+right+1].min()
-            return (series.iloc[idx] - max(left_min, right_min)) / series.iloc[idx] * 100
-        else:
-            left_max = series.iloc[idx-left:idx].max()
-            right_max = series.iloc[idx+1:idx+right+1].max()
-            return (min(left_max, right_max) - series.iloc[idx]) / series.iloc[idx] * 100
-    
-    def detect_order_blocks(self, df, lookback=10):
-        """كشف كتل الأوامر (Order Blocks)"""
-        if len(df) < lookback + 5:
-            return
-            
-        for i in range(5, len(df) - 1):
-            current_candle = {
-                'open': float(df['open'].iloc[i]),
-                'high': float(df['high'].iloc[i]),
-                'low': float(df['low'].iloc[i]),
-                'close': float(df['close'].iloc[i])
-            }
-            next_candle = {
-                'open': float(df['open'].iloc[i+1]),
-                'high': float(df['high'].iloc[i+1]),
-                'low': float(df['low'].iloc[i+1]),
-                'close': float(df['close'].iloc[i+1])
-            }
-            
-            # Bullish Order Block: شمعة هابطة يليها شمعة صاعدة
-            if (current_candle['close'] < current_candle['open'] and 
-                next_candle['close'] > next_candle['open'] and
-                next_candle['close'] > current_candle['high']):
-                
-                self.order_blocks.append({
-                    'type': 'bullish',
-                    'entry_zone': [current_candle['low'], current_candle['high']],
-                    'timestamp': df['time'].iloc[i],
-                    'strength': self._calculate_ob_strength(current_candle, next_candle)
-                })
-            
-            # Bearish Order Block: شمعة صاعدة يليها شمعة هابطة
-            elif (current_candle['close'] > current_candle['open'] and 
-                  next_candle['close'] < next_candle['open'] and
-                  next_candle['close'] < current_candle['low']):
-                
-                self.order_blocks.append({
-                    'type': 'bearish',
-                    'entry_zone': [current_candle['low'], current_candle['high']],
-                    'timestamp': df['time'].iloc[i],
-                    'strength': self._calculate_ob_strength(current_candle, next_candle)
-                })
-    
-    def _calculate_ob_strength(self, candle1, candle2):
-        """حساب قوة كتلة الأوامر"""
-        body1 = abs(candle1['close'] - candle1['open'])
-        body2 = abs(candle2['close'] - candle2['open'])
-        range1 = candle1['high'] - candle1['low']
-        
-        if range1 == 0:
-            return 0
-            
-        body_ratio = body1 / range1
-        momentum = body2 / body1 if body1 > 0 else 0
-        
-        return min(5.0, (body_ratio * 3 + momentum * 2))
-    
-    def detect_fair_value_gaps(self, df):
-        """كشف فجوات القيمة العادلة (FVG)"""
-        if len(df) < 4:
-            return
-            
-        for i in range(2, len(df) - 1):
-            candle_a = {
-                'high': float(df['high'].iloc[i-2]),
-                'low': float(df['low'].iloc[i-2])
-            }
-            candle_b = {
-                'high': float(df['high'].iloc[i-1]),
-                'low': float(df['low'].iloc[i-1])
-            }
-            candle_c = {
-                'high': float(df['high'].iloc[i]),
-                'low': float(df['low'].iloc[i])
-            }
-            
-            # Bullish FVG: A-high < C-low
-            if candle_a['high'] < candle_c['low']:
-                self.fair_value_gaps.append({
-                    'type': 'bullish',
-                    'zone': [candle_a['high'], candle_c['low']],
-                    'size_bps': ((candle_c['low'] - candle_a['high']) / candle_a['high']) * 10000,
-                    'timestamp': df['time'].iloc[i]
-                })
-            
-            # Bearish FVG: A-low > C-high
-            elif candle_a['low'] > candle_c['high']:
-                self.fair_value_gaps.append({
-                    'type': 'bearish',
-                    'zone': [candle_c['high'], candle_a['low']],
-                    'size_bps': ((candle_a['low'] - candle_c['high']) / candle_a['low']) * 10000,
-                    'timestamp': df['time'].iloc[i]
-                })
-    
-    def analyze_liquidity_zones(self, current_price):
-        """تحليل مناطق السيولة"""
-        supply_zones = []
-        demand_zones = []
-        
-        # مناطق العرض (مقاومة)
-        for pivot in self.pivot_highs:
-            if pivot['price'] > current_price * 1.005:  # فوق السعر ب 0.5%
-                supply_zones.append({
-                    'price': pivot['price'],
-                    'strength': pivot['strength'],
-                    'type': 'supply'
-                })
-        
-        # مناطق الطلب (دعم)
-        for pivot in self.pivot_lows:
-            if pivot['price'] < current_price * 0.995:  # تحت السعر ب 0.5%
-                demand_zones.append({
-                    'price': pivot['price'],
-                    'strength': pivot['strength'],
-                    'type': 'demand'
-                })
-        
-        # ترتيب المناطق حسب القوة
-        supply_zones.sort(key=lambda x: x['strength'], reverse=True)
-        demand_zones.sort(key=lambda x: x['strength'], reverse=True)
-        
-        return {
-            'supply_zones': supply_zones[:3],  # أقوى 3 مناطق عرض
-            'demand_zones': demand_zones[:3],  # أقوى 3 مناطق طلب
-            'current_strength': self._calculate_current_liquidity_strength(current_price)
-        }
-    
-    def _calculate_current_liquidity_strength(self, current_price):
-        """حساب قوة السيولة الحالية"""
-        near_supply = any(abs(pivot['price'] - current_price) / current_price < 0.02 
-                         for pivot in self.pivot_highs)
-        near_demand = any(abs(pivot['price'] - current_price) / current_price < 0.02 
-                         for pivot in self.pivot_lows)
-        
-        return {
-            'near_supply': near_supply,
-            'near_demand': near_demand,
-            'imbalance': len([p for p in self.pivot_highs if p['price'] > current_price]) - 
-                        len([p for p in self.pivot_lows if p['price'] < current_price])
-        }
-    
-    def get_smc_analysis(self, df, current_price):
-        """تحليل SMC شامل"""
-        self.detect_pivot_points(df)
-        self.detect_order_blocks(df)
-        self.detect_fair_value_gaps(df)
-        
-        return {
-            'pivot_highs': list(self.pivot_highs)[-5:],  # آخر 5 قمم
-            'pivot_lows': list(self.pivot_lows)[-5:],    # آخر 5 قيعان
-            'order_blocks': list(self.order_blocks)[-3:], # آخر 3 كتل أوامر
-            'fair_value_gaps': list(self.fair_value_gaps)[-3:], # آخر 3 فجوات
-            'liquidity_pools': self.analyze_liquidity_zones(current_price)
-        }
+import os, time, math, random, signal, sys, traceback, logging, json
+from logging.handlers import RotatingFileHandler
+from datetime import datetime
+import pandas as pd
+import numpy as np
+import ccxt
+from flask import Flask, jsonify
+from decimal import Decimal, ROUND_DOWN, InvalidOperation
+from collections import deque, defaultdict
+import statistics
 
-# =================== PRICE STRUCTURE ANALYSIS ===================
+try:
+    from termcolor import colored
+except Exception:
+    def colored(t,*a,**k): return t
 
-def analyze_price_structure(df):
-    """تحليل الهيكل السعري المتقدم"""
-    if len(df) < 30:
-        return {"ok": False, "trend": "neutral", "trend_strength": 0}
-    
-    highs = df['high'].astype(float)
-    lows = df['low'].astype(float)
-    closes = df['close'].astype(float)
-    
-    # تحديد Higher Highs / Lower Lows
-    hh = 0
-    hl = 0
-    lh = 0
-    ll = 0
-    
-    for i in range(2, len(df)):
-        # Higher High
-        if highs.iloc[i] > highs.iloc[i-1] > highs.iloc[i-2]:
-            hh += 1
-        # Higher Low
-        elif lows.iloc[i] > lows.iloc[i-1] > lows.iloc[i-2]:
-            hl += 1
-        # Lower High
-        elif highs.iloc[i] < highs.iloc[i-1] < highs.iloc[i-2]:
-            lh += 1
-        # Lower Low
-        elif lows.iloc[i] < lows.iloc[i-1] < lows.iloc[i-2]:
-            ll += 1
-    
-    # تحديد الاتجاه
-    bullish_strength = hh + hl
-    bearish_strength = lh + ll
-    total_strength = bullish_strength + bearish_strength
-    
-    if total_strength == 0:
-        return {"ok": False, "trend": "neutral", "trend_strength": 0}
-    
-    if bullish_strength > bearish_strength * 1.5:
-        trend = "bullish"
-        strength = bullish_strength / total_strength * 10
-    elif bearish_strength > bullish_strength * 1.5:
-        trend = "bearish"
-        strength = bearish_strength / total_strength * 10
-    else:
-        trend = "ranging"
-        strength = abs(bullish_strength - bearish_strength) / total_strength * 5
-    
-    # كشف نقاط التحول المحتملة
-    potential_reversal = False
-    if trend == "bullish" and ll > hh:
-        potential_reversal = True
-    elif trend == "bearish" and hh > ll:
-        potential_reversal = True
-    
-    return {
-        "ok": True,
-        "trend": trend,
-        "trend_strength": round(strength, 2),
-        "bullish_signals": bullish_strength,
-        "bearish_signals": bearish_strength,
-        "potential_reversal": potential_reversal,
-        "structure": f"HH:{hh} HL:{hl} LH:{lh} LL:{ll}"
-    }
+# =================== SMART ENTRY QUALITY ENGINE ===================
 
-# =================== VWAP ANALYSIS ===================
+# أوزان الطبقات
+TIER_A_WEIGHT = 4      # Golden / SMC قوي / Liquidity Sweep كبيرة
+TIER_B_WEIGHT = 2      # FVG / OB / VWAP / Structure / Flow  
+TIER_C_WEIGHT = 1      # RSI / ADX / Candles
 
-def calculate_vwap(df):
-    """حساب VWAP (Volume Weighted Average Price)"""
-    if len(df) < 20:
-        return {"ok": False, "vwap": 0, "deviation": 0}
-    
-    typical_price = (df['high'].astype(float) + df['low'].astype(float) + df['close'].astype(float)) / 3
-    volume = df['volume'].astype(float)
-    
-    vwap = (typical_price * volume).cumsum() / volume.cumsum()
-    current_vwap = vwap.iloc[-1]
-    current_price = float(df['close'].iloc[-1])
-    
-    deviation = ((current_price - current_vwap) / current_vwap) * 100
-    
-    return {
-        "ok": True,
-        "vwap": current_vwap,
-        "deviation": round(deviation, 4),
-        "above_vwap": current_price > current_vwap,
-        "aligned": abs(deviation) < 1.0  # ضمن 1% من VWAP
-    }
+# عتبات الدخول
+TREND_MIN_SCORE = 10      # أقل Score لصفقة ترند
+SCALP_MIN_SCORE = 5       # أقل Score لسكالب محترم
 
-# =================== ENTRY DECISION MASTER ENGINE ===================
+TREND_NEED_TIER_A = True    # لازم إشارة Tier A لصفقة ترند
+SCALP_NEED_TIER_A = False   # السكالب ممكن بدون Tier A لو النقاط كفاية
 
-def master_entry_engine(council, price):
-    """
-    أقوى نسخة منطق دخول مرتبة – tier-based + decisive + clean
-    """
+# =================== ENV / MODE ===================
+EXCHANGE_NAME = os.getenv("EXCHANGE", "bingx").lower()
 
-    tierA = []
-    tierB = []
-    tierC = []
+if EXCHANGE_NAME == "bybit":
+    API_KEY = os.getenv("BYBIT_API_KEY", "")
+    API_SECRET = os.getenv("BYBIT_API_SECRET", "")
+else:
+    API_KEY = os.getenv("BINGX_API_KEY", "")
+    API_SECRET = os.getenv("BINGX_API_SECRET", "")
 
-    det = council["details"]
-    gz   = det.get("golden_zone", {})
-    smc  = det.get("smc_analysis", {})
-    indi = det.get("indicators", {})
-    vwap = det.get("vwap_analysis", {})
-    cndl = det.get("candle_signals", {})
+MODE_LIVE = bool(API_KEY and API_SECRET)
+SELF_URL = os.getenv("SELF_URL", "") or os.getenv("RENDER_EXTERNAL_URL", "")
+PORT = int(os.getenv("PORT", 5000))
 
-    # ----------- TIER A (أقوى 3 إشارات لا تفتح صفقة ترند بدونها) -----------
+# ==== Run mode / Logging toggles ====
+LOG_LEGACY = False
+LOG_ADDONS = True
 
-    # GOLDEN ZONE CONFIRMED
-    if gz.get("ok") and gz.get("score", 0) >= 6:
-        tierA.append(f"GOLDEN({gz['zone']['type']})")
+# ==== Execution Switches ====
+EXECUTE_ORDERS = True
+SHADOW_MODE_DASHBOARD = False
+DRY_RUN = False
 
-    # STRONG SMC (OB + FVG + Liquidity Sweep)
-    smc_strength = 0
+# ==== Addon: Logging + Recovery Settings ====
+BOT_VERSION = f"SUI ULTRA PRO AI v8.0 — {EXCHANGE_NAME.upper()} - PROFESSIONAL TIER SYSTEM"
+print("🚀 Booting:", BOT_VERSION, flush=True)
 
-    if smc['liquidity_pools']['ok']:
-        ph = len(smc['liquidity_pools']['pivot_highs'])
-        pl = len(smc['liquidity_pools']['pivot_lows'])
-        if ph >= 2 or pl >= 2:
-            smc_strength += 2
+STATE_PATH = "./bot_state.json"
+RESUME_ON_RESTART = True
+RESUME_LOOKBACK_SECS = 60 * 60
 
-    if len(smc.get("order_blocks", [])) >= 2:
-        smc_strength += 2
+# =================== SETTINGS ===================
+SYMBOL     = os.getenv("SYMBOL", "SUI/USDT:USDT")
+INTERVAL   = os.getenv("INTERVAL", "15m")
 
-    if len(smc.get("fair_value_gaps", [])) >= 2:
-        smc_strength += 1
+# ===== RISK / LEVERAGE PROFILE (FIXED) =====
+LEVERAGE   = 10
+RISK_ALLOC = 0.60
 
-    if smc_strength >= 4:
-        tierA.append(f"SMC_STRONG({smc_strength})")
+POSITION_MODE = os.getenv("POSITION_MODE", "oneway")
 
-    # LIQUIDITY SWEEP
-    lq = smc["liquidity_pools"].get("current_strength", {})
-    if lq.get("near_supply") or lq.get("near_demand"):
-        tierA.append("LIQ_SWEEP")
+# RF Settings
+RF_SOURCE = "close"
+RF_PERIOD = int(os.getenv("RF_PERIOD", 18))
+RF_MULT   = float(os.getenv("RF_MULT", 3.0))
+RF_LIVE_ONLY = True
+RF_HYST_BPS  = 6.0
 
-    # ----------- TIER B (داعم قوي – يكمل الصفقة) -----------
+# Indicators
+RSI_LEN = 14
+ADX_LEN = 14
+ATR_LEN = 14
 
-    # VWAP Alignment
-    if vwap.get("ok") and vwap.get("aligned"):
-        tierB.append(f"VWAP_ALIGN")
+MAX_SPREAD_BPS = float(os.getenv("MAX_SPREAD_BPS", 6.0))
 
-    # Strong Order Block
-    obs = smc.get("order_blocks", [])
-    if obs and obs[-1]["strength"] >= 3:
-        tierB.append(f"OB({obs[-1]['strength']})")
+# Dynamic TP / trail
+TP1_PCT_BASE       = 0.45
+TP1_CLOSE_FRAC     = 0.50
+BREAKEVEN_AFTER    = 0.30
+TRAIL_ACTIVATE_PCT = 1.20
+ATR_TRAIL_MULT     = 1.8
 
-    # Strong FVG
-    fvgs = smc.get("fair_value_gaps", [])
-    if fvgs and fvgs[-1]["size_bps"] >= 8:
-        tierB.append(f"FVG({fvgs[-1]['size_bps']:.1f})")
+# Dust guard
+FINAL_CHUNK_QTY = float(os.getenv("FINAL_CHUNK_QTY", 50.0))
+RESIDUAL_MIN_QTY = float(os.getenv("RESIDUAL_MIN_QTY", 10.0))
 
-    # Market Structure
-    ps = det.get("price_structure", {})
-    if ps.get("ok") and ps.get("trend_strength", 0) >= 2:
-        tierB.append(f"STRUCT_{ps['trend']}({ps['trend_strength']})")
+# Strict close
+CLOSE_RETRY_ATTEMPTS = 6
+CLOSE_VERIFY_WAIT_S  = 2.0
 
-    # ----------- TIER C (فلتر وتحسين فقط) -----------
+# Pacing
+BASE_SLEEP   = 5
+NEAR_CLOSE_S = 1
 
-    # RSI context
-    rsi = indi.get("rsi", 50)
-    if 40 <= rsi <= 60:
-        tierC.append(f"RSI_NEUTRAL({rsi:.1f})")
-    if rsi < 30:
-        tierC.append(f"RSI_OVERSOLD({rsi:.1f})")
-    if rsi > 70:
-        tierC.append(f"RSI_OVERBOUGHT({rsi:.1f})")
+# ===== SMART ENTRY SYSTEM =====
+SCALP_MODE = True
+COUNCIL_AI_MODE = True
+TREND_RIDING_AI = True
 
-    # ADX
-    if indi.get("adx", 0) >= 20:
-        tierC.append(f"ADX({indi['adx']:.1f})")
+# ===== PROFIT PROFILES =====
+PROFIT_PROFILE_CONFIG = {
+    "SCALP_SMALL": {
+        "label": "SCALP_SMALL",
+        "tp1_pct": 0.45,
+        "tp2_pct": None,
+        "tp3_pct": None,
+        "trail_start_pct": 0.50,
+        "desc": "صفقة سكالب صغيرة"
+    },
+    "TREND_MEDIUM": {
+        "label": "TREND_MEDIUM", 
+        "tp1_pct": 0.8,
+        "tp2_pct": 1.6,
+        "tp3_pct": None,
+        "trail_start_pct": 1.0,
+        "desc": "ترند متوسط"
+    },
+    "TREND_STRONG": {
+        "label": "TREND_STRONG",
+        "tp1_pct": 0.8,
+        "tp2_pct": 2.0,
+        "tp3_pct": 4.0,
+        "trail_start_pct": 1.2,
+        "desc": "ترند قوي"
+    },
+}
 
-    # Candles
-    cs = max(cndl.get("score_buy", 0), cndl.get("score_sell", 0))
-    if cs >= 4:
-        tierC.append(f"CANDLE({cs})")
+# ===== SNAPSHOT & MARK SYSTEM =====
+GREEN="🟢"; RED="🔴"
+RESET="\x1b[0m"; BOLD="\x1b[1m"
+FG_G="\x1b[32m"; FG_R="\x1b[31m"; FG_C="\x1b[36m"; FG_Y="\x1b[33m"; FG_M="\x1b[35m"
 
-    # -----------------------------------
-    # --------- DECISION LOGIC ----------
-    # -----------------------------------
+# ===== SMART QUANTITY FIX =====
+MIN_QTY = 0.1
+MIN_BALANCE_FOR_TRADE = 10.0
 
-    score = len(tierA) * 4 + len(tierB) * 2 + len(tierC) * 1
+# =================== PROFESSIONAL LOGGING ===================
+def log_i(msg): print(f"ℹ️ {msg}", flush=True)
+def log_g(msg): print(f"✅ {msg}", flush=True)
+def log_w(msg): print(f"🟨 {msg}", flush=True)
+def log_e(msg): print(f"❌ {msg}", flush=True)
 
-    # Determine Mode
-    if len(tierA) >= 1 and score >= 10:
-        mode = "trend"
-    elif score >= 7:
-        mode = "studied_scalp"
-    elif score >= 5:
-        mode = "cautious_scalp"
-    else:
-        mode = "reject"
+def log_banner(text): print(f"\n{'—'*12} {text} {'—'*12}\n", flush=True)
 
-    # Determine Direction
-    side = None
-    if gz.get("ok"):
-        if gz["zone"]["type"] == "golden_bottom": side = "buy"
-        if gz["zone"]["type"] == "golden_top":    side = "sell"
-    else:
-        if cndl.get("score_buy", 0) > cndl.get("score_sell", 0): side = "buy"
-        if cndl.get("score_sell", 0) > cndl.get("score_buy", 0): side = "sell"
-
-    if mode == "reject" or side is None:
-        return {
-            "allow": False,
-            "mode": "reject",
-            "side": None,
-            "score": score,
-            "tierA": tierA,
-            "tierB": tierB,
-            "tierC": tierC,
-            "why": "weak_structure"
-        }
-
-    return {
-        "allow": True,
-        "mode": mode,
-        "side": side,
-        "score": score,
-        "tierA": tierA,
-        "tierB": tierB,
-        "tierC": tierC
-    }
-
-# =================== ENHANCED COUNCIL AI WITH SMC ===================
-
-def super_council_ai_enhanced_with_smc(df):
-    """نسخة محسنة من المجلس مع دمج SMC والهيكل السعري"""
+def save_state(state: dict):
     try:
-        if len(df) < 50:
-            return {"b": 0, "s": 0, "score_b": 0.0, "score_s": 0.0, "logs": [], "confidence": 0.0}
+        state["ts"] = int(time.time())
+        with open(STATE_PATH, "w", encoding="utf-8") as f:
+            json.dump(state, f, ensure_ascii=False, indent=2)
+    except Exception as e:
+        log_w(f"state save failed: {e}")
+
+def load_state() -> dict:
+    try:
+        if not os.path.exists(STATE_PATH): return {}
+        with open(STATE_PATH, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception as e:
+        log_w(f"state load failed: {e}")
+    return {}
+
+# =================== EXCHANGE FACTORY ===================
+def make_ex():
+    exchange_config = {
+        "apiKey": API_KEY,
+        "secret": API_SECRET,
+        "enableRateLimit": True,
+        "timeout": 20000,
+    }
+    
+    if EXCHANGE_NAME == "bybit":
+        exchange_config["options"] = {"defaultType": "swap"}
+        return ccxt.bybit(exchange_config)
+    else:
+        exchange_config["options"] = {"defaultType": "swap"}
+        return ccxt.bingx(exchange_config)
+
+ex = make_ex()
+
+# =================== EXCHANGE-SPECIFIC ADAPTERS ===================
+def exchange_specific_params(side, is_close=False):
+    if EXCHANGE_NAME == "bybit":
+        if POSITION_MODE == "hedge":
+            return {"positionSide": "Long" if side == "buy" else "Short", "reduceOnly": is_close}
+        return {"positionSide": "Both", "reduceOnly": is_close}
+    else:
+        if POSITION_MODE == "hedge":
+            return {"positionSide": "LONG" if side == "buy" else "SHORT", "reduceOnly": is_close}
+        return {"positionSide": "BOTH", "reduceOnly": is_close}
+
+def exchange_set_leverage(exchange, leverage, symbol):
+    try:
+        if EXCHANGE_NAME == "bybit":
+            exchange.set_leverage(leverage, symbol)
+        else:
+            exchange.set_leverage(leverage, symbol, params={"side": "BOTH"})
+        log_g(f"✅ {EXCHANGE_NAME.upper()} leverage set: {leverage}x")
+    except Exception as e:
+        log_w(f"⚠️ set_leverage warning: {e}")
+
+# =================== MARKET SPECS ===================
+MARKET = {}
+AMT_PREC = 0
+LOT_STEP = None
+LOT_MIN  = None
+
+def load_market_specs():
+    global MARKET, AMT_PREC, LOT_STEP, LOT_MIN
+    try:
+        ex.load_markets()
+        MARKET = ex.markets.get(SYMBOL, {})
+        AMT_PREC = int((MARKET.get("precision", {}) or {}).get("amount", 0) or 0)
+        LOT_STEP = (MARKET.get("limits", {}) or {}).get("amount", {}).get("step", None)
+        LOT_MIN  = (MARKET.get("limits", {}) or {}).get("amount", {}).get("min",  None)
+        log_i(f"🎯 {SYMBOL} specs → precision={AMT_PREC}, step={LOT_STEP}, min={LOT_MIN}")
+    except Exception as e:
+        log_w(f"load_market_specs: {e}")
+
+def ensure_leverage_mode():
+    try:
+        exchange_set_leverage(ex, LEVERAGE, SYMBOL)
+        log_i(f"📊 {EXCHANGE_NAME.upper()} position mode: {POSITION_MODE}")
+    except Exception as e:
+        log_w(f"ensure_leverage_mode: {e}")
+
+try:
+    load_market_specs()
+    ensure_leverage_mode()
+except Exception as e:
+    log_w(f"exchange init: {e}")
+
+# =================== LOGGING SETUP ===================
+def setup_file_logging():
+    """إعداد التسجيل المهني مع قمع رسائل Werkzeug"""
+    logger = logging.getLogger()
+    logger.setLevel(logging.INFO)
+    
+    for handler in logger.handlers[:]:
+        logger.removeHandler(handler)
+    
+    if not any(isinstance(h, RotatingFileHandler) and getattr(h, "baseFilename", "").endswith("bot.log")
+               for h in logger.handlers):
+        fh = RotatingFileHandler("bot.log", maxBytes=5_000_000, backupCount=7, encoding="utf-8")
+        fh.setFormatter(logging.Formatter("%(asctime)s %(levelname)s: %(message)s [%(filename)s:%(lineno)d]"))
+        logger.addHandler(fh)
+    
+    ch = logging.StreamHandler()
+    ch.setFormatter(logging.Formatter("%(asctime)s %(levelname)s: %(message)s"))
+    logger.addHandler(ch)
+    
+    logging.getLogger('werkzeug').setLevel(logging.ERROR)
+    logging.getLogger('ccxt.base.exchange').setLevel(logging.INFO)
+    
+    log_i("🔄 Professional logging ready")
+
+setup_file_logging()
+
+# =================== HELPERS ===================
+_consec_err = 0
+last_loop_ts = time.time()
+
+def _fmt(x,n=6):
+    try: return f"{float(x):.{n}f}"
+    except: return str(x)
+
+def _pct(x):
+    try: return f"{float(x):.2f}%"
+    except: return str(x)
+
+def last_scalar(x, default=0.0):
+    """يرجع float من آخر عنصر"""
+    try:
+        if isinstance(x, (int, float)):
+            return float(x)
+        if isinstance(x, pd.Series): 
+            return float(x.iloc[-1])
+        if isinstance(x, (list, tuple, np.ndarray)): 
+            return float(x[-1])
+        if isinstance(x, str):
+            return None
+        if x is None or (isinstance(x, float) and math.isnan(x)):
+            return None
+        return float(x)
+    except Exception:
+        return None
+
+def safe_get(ind: dict, key: str, default=0.0):
+    """يقرأ مؤشر من dict ويحوّله scalar أخير"""
+    if ind is None: 
+        return float(default)
+    val = ind.get(key, default)
+    result = last_scalar(val, default=default)
+    return result if result is not None else float(default)
+
+def _round_amt(q):
+    """نسخة محسنة من التقريب مع منع القيم الصغيرة"""
+    if q is None: 
+        return MIN_QTY
         
-        current_price = float(df['close'].iloc[-1])
-        ind = compute_indicators(df)
+    try:
+        d = Decimal(str(q))
         
-        # تحليلات متقدمة
-        smc_analysis = smc_detector.get_smc_analysis(df, current_price)
-        price_structure = analyze_price_structure(df)
-        vwap_analysis = calculate_vwap(df)
-        gz = golden_zone_check(df, ind)
-        candles = compute_candles(df)
-        flow = compute_flow_metrics(df)
+        if d < Decimal(str(MIN_QTY)):
+            return float(MIN_QTY)
+            
+        if LOT_STEP and isinstance(LOT_STEP, (int, float)) and LOT_STEP > 0:
+            step = Decimal(str(LOT_STEP))
+            d = (d / step).to_integral_value(rounding=ROUND_DOWN) * step
+            
+        prec = int(AMT_PREC) if AMT_PREC and AMT_PREC >= 0 else 0
+        d = d.quantize(Decimal(1).scaleb(-prec), rounding=ROUND_DOWN)
         
-        # تحليل السيولة المتقدم
-        liquidity_analysis = smc_detector.analyze_liquidity_zones(current_price)
+        if LOT_MIN and isinstance(LOT_MIN, (int, float)) and LOT_MIN > 0 and d < Decimal(str(LOT_MIN)):
+            return float(MIN_QTY)
+            
+        result = float(d)
         
-        council_data = {
-            "b": 0, "s": 0,
-            "score_b": 0.0, "score_s": 0.0,
-            "logs": [],
-            "confidence": 0.0,
-            "details": {
-                "smc_analysis": smc_analysis,
-                "price_structure": price_structure,
-                "vwap_analysis": vwap_analysis,
-                "golden_zone": gz,
-                "candle_signals": candles,
-                "flow_metrics": flow,
-                "liquidity_analysis": liquidity_analysis,
-                "indicators": ind
-            }
-        }
+        if result <= 0:
+            return float(MIN_QTY)
+            
+        return result
         
-        # ===== SMC-BASED VOTING =====
+    except (InvalidOperation, ValueError, TypeError):
+        return float(MIN_QTY)
+
+def safe_qty(q): 
+    """نسخة محسنة مع حماية من القيم الصغيرة جداً"""
+    try:
+        q_float = float(q) if q else 0.0
         
-        # Order Blocks تأثير
-        for ob in smc_analysis.get('order_blocks', [])[-2:]:
-            if ob['type'] == 'bullish' and ob['strength'] >= 3:
-                council_data["score_b"] += ob['strength'] * 0.8
-                council_data["b"] += 1
-                council_data["logs"].append(f"📦 Bullish OB (str:{ob['strength']:.1f})")
-            elif ob['type'] == 'bearish' and ob['strength'] >= 3:
-                council_data["score_s"] += ob['strength'] * 0.8
-                council_data["s"] += 1
-                council_data["logs"].append(f"📦 Bearish OB (str:{ob['strength']:.1f})")
+        if q_float < MIN_QTY:
+            log_w(f"🛑 كمية صغيرة جداً: {q_float:.6f} < {MIN_QTY}، رفع إلى الحد الأدنى")
+            q_float = MIN_QTY
+            
+        q_rounded = _round_amt(q_float)
         
-        # FVG تأثير
-        for fvg in smc_analysis.get('fair_value_gaps', [])[-2:]:
-            if fvg['type'] == 'bullish' and fvg['size_bps'] >= 5:
-                council_data["score_b"] += min(2.0, fvg['size_bps'] * 0.1)
-                council_data["b"] += 1
-                council_data["logs"].append(f"📊 Bullish FVG ({fvg['size_bps']:.1f}bps)")
-            elif fvg['type'] == 'bearish' and fvg['size_bps'] >= 5:
-                council_data["score_s"] += min(2.0, fvg['size_bps'] * 0.1)
-                council_data["s"] += 1
-                council_data["logs"].append(f"📊 Bearish FVG ({fvg['size_bps']:.1f}bps)")
-        
-        # الهيكل السعري
-        if price_structure["ok"]:
-            if price_structure["trend"] == "bullish":
-                council_data["score_b"] += price_structure["trend_strength"] * 0.3
-                council_data["b"] += int(price_structure["trend_strength"])
-                council_data["logs"].append(f"📈 Bullish Structure (str:{price_structure['trend_strength']:.1f})")
-            elif price_structure["trend"] == "bearish":
-                council_data["score_s"] += price_structure["trend_strength"] * 0.3
-                council_data["s"] += int(price_structure["trend_strength"])
-                council_data["logs"].append(f"📉 Bearish Structure (str:{price_structure['trend_strength']:.1f})")
-        
-        # VWAP محاذاة
-        if vwap_analysis["ok"] and vwap_analysis["aligned"]:
-            if vwap_analysis["above_vwap"]:
-                council_data["score_b"] += 1.5
-                council_data["b"] += 1
-                council_data["logs"].append("🔷 Above VWAP (Bullish)")
-            else:
-                council_data["score_s"] += 1.5
-                council_data["s"] += 1
-                council_data["logs"].append("🔷 Below VWAP (Bearish)")
-        
-        # السيولة
-        liq_strength = liquidity_analysis.get('current_strength', {})
-        if liq_strength.get('near_demand'):
-            council_data["score_b"] += 2.0
-            council_data["b"] += 2
-            council_data["logs"].append("💧 Near Demand Liquidity")
-        if liq_strength.get('near_supply'):
-            council_data["score_s"] += 2.0
-            council_data["s"] += 2
-            council_data["logs"].append("💧 Near Supply Liquidity")
-        
-        # ===== APPLY MASTER ENTRY ENGINE =====
-        master_decision = master_entry_engine(council_data, current_price)
-        
-        # تحديث البيانات النهائية
-        council_data.update({
-            "master_decision": master_decision,
-            "confidence": min(1.0, (council_data["score_b"] + council_data["score_s"]) / 25.0)
-        })
-        
-        return council_data
+        if q_rounded <= 0:
+            log_w(f"🛑 الكمية بعد التقريب صفر: {q_float:.6f} → {q_rounded}")
+            q_rounded = MIN_QTY
+            
+        log_i(f"✅ كمية الصفقة النهائية: {q_rounded:.4f}")
+        return q_rounded
         
     except Exception as e:
-        log_w(f"Enhanced Council AI with SMC error: {e}")
-        return {"b":0,"s":0,"score_b":0.0,"score_s":0.0,"logs":[],"confidence":0.0,"master_decision":{"allow":False}}
+        log_e(f"❌ خطأ في safe_qty: {e}")
+        return MIN_QTY
 
-# =================== ENHANCED POSITION MANAGEMENT ===================
+def compute_size(balance, price):
+    """
+    حجم اللوت ثابت:
+    - 60% من رصيد المحفظة
+    - ×10x ليفرج
+    """
+    effective_balance = float(balance or 0.0)
+    px = float(price or 0.0)
 
-def manage_position_enhanced_with_smc(df, ind, info):
-    """إدارة محسنة للمراكز مع دمج SMC"""
+    if effective_balance <= 0 or px <= 0:
+        return 0.0
+
+    capital_usdt = effective_balance * 0.60
+    notional_usdt = capital_usdt * 10.0
+    raw_qty = notional_usdt / px
+
+    qty = safe_qty(raw_qty)
+
+    log_i(
+        f"SIZE_FIXED_60pct_10x | bal={effective_balance:.2f} | "
+        f"price={px:.6f} | capital={capital_usdt:.2f} | "
+        f"notional={notional_usdt:.2f} | qty={qty:.4f}"
+    )
+
+    return qty
+
+def fmt(v, d=6, na="—"):
+    try:
+        if v is None or (isinstance(v,float) and (math.isnan(v) or math.isinf(v))): return na
+        return f"{float(v):.{d}f}"
+    except Exception:
+        return na
+
+def with_retry(fn, tries=3, base_wait=0.4):
+    global _consec_err
+    for i in range(tries):
+        try:
+            r = fn()
+            _consec_err = 0
+            return r
+        except Exception:
+            _consec_err += 1
+            if i == tries-1: raise
+            time.sleep(base_wait*(2**i) + random.random()*0.25)
+
+def fetch_ohlcv(limit=600):
+    rows = with_retry(lambda: ex.fetch_ohlcv(SYMBOL, timeframe=INTERVAL, limit=limit, params={"type":"swap"}))
+    return pd.DataFrame(rows, columns=["time","open","high","low","close","volume"])
+
+def price_now():
+    try:
+        t = with_retry(lambda: ex.fetch_ticker(SYMBOL))
+        return t.get("last") or t.get("close")
+    except Exception: return None
+
+def balance_usdt():
+    if not MODE_LIVE: return 100.0
+    try:
+        b = with_retry(lambda: ex.fetch_balance(params={"type":"swap"}))
+        return b.get("total",{}).get("USDT") or b.get("free",{}).get("USDT")
+    except Exception: return None
+
+def orderbook_spread_bps():
+    try:
+        ob = with_retry(lambda: ex.fetch_order_book(SYMBOL, limit=5))
+        bid = ob["bids"][0][0] if ob["bids"] else None
+        ask = ob["asks"][0][0] if ob["asks"] else None
+        if not (bid and ask): return None
+        mid = (bid+ask)/2.0
+        return ((ask-bid)/mid)*10000.0
+    except Exception:
+        return None
+
+def _interval_seconds(iv: str) -> int:
+    iv=(iv or "").lower().strip()
+    if iv.endswith("m"): return int(float(iv[:-1]))*60
+    if iv.endswith("h"): return int(float(iv[:-1]))*3600
+    if iv.endswith("d"): return int(float(iv[:-1]))*86400
+    return 15*60
+
+def time_to_candle_close(df: pd.DataFrame) -> int:
+    tf = _interval_seconds(INTERVAL)
+    if len(df) == 0: return tf
+    cur_start_ms = int(df["time"].iloc[-1])
+    now_ms = int(time.time()*1000)
+    next_close_ms = cur_start_ms + tf*1000
+    while next_close_ms <= now_ms:
+        next_close_ms += tf*1000
+    left = max(0, next_close_ms - now_ms)
+    return int(left/1000)
+
+# =================== SMART CONTEXT SYSTEMS ===================
+class SmartTrendContext:
+    def __init__(self):
+        self.fast_ma = deque(maxlen=20)
+        self.slow_ma = deque(maxlen=50)
+        self.trend = "flat"
+        self.strength = 0.0
+        self.momentum = 0.0
+
+    def update(self, close, volume=None):
+        self.fast_ma.append(close)
+        self.slow_ma.append(close)
+
+        if len(self.slow_ma) < 10:
+            self.trend = "flat"
+            self.strength = 0
+            self.momentum = 0
+            return
+
+        fast = sum(self.fast_ma) / len(self.fast_ma)
+        slow = sum(self.slow_ma) / len(self.slow_ma)
+
+        delta = fast - slow
+        self.strength = abs(delta) / slow * 100 if slow != 0 else 0
+        
+        if len(self.fast_ma) >= 5:
+            recent = list(self.fast_ma)[-5:]
+            self.momentum = (recent[-1] - recent[0]) / recent[0] * 100 if recent[0] != 0 else 0
+
+        if delta > 0 and self.strength > 0.1:
+            self.trend = "up"
+        elif delta < 0 and self.strength > 0.1:
+            self.trend = "down"
+        else:
+            self.trend = "flat"
+
+    def is_strong_trend(self):
+        return self.strength > 0.3 and abs(self.momentum) > 0.5
+
+class SMCDetector:
+    def __init__(self):
+        self.swing_highs = deque(maxlen=10)
+        self.swing_lows = deque(maxlen=10)
+        self.liquidity_zones = []
+        
+    def detect_swings(self, df, lookback=20):
+        if len(df) < lookback * 2:
+            return
+            
+        highs = df['high'].astype(float).tail(lookback * 2)
+        lows = df['low'].astype(float).tail(lookback * 2)
+        
+        for i in range(lookback, len(highs) - lookback):
+            if highs.iloc[i] == highs.iloc[i-lookback:i+lookback].max():
+                self.swing_highs.append((i, highs.iloc[i]))
+            if lows.iloc[i] == lows.iloc[i-lookback:i+lookback].min():
+                self.swing_lows.append((i, lows.iloc[i]))
+    
+    def detect_liquidity_zones(self, current_price):
+        zones = []
+        for _, high in self.swing_highs:
+            if high > current_price * 1.01:
+                zones.append(("sell_liquidity", high))
+        
+        for _, low in self.swing_lows:
+            if low < current_price * 0.99:
+                zones.append(("buy_liquidity", low))
+                
+        return zones
+
+def volume_is_strong(vol_list, window=20, threshold=1.4):
+    if len(vol_list) < window:
+        return False
+    recent = vol_list[-window:]
+    avg = sum(recent) / len(recent)
+    return recent[-1] > avg * threshold
+
+def detect_ob(candles):
+    if len(candles) < 5:
+        return None
+    
+    candle_list = []
+    for i in range(len(candles)):
+        candle_list.append({
+            'open': float(candles['open'].iloc[i]),
+            'high': float(candles['high'].iloc[i]),
+            'low': float(candles['low'].iloc[i]),
+            'close': float(candles['close'].iloc[i])
+        })
+    
+    if len(candle_list) < 5:
+        return None
+        
+    b = candle_list[-4]
+    c = candle_list[-3]
+    
+    if b['close'] < b['open'] and c['close'] > c['open']:
+        return ("bullish", b['open'], b['close'])
+    
+    if b['close'] > b['open'] and c['close'] < c['open']:
+        return ("bearish", b['open'], b['close'])
+    
+    return None
+
+def detect_fvg(candles):
+    if len(candles) < 4:
+        return None
+        
+    candle_list = []
+    for i in range(len(candles)):
+        candle_list.append({
+            'open': float(candles['open'].iloc[i]),
+            'high': float(candles['high'].iloc[i]),
+            'low': float(candles['low'].iloc[i]),
+            'close': float(candles['close'].iloc[i])
+        })
+    
+    if len(candle_list) < 4:
+        return None
+        
+    a = candle_list[-4]
+    b = candle_list[-3]
+    c = candle_list[-2]
+
+    if a['high'] < c['low']:
+        return ("bullish", a['high'], c['low'])
+
+    if a['low'] > c['high']:
+        return ("bearish", c['high'], a['low'])
+
+    return None
+
+# =================== SMART ENTRY QUALITY ENGINE ===================
+def evaluate_entry_quality(direction, council_data, current_price=None):
+    """
+    🎯 أقوى نظام تقييم دخول - يجمع كل الإستراتيجيات في Score واحد
+    """
+    score = 0
+    tier_a_hits = []
+    tier_b_hits = [] 
+    tier_c_hits = []
+    
+    # استخراج البيانات من مجلس الإدارة
+    golden = council_data.get("golden", {})
+    smc = council_data.get("smc_analysis", {})
+    fvg = council_data.get("fvg_analysis", {})
+    ob = council_data.get("order_blocks", {})
+    structure = council_data.get("price_structure", {})
+    rsi_ctx = council_data.get("rsi_context", {})
+    adx_ctx = council_data.get("adx_context", {})
+    candles = council_data.get("candle_signals", {})
+
+    # ============= TIER A - الإشارات القوية (إلزامي للترند) =============
+    
+    # 1. المناطق الذهبية القوية
+    if golden.get("ok") and golden.get("score", 0) >= 6.5:
+        score += TIER_A_WEIGHT * 2
+        tier_a_hits.append(f"GOLDEN_{golden.get('zone_type', '').upper()}({golden.get('score', 0):.1f})")
+
+    # 2. تحليل SMC قوي
+    smc_strength = 0
+    if smc.get("bos_detected"):
+        smc_strength += 2
+    if smc.get("choch_detected"): 
+        smc_strength += 2
+    if smc.get("liquidity_sweep"):
+        smc_strength += 2
+        
+    if smc_strength >= 4:
+        score += TIER_A_WEIGHT
+        tier_a_hits.append(f"SMC_STRONG({smc_strength})")
+
+    # 3. مناطق السيولة الكبيرة
+    liq_zones = smc.get("liquidity_zones", [])
+    strong_liquidity = len([z for z in liq_zones if z.get("strength", 0) >= 3]) >= 2
+    if strong_liquidity:
+        score += TIER_A_WEIGHT
+        tier_a_hits.append("STRONG_LIQUIDITY")
+
+    # ============= TIER B - إشارات الدعم القوية =============
+    
+    # 1. فجوات القيمة العادلة القوية
+    if fvg.get("valid") and fvg.get("strength", 0) >= 3:
+        score += TIER_B_WEIGHT
+        tier_b_hits.append(f"FVG_STRONG({fvg.get('strength', 0):.1f})")
+
+    # 2. كتل الأوامر المحترفة
+    if ob.get("valid") and ob.get("strength", 0) >= 3:
+        score += TIER_B_WEIGHT  
+        tier_b_hits.append(f"OB_STRONG({ob.get('strength', 0):.1f})")
+
+    # 3. هيكل سعري واضح
+    if structure.get("trend_strength", 0) >= 2:
+        score += TIER_B_WEIGHT
+        tier_b_hits.append(f"STRUCTURE_{structure.get('trend', '').upper()}({structure.get('trend_strength', 0):.1f})")
+
+    # ============= TIER C - عوامل تحسين =============
+    
+    # 1. RSI في منطقة مناسبة
+    rsi_val = rsi_ctx.get("value", 50)
+    if (direction == "buy" and 30 <= rsi_val <= 45) or (direction == "sell" and 55 <= rsi_val <= 70):
+        score += TIER_C_WEIGHT
+        tier_c_hits.append(f"RSI_OPTIMAL({rsi_val:.1f})")
+
+    # 2. ADX قوي
+    if adx_ctx.get("value", 0) >= 20:
+        score += TIER_C_WEIGHT
+        tier_c_hits.append(f"ADX_STRONG({adx_ctx.get('value', 0):.1f})")
+
+    # 3. إشارات شموع قوية
+    candle_strength = max(candles.get("buy_score", 0), candles.get("sell_score", 0))
+    if candle_strength >= 2:
+        score += TIER_C_WEIGHT
+        tier_c_hits.append(f"CANDLE_STRONG({candle_strength:.1f})")
+
+    # ============= قرار السماح بالدخول =============
+    
+    has_tier_a = len(tier_a_hits) > 0
+    
+    return {
+        "score": score,
+        "tier_a": tier_a_hits,
+        "tier_b": tier_b_hits, 
+        "tier_c": tier_c_hits,
+        "has_tier_a": has_tier_a
+    }
+
+def master_entry_engine(council_data, current_price):
+    """
+    🧠 المحرك الرئيسي للدخول - يقرر الجانب والنمط بناءً على كل البيانات
+    """
+    # استخراج اتجاه مجلس الإدارة
+    score_buy = council_data.get("score_b", 0)
+    score_sell = council_data.get("score_sell", 0)
+    votes_buy = council_data.get("b", 0)
+    votes_sell = council_data.get("s", 0)
+    
+    # تحديد الاتجاه الأساسي
+    if score_buy > score_sell and votes_buy > votes_sell:
+        direction = "buy"
+        confidence = min(1.0, score_buy / 20.0)
+    elif score_sell > score_buy and votes_sell > votes_buy:
+        direction = "sell" 
+        confidence = min(1.0, score_sell / 20.0)
+    else:
+        return {"allow": False, "reason": "no_clear_direction"}
+    
+    # تحديد النمط المبدئي
+    adx_val = council_data.get("adx", 0)
+    if adx_val >= 25 and confidence >= 0.7:
+        preliminary_mode = "trend"
+    else:
+        preliminary_mode = "scalp"
+    
+    # تقييم جودة الدخول
+    quality = evaluate_entry_quality(direction, council_data, current_price)
+    
+    # تحديد السماح بالدخول بناءً على النمط والجودة
+    if preliminary_mode == "trend":
+        min_score = TREND_MIN_SCORE
+        need_tier_a = TREND_NEED_TIER_A
+    else:
+        min_score = SCALP_MIN_SCORE
+        need_tier_a = SCALP_NEED_TIER_A
+
+    allow = True
+    reasons = []
+
+    if quality["score"] < min_score:
+        allow = False
+        reasons.append(f"low_score({quality['score']:.1f} < {min_score})")
+
+    if need_tier_a and not quality["has_tier_a"]:
+        allow = False
+        reasons.append("no_tier_A_signal")
+
+    if not allow:
+        return {
+            "allow": False,
+            "reason": "low_quality",
+            "details": quality,
+            "reasons": reasons
+        }
+    
+    # التعديل النهائي للنمط بناءً على الجودة
+    if preliminary_mode == "trend" and not quality["has_tier_a"]:
+        final_mode = "scalp"
+    else:
+        final_mode = preliminary_mode
+        
+    return {
+        "allow": True,
+        "direction": direction,
+        "mode": final_mode,
+        "confidence": confidence,
+        "quality": quality,
+        "details": {
+            "score_buy": score_buy,
+            "score_sell": score_sell,
+            "votes_buy": votes_buy,
+            "votes_sell": votes_sell,
+            "adx": adx_val
+        }
+    }
+
+# =================== PROFESSIONAL TRADE EXECUTION ===================
+def open_market_enhanced(side, qty, price):
+    """نسخة محسنة من فتح الصفقة مع النظام الجديد"""
+    if qty <= 0 or price is None:
+        log_e("❌ كمية أو سعر غير صالح")
+        return False
+
+    # تحقق إضافي من الحجم
+    balance = balance_usdt()
+    expected_qty = compute_size(balance, price)
+    
+    if abs(qty - expected_qty) > (expected_qty * 0.1):
+        log_w(f"⚠️ تصحيح الحجم: {qty:.4f} → {expected_qty:.4f}")
+        qty = expected_qty
+
+    df = fetch_ohlcv(limit=200)
+    ind = compute_indicators(df)
+
+    # تحديد المود النهائي
+    trend_info = compute_trend_strength(df, ind)
+    trend_strength = trend_info.get("strength", "flat")
+    
+    council_data = super_council_ai_enhanced(df)
+    entry_decision = master_entry_engine(council_data, price)
+    
+    if not entry_decision["allow"]:
+        log_w(f"⛔ الدخول مرفوض: {entry_decision.get('reason', 'unknown')}")
+        return False
+
+    mode = entry_decision["mode"]
+    quality = entry_decision["quality"]
+
+    # تحديد Profit Profile المناسب
+    if mode == "scalp":
+        profit_profile = PROFIT_PROFILE_CONFIG["SCALP_SMALL"]
+    elif trend_strength in ["strong", "very_strong"] and quality["score"] >= 12:
+        profit_profile = PROFIT_PROFILE_CONFIG["TREND_STRONG"]
+    else:
+        profit_profile = PROFIT_PROFILE_CONFIG["TREND_MEDIUM"]
+
+    # إعدادات الإدارة
+    management_config = {
+        "tp1_pct": profit_profile["tp1_pct"],
+        "tp2_pct": profit_profile["tp2_pct"],
+        "tp3_pct": profit_profile["tp3_pct"],
+        "trail_start_pct": profit_profile["trail_start_pct"],
+        "profile": profit_profile["label"],
+        "profile_desc": profit_profile["desc"]
+    }
+
+    # تنفيذ الأمر
+    success = execute_trade_decision(side, price, qty, mode, council_data)
+
+    if success:
+        trade_side = "long" if side.lower().startswith("b") else "short"
+        
+        STATE.update({
+            "open": True,
+            "side": trade_side,
+            "entry": float(price),
+            "qty": float(qty),
+            "pnl": 0.0,
+            "bars": 0,
+            "mode": mode,
+            "management": management_config,
+            "opened_at": time.time(),
+            "tp1_done": False,
+            "trail_active": False,
+            "breakeven_armed": False,
+            "highest_profit_pct": 0.0,
+            "profit_targets_achieved": 0,
+            "profit_profile": profit_profile["label"],
+            "entry_quality": quality
+        })
+
+        save_state({
+            "in_position": True,
+            "side": "LONG" if trade_side == "long" else "SHORT",
+            "entry_price": price,
+            "position_qty": qty,
+            "leverage": LEVERAGE,
+            "mode": mode,
+            "profit_profile": profit_profile["label"],
+            "management": management_config,
+            "opened_at": int(time.time())
+        })
+
+        # لوج ملوّن واضح
+        profile_color = "🟢" if profit_profile["label"] == "TREND_STRONG" else "🟡" if profit_profile["label"] == "TREND_MEDIUM" else "🔵"
+        log_g(
+            f"{profile_color} PROFESSIONAL TRADE OPENED | {side.upper()} {qty:.4f} @ {price:.6f} "
+            f"| {mode.upper()} | {profit_profile['label']} | "
+            f"Quality Score: {quality['score']:.1f} | "
+            f"Tier A: {', '.join(quality['tier_a']) or 'None'}"
+        )
+        
+        return True
+
+    return False
+
+def execute_trade_decision(side, price, qty, mode, council_data):
+    if not EXECUTE_ORDERS or DRY_RUN:
+        log_i(f"DRY_RUN: {side} {qty:.4f} @ {price:.6f} | mode={mode}")
+        return True
+    
+    if qty <= 0:
+        log_e("❌ كمية غير صالحة للتنفيذ")
+        return False
+
+    print(f"🎯 EXECUTE: {side.upper()} {qty:.4f} @ {price:.6f} | "
+          f"mode={mode} | votes={council_data['b']}/{council_data['s']} score={council_data['score_b']:.1f}/{council_data['score_s']:.1f}", flush=True)
+
+    try:
+        if MODE_LIVE:
+            exchange_set_leverage(ex, LEVERAGE, SYMBOL)
+            params = exchange_specific_params(side, is_close=False)
+            ex.create_order(SYMBOL, "market", side, qty, None, params)
+        
+        log_g(f"✅ EXECUTED: {side.upper()} {qty:.4f} @ {price:.6f}")
+        return True
+    except Exception as e:
+        log_e(f"❌ EXECUTION FAILED: {e}")
+        return False
+
+# =================== SMART TRADE MANAGEMENT ===================
+def manage_trade_by_profile(df, ind, info):
+    """إدارة الصفقة حسب التصنيف المحدد من النظام الجديد"""
     if not STATE["open"] or STATE["qty"] <= 0:
         return
 
@@ -548,89 +894,484 @@ def manage_position_enhanced_with_smc(df, ind, info):
     entry = STATE["entry"]
     side = STATE["side"]
     mode = STATE.get("mode", "scalp")
+    profile = STATE.get("profit_profile", "SCALP_SMALL")
     
+    # حساب الربح
     pnl_pct = (px - entry) / entry * 100 * (1 if side == "long" else -1)
     STATE["pnl"] = pnl_pct
     
     if pnl_pct > STATE["highest_profit_pct"]:
         STATE["highest_profit_pct"] = pnl_pct
 
-    # ===== SMC-BASED DYNAMIC MANAGEMENT =====
+    # جلب إعدادات الـ Profile
+    management = STATE.get("management", {})
+    tp1 = management.get("tp1_pct", 0.45)
+    tp2 = management.get("tp2_pct")
+    tp3 = management.get("tp3_pct")
     
-    current_price = float(df['close'].iloc[-1])
-    smc_analysis = smc_detector.get_smc_analysis(df, current_price)
-    liquidity_zones = smc_detector.analyze_liquidity_zones(current_price)
-    
-    # ترقية السكالب لترند عند إشارات قوية
-    if mode == "scalp" and not STATE.get("upgraded_to_trend", False):
-        upgrade_conditions = [
-            pnl_pct >= 0.8,
-            len(smc_analysis.get('order_blocks', [])) >= 2,
-            liquidity_zones['current_strength']['imbalance'] > 2
-        ]
+    # تطبيق أهداف الربح حسب الـ Profile
+    if profile == "SCALP_SMALL" and not STATE.get("tp1_done") and pnl_pct >= tp1:
+        close_market_strict(f"SCALP_SMALL TP: {tp1}%")
+        return
         
-        if sum(upgrade_conditions) >= 2:
-            STATE["mode"] = "trend"
-            STATE["upgraded_to_trend"] = True
-            log_i("🎯 SCALP UPGRADED TO TREND - Strong SMC signals detected")
-    
-    # وقف خسارة ديناميكي يعتمد على السيولة
-    if not STATE.get("dynamic_sl_set", False):
-        nearest_support = min([z['price'] for z in liquidity_zones['demand_zones']], default=entry * 0.99)
-        nearest_resistance = max([z['price'] for z in liquidity_zones['supply_zones']], default=entry * 1.01)
-        
-        if side == "long":
-            dynamic_sl = nearest_support
-        else:
-            dynamic_sl = nearest_resistance
+    elif profile == "TREND_MEDIUM":
+        if not STATE.get("tp1_done") and pnl_pct >= tp1:
+            close_qty = safe_qty(STATE["qty"] * 0.5)
+            if close_qty > 0:
+                close_side = "sell" if side == "long" else "buy"
+                if MODE_LIVE and EXECUTE_ORDERS and not DRY_RUN:
+                    try:
+                        params = exchange_specific_params(close_side, is_close=True)
+                        ex.create_order(SYMBOL, "market", close_side, close_qty, None, params)
+                        log_g(f"🎯 TREND_MEDIUM TP1 | {tp1}% | closed 50%")
+                        STATE["qty"] = safe_qty(STATE["qty"] - close_qty)
+                        STATE["tp1_done"] = True
+                    except Exception as e:
+                        log_e(f"❌ TREND_MEDIUM TP1 close failed: {e}")
+                        
+        elif STATE.get("tp1_done") and not STATE.get("tp2_done") and pnl_pct >= tp2:
+            close_market_strict(f"TREND_MEDIUM TP2: {tp2}%")
+            return
             
-        STATE["dynamic_stop_loss"] = dynamic_sl
-        STATE["dynamic_sl_set"] = True
-        log_i(f"🛡️ Dynamic SL set: {dynamic_sl:.6f}")
-
-    # جني أرباح ذكي عند مناطق السيولة
-    if side == "long" and liquidity_zones['supply_zones']:
-        nearest_supply = liquidity_zones['supply_zones'][0]['price']
-        if px >= nearest_supply * 0.998 and pnl_pct > 0.5:  # قرب منطقة العرض
-            close_qty = safe_qty(STATE["qty"] * 0.5)
+    elif profile == "TREND_STRONG":
+        if not STATE.get("tp1_done") and pnl_pct >= tp1:
+            close_qty = safe_qty(STATE["qty"] * 0.3)
             if close_qty > 0:
-                close_side = "sell"
+                close_side = "sell" if side == "long" else "buy"
                 if MODE_LIVE and EXECUTE_ORDERS and not DRY_RUN:
                     try:
                         params = exchange_specific_params(close_side, is_close=True)
                         ex.create_order(SYMBOL, "market", close_side, close_qty, None, params)
-                        log_g(f"🏦 Take Profit at Supply Zone | PnL: {pnl_pct:.2f}%")
+                        log_g(f"🎯 TREND_STRONG TP1 | {tp1}% | closed 30%")
                         STATE["qty"] = safe_qty(STATE["qty"] - close_qty)
+                        STATE["tp1_done"] = True
                     except Exception as e:
-                        log_e(f"❌ Supply zone TP failed: {e}")
-    
-    elif side == "short" and liquidity_zones['demand_zones']:
-        nearest_demand = liquidity_zones['demand_zones'][0]['price']
-        if px <= nearest_demand * 1.002 and pnl_pct > 0.5:  # قرب منطقة الطلب
-            close_qty = safe_qty(STATE["qty"] * 0.5)
+                        log_e(f"❌ TREND_STRONG TP1 close failed: {e}")
+                        
+        elif STATE.get("tp1_done") and not STATE.get("tp2_done") and pnl_pct >= tp2:
+            close_qty = safe_qty(STATE["qty"] * 0.3)
             if close_qty > 0:
-                close_side = "buy"
+                close_side = "sell" if side == "long" else "buy"
                 if MODE_LIVE and EXECUTE_ORDERS and not DRY_RUN:
                     try:
                         params = exchange_specific_params(close_side, is_close=True)
                         ex.create_order(SYMBOL, "market", close_side, close_qty, None, params)
-                        log_g(f"🏦 Take Profit at Demand Zone | PnL: {pnl_pct:.2f}%")
+                        log_g(f"🎯 TREND_STRONG TP2 | {tp2}% | closed 30%")
                         STATE["qty"] = safe_qty(STATE["qty"] - close_qty)
+                        STATE["tp2_done"] = True
                     except Exception as e:
-                        log_e(f"❌ Demand zone TP failed: {e}")
-    
-    # الإدارة الأساسية
-    manage_after_entry_enhanced(df, ind, info)
+                        log_e(f"❌ TREND_STRONG TP2 close failed: {e}")
+                        
+        elif STATE.get("tp2_done") and not STATE.get("tp3_done") and pnl_pct >= tp3:
+            close_market_strict(f"TREND_STRONG TP3: {tp3}%")
+            return
 
-# =================== ENHANCED TRADE LOOP WITH SMC ===================
+    STATE["bars"] += 1
 
-def trade_loop_enhanced_with_smc():
-    """الدورة الرئيسية المحسنة مع دمج SMC"""
-    global wait_for_next_signal_side, compound_pnl
+def apply_smart_profit_strategy():
+    """نسخة مبسطة من نظام جني الأرباح"""
+    if not STATE.get("open") or STATE["qty"] <= 0:
+        return
+        
+    try:
+        current_price = price_now()
+        if not current_price or not STATE.get("entry"):
+            return
+            
+        entry_price = STATE["entry"]
+        side = STATE["side"]
+        mode = STATE.get("mode", "scalp")
+        
+        # حساب الربح/الخسارة
+        if side == "long":
+            pnl_pct = ((current_price - entry_price) / entry_price) * 100
+        else:
+            pnl_pct = ((entry_price - current_price) / entry_price) * 100
+        
+        STATE["pnl"] = pnl_pct
+        
+        # نظام جني الأرباح المبسط
+        if mode == "scalp":
+            if pnl_pct >= 0.8 and not STATE.get("scalp_tp_done", False):
+                log_g(f"💰 SCALP TP FULL | pnl={pnl_pct:.2f}%")
+                close_market_strict("scalp_tp_full")
+                STATE["scalp_tp_done"] = True
+                return
+        else:
+            # TP1 عند 1.5% - إغلاق 40%
+            if (pnl_pct >= 1.5 and 
+                not STATE.get("trend_tp1_done", False) and 
+                STATE["qty"] > 0):
+                
+                close_qty = safe_qty(STATE["qty"] * 0.4)
+                if close_qty > 0:
+                    close_side = "sell" if STATE["side"] == "long" else "buy"
+                    if MODE_LIVE and EXECUTE_ORDERS and not DRY_RUN:
+                        try:
+                            params = exchange_specific_params(close_side, is_close=True)
+                            ex.create_order(SYMBOL, "market", close_side, close_qty, None, params)
+                            log_g(f"🎯 TREND TP1 | pnl={pnl_pct:.2f}% | closed 40%")
+                        except Exception as e:
+                            log_e(f"❌ TREND TP1 close failed: {e}")
+                    STATE["qty"] = safe_qty(STATE["qty"] - close_qty)
+                    STATE["trend_tp1_done"] = True
+            
+            # TP2 عند 3.0% - إغلاق باقي الصفقة
+            if (pnl_pct >= 3.0 and 
+                not STATE.get("trend_tp2_done", False) and 
+                STATE["qty"] > 0):
+                
+                log_g(f"🏁 TREND TP2 FULL EXIT | pnl={pnl_pct:.2f}%")
+                close_market_strict("trend_tp2_full")
+                STATE["trend_tp2_done"] = True
+                return
+                
+    except Exception as e:
+        log_w(f"Simple profit strategy error: {e}")
+
+# =================== INDICATORS ===================
+def wilder_ema(s: pd.Series, n: int): 
+    return s.ewm(alpha=1/n, adjust=False).mean()
+
+def compute_indicators(df: pd.DataFrame):
+    if len(df) < max(ATR_LEN, RSI_LEN, ADX_LEN) + 2:
+        return {"rsi":50.0,"plus_di":0.0,"minus_di":0.0,"dx":0.0,"adx":0.0,"atr":0.0}
+    c,h,l = df["close"].astype(float), df["high"].astype(float), df["low"].astype(float)
+    tr = pd.concat([(h-l).abs(), (h-c.shift(1)).abs(), (l-c.shift(1)).abs()], axis=1).max(axis=1)
+    atr = wilder_ema(tr, ATR_LEN)
+
+    delta=c.diff(); up=delta.clip(lower=0.0); dn=(-delta).clip(lower=0.0)
+    rs = wilder_ema(up, RSI_LEN) / wilder_ema(dn, RSI_LEN).replace(0,1e-12)
+    rsi = 100 - (100/(1+rs))
+
+    up_move=h.diff(); down_move=l.shift(1)-l
+    plus_dm=up_move.where((up_move>down_move)&(up_move>0),0.0)
+    minus_dm=down_move.where((down_move>up_move)&(down_move>0),0.0)
+    plus_di=100*(wilder_ema(plus_dm, ADX_LEN)/atr.replace(0,1e-12))
+    minus_di=100*(wilder_ema(minus_dm, ADX_LEN)/atr.replace(0,1e-12))
+    dx=(100*(plus_di-minus_di).abs()/(plus_di+minus_di).replace(0,1e-12)).fillna(0.0)
+    adx=wilder_ema(dx, ADX_LEN)
+
+    i=len(df)-1
+    return {
+        "rsi": float(rsi.iloc[i]), "plus_di": float(plus_di.iloc[i]),
+        "minus_di": float(minus_di.iloc[i]), "dx": float(dx.iloc[i]),
+        "adx": float(adx.iloc[i]), "atr": float(atr.iloc[i])
+    }
+
+def compute_trend_strength(df, ind):
+    close = df['close'].astype(float)
+    adx = safe_get(ind, 'adx', 0)
+    plus_di = safe_get(ind, 'plus_di', 0)
+    minus_di = safe_get(ind, 'minus_di', 0)
     
-    # تهيئة محرك SMC
-    global smc_detector
-    smc_detector = SmartMoneyConcepts()
+    momentum_5 = ((close.iloc[-1] - close.iloc[-5]) / close.iloc[-5]) * 100 if len(close) >= 5 else 0
+    
+    if adx > 40 and abs(momentum_5) > 3.0:
+        strength = "very_strong"
+    elif adx > 30 and abs(momentum_5) > 2.0:
+        strength = "strong"
+    elif adx > 25 and abs(momentum_5) > 1.0:
+        strength = "moderate"
+    elif adx > 20:
+        strength = "weak"
+    else:
+        strength = "no_trend"
+    
+    direction = "up" if plus_di > minus_di else "down"
+    
+    return {
+        "strength": strength,
+        "direction": direction,
+        "adx": adx,
+        "momentum_5": momentum_5
+    }
+
+# =================== COUNCIL AI SYSTEM ===================
+def super_council_ai_enhanced(df):
+    """نسخة مبسطة من مجلس الإدارة"""
+    try:
+        if len(df) < 50:
+            return {"b": 0, "s": 0, "score_b": 0.0, "score_s": 0.0, "confidence": 0.0}
+        
+        ind = compute_indicators(df)
+        
+        # استخراج القيم
+        adx = safe_get(ind, "adx", 0.0)
+        plus_di = safe_get(ind, "plus_di", 0.0)
+        minus_di = safe_get(ind, "minus_di", 0.0)
+        rsi_val = safe_get(ind, "rsi", 50.0)
+        
+        votes_b = 0
+        votes_s = 0
+        score_b = 0.0
+        score_s = 0.0
+
+        # تحليل الاتجاه
+        if plus_di > minus_di and adx > 20:
+            votes_b += 2
+            score_b += adx * 0.1
+        elif minus_di > plus_di and adx > 20:
+            votes_s += 2
+            score_s += adx * 0.1
+
+        # تحليل RSI
+        if rsi_val < 40:
+            votes_b += 1
+            score_b += (40 - rsi_val) * 0.1
+        elif rsi_val > 60:
+            votes_s += 1
+            score_s += (rsi_val - 60) * 0.1
+
+        # تحليل المناطق الذهبية
+        golden = golden_zone_check(df, ind)
+        if golden.get("ok"):
+            if golden["zone"]["type"] == "golden_bottom":
+                votes_b += 3
+                score_b += golden["score"] * 0.2
+            elif golden["zone"]["type"] == "golden_top":
+                votes_s += 3
+                score_s += golden["score"] * 0.2
+
+        # تحليل الشموع
+        candles = compute_candles(df)
+        if candles["score_buy"] > 0:
+            votes_b += 1
+            score_b += candles["score_buy"] * 0.3
+        if candles["score_sell"] > 0:
+            votes_s += 1
+            score_s += candles["score_sell"] * 0.3
+
+        # حساب الثقة
+        total_score = score_b + score_s
+        confidence = min(1.0, total_score / 20.0)
+
+        return {
+            "b": votes_b, "s": votes_s,
+            "score_b": round(score_b, 2), "score_s": round(score_s, 2),
+            "adx": adx,
+            "golden": golden,
+            "candle_signals": candles,
+            "confidence": round(confidence, 2)
+        }
+    except Exception as e:
+        log_w(f"super_council_ai_enhanced error: {e}")
+        return {"b":0,"s":0,"score_b":0.0,"score_s":0.0,"confidence":0.0}
+
+def golden_zone_check(df, ind=None):
+    """نسخة مبسطة من كشف المناطق الذهبية"""
+    try:
+        if len(df) < 60:
+            return {"ok": False, "score": 0.0}
+        
+        close = df['close'].astype(float)
+        high = df['high'].astype(float)
+        low = df['low'].astype(float)
+        
+        # تحليل مبسط للمناطق الذهبية
+        current_price = float(close.iloc[-1])
+        recent_high = float(high.tail(20).max())
+        recent_low = float(low.tail(20).min())
+        
+        # حساب المناطق الذهبية
+        golden_bottom = recent_low + (recent_high - recent_low) * 0.618
+        golden_top = recent_high - (recent_high - recent_low) * 0.618
+        
+        score = 0.0
+        zone_type = None
+        
+        if current_price <= golden_bottom * 1.01:
+            zone_type = "golden_bottom"
+            score = 7.0
+        elif current_price >= golden_top * 0.99:
+            zone_type = "golden_top" 
+            score = 7.0
+            
+        if zone_type:
+            return {
+                "ok": True,
+                "score": score,
+                "zone_type": zone_type,
+                "zone": {
+                    "type": zone_type,
+                    "price_level": golden_bottom if zone_type == "golden_bottom" else golden_top
+                }
+            }
+        else:
+            return {"ok": False, "score": 0.0}
+            
+    except Exception as e:
+        return {"ok": False, "score": 0.0}
+
+def compute_candles(df):
+    """تحليل مبسط للشموع"""
+    if len(df) < 3:
+        return {"buy":False,"sell":False,"score_buy":0.0,"score_sell":0.0}
+    
+    try:
+        o1 = float(df["open"].iloc[-2])
+        h1 = float(df["high"].iloc[-2])
+        l1 = float(df["low"].iloc[-2])
+        c1 = float(df["close"].iloc[-2])
+        
+        o0 = float(df["open"].iloc[-3])
+        c0 = float(df["close"].iloc[-3])
+        
+        score_buy = 0.0
+        score_sell = 0.0
+        
+        # شمعة engulfing صاعدة
+        if c0 < o0 and c1 > o1 and c1 > o0 and o1 < c0:
+            score_buy += 2.0
+            
+        # شمعة engulfing هابطة  
+        if c0 > o0 and c1 < o1 and c1 < o0 and o1 > c0:
+            score_sell += 2.0
+            
+        # شمعة hammer
+        body = abs(c1 - o1)
+        lower_wick = min(o1, c1) - l1
+        if lower_wick >= 2 * body and c1 > o1:
+            score_buy += 1.5
+            
+        # شمعة shooting star
+        upper_wick = h1 - max(o1, c1)
+        if upper_wick >= 2 * body and c1 < o1:
+            score_sell += 1.5
+            
+        return {
+            "buy": score_buy > 0,
+            "sell": score_sell > 0,
+            "score_buy": round(score_buy, 2),
+            "score_sell": round(score_sell, 2)
+        }
+    except Exception as e:
+        return {"buy":False,"sell":False,"score_buy":0.0,"score_sell":0.0}
+
+# =================== RANGE FILTER ===================
+def _ema(s, n): return s.ewm(span=n, adjust=False).mean()
+
+def _rng_size(src: pd.Series, qty: float, n: int) -> pd.Series:
+    avrng = _ema((src - src.shift(1)).abs(), n)
+    wper = (n*2)-1
+    return _ema(avrng, wper) * qty
+
+def _rng_filter(src: pd.Series, rsize: pd.Series):
+    rf=[float(src.iloc[0])]
+    for i in range(1,len(src)):
+        prev=rf[-1]; x=float(src.iloc[i]); r=float(rsize.iloc[i]); cur=prev
+        if x - r > prev: cur = x - r
+        if x + r < prev: cur = x + r
+        rf.append(cur)
+    filt=pd.Series(rf, index=src.index, dtype="float64")
+    return filt + rsize, filt - rsize, filt
+
+def rf_signal_live(df: pd.DataFrame):
+    if len(df) < RF_PERIOD + 3:
+        i = -1
+        price = float(df["close"].iloc[i]) if len(df) else None
+        return {"time": int(df["time"].iloc[i]) if len(df) else int(time.time()*1000),
+                "price": price or 0.0, "long": False, "short": False,
+                "filter": price or 0.0, "hi": price or 0.0, "lo": price or 0.0}
+    src = df[RF_SOURCE].astype(float)
+    hi, lo, filt = _rng_filter(src, _rng_size(src, RF_MULT, RF_PERIOD))
+    def _bps(a,b):
+        try: return abs((a-b)/b)*10000.0
+        except Exception: return 0.0
+    p_now = float(src.iloc[-1]); p_prev = float(src.iloc[-2])
+    f_now = float(filt.iloc[-1]); f_prev = float(filt.iloc[-2])
+    long_flip  = (p_prev <= f_prev and p_now > f_now and _bps(p_now, f_now) >= RF_HYST_BPS)
+    short_flip = (p_prev >= f_prev and p_now < f_now and _bps(p_now, f_now) >= RF_HYST_BPS)
+    return {
+        "time": int(df["time"].iloc[-1]), "price": p_now,
+        "long": bool(long_flip), "short": bool(short_flip),
+        "filter": f_now, "hi": float(hi.iloc[-1]), "lo": float(lo.iloc[-1])
+    }
+
+# =================== STATE & POSITION MANAGEMENT ===================
+STATE = {
+    "open": False, "side": None, "entry": None, "qty": 0.0,
+    "pnl": 0.0, "bars": 0, "trail": None, "breakeven": None,
+    "tp1_done": False, "highest_profit_pct": 0.0,
+    "profit_targets_achieved": 0,
+}
+compound_pnl = 0.0
+
+def _read_position():
+    try:
+        poss = ex.fetch_positions(params={"type":"swap"})
+        for p in poss:
+            sym = (p.get("symbol") or p.get("info",{}).get("symbol") or "")
+            if SYMBOL.split(":")[0] not in sym: continue
+            qty = abs(float(p.get("contracts") or p.get("info",{}).get("positionAmt") or 0))
+            if qty <= 0: return 0.0, None, None
+            entry = float(p.get("entryPrice") or p.get("info",{}).get("avgEntryPrice") or 0)
+            side_raw = (p.get("side") or p.get("info",{}).get("positionSide") or "").lower()
+            side = "long" if ("long" in side_raw or float(p.get("cost",0))>0) else "short"
+            return qty, side, entry
+    except Exception as e:
+        logging.error(f"_read_position error: {e}")
+    return 0.0, None, None
+
+def close_market_strict(reason="STRICT"):
+    global compound_pnl
+    exch_qty, exch_side, exch_entry = _read_position()
+    if exch_qty <= 0:
+        if STATE.get("open"):
+            _reset_after_close(reason)
+        return
+    side_to_close = "sell" if (exch_side=="long") else "buy"
+    qty_to_close  = safe_qty(exch_qty)
+    attempts=0; last_error=None
+    while attempts < CLOSE_RETRY_ATTEMPTS:
+        try:
+            if MODE_LIVE and EXECUTE_ORDERS and not DRY_RUN:
+                params = exchange_specific_params(side_to_close, is_close=True)
+                ex.create_order(SYMBOL,"market",side_to_close,qty_to_close,None,params)
+            time.sleep(CLOSE_VERIFY_WAIT_S)
+            left_qty, _, _ = _read_position()
+            if left_qty <= 0:
+                px = price_now() or STATE.get("entry")
+                entry_px = STATE.get("entry") or exch_entry or px
+                side = STATE.get("side") or exch_side or ("long" if side_to_close=="sell" else "short")
+                qty  = exch_qty
+                pnl  = (px - entry_px) * qty * (1 if side=="long" else -1)
+                compound_pnl += pnl
+                log_i(f"STRICT CLOSE {side} reason={reason} pnl={fmt(pnl)} total={fmt(compound_pnl)}")
+                logging.info(f"STRICT_CLOSE {side} pnl={pnl} total={compound_pnl}")
+                _reset_after_close(reason, prev_side=side)
+                return
+            qty_to_close = safe_qty(left_qty)
+            attempts += 1
+            log_w(f"strict close retry {attempts}/{CLOSE_RETRY_ATTEMPTS} — residual={fmt(left_qty,4)}")
+            time.sleep(CLOSE_VERIFY_WAIT_S)
+        except Exception as e:
+            last_error = e; logging.error(f"close_market_strict attempt {attempts+1}: {e}"); attempts += 1; time.sleep(CLOSE_VERIFY_WAIT_S)
+    log_e(f"STRICT CLOSE FAILED after {CLOSE_RETRY_ATTEMPTS} attempts — last error: {last_error}")
+    logging.critical(f"STRICT CLOSE FAILED — last_error={last_error}")
+
+def _reset_after_close(reason, prev_side=None):
+    global compound_pnl
+    STATE.update({
+        "open": False, "side": None, "entry": None, "qty": 0.0,
+        "pnl": 0.0, "bars": 0, "trail": None, "breakeven": None,
+        "tp1_done": False, "highest_profit_pct": 0.0, "profit_targets_achieved": 0,
+        "trail_tightened": False, "partial_taken": False
+    })
+    save_state({"in_position": False, "position_qty": 0})
+    
+    logging.info(f"AFTER_CLOSE: {reason}")
+
+# =================== PROFESSIONAL TRADE LOOP ===================
+def professional_trade_loop():
+    """
+    🎯 الحلقة الرئيسية للتداول المحترف مع نظام الجودة
+    """
+    global compound_pnl
+    
+    # تهيئة أنظمة السياق
+    trend_ctx = SmartTrendContext()
+    smc_detector = SMCDetector()
     
     loop_i = 0
     
@@ -645,64 +1386,66 @@ def trade_loop_enhanced_with_smc():
                 time.sleep(BASE_SLEEP)
                 continue
                 
-            # تحديث محرك SMC
-            current_price = float(df['close'].iloc[-1]) if len(df) > 0 else px
-            smc_detector.detect_pivot_points(df)
-            smc_detector.detect_order_blocks(df)
-            smc_detector.detect_fair_value_gaps(df)
+            # تحديث أنظمة السياق
+            close_prices = df['close'].astype(float).tolist()
+            volumes = df['volume'].astype(float).tolist()
+            
+            trend_ctx.update(close_prices[-1] if close_prices else 0)
+            smc_detector.detect_swings(df)
             
             info = rf_signal_live(df)
             ind = compute_indicators(df)
+            spread_bps = orderbook_spread_bps()
             
-            # مجلس الإدارة المحسن مع SMC
-            council_data = super_council_ai_enhanced_with_smc(df)
-            master_decision = council_data.get("master_decision", {})
+            # ✅ نظام جني الأرباح الذكي
+            if STATE.get("open") and px:
+                apply_smart_profit_strategy()
+                
+            # ============================================
+            #  PROFESSIONAL ENTRY DECISION ENGINE
+            # ============================================
             
-            # لوج قرار المجلس
-            if master_decision.get("allow", False):
-                log_i(f"🏛 MASTER DECISION: {master_decision['side'].upper()} | {master_decision['mode']} | "
-                      f"Score: {master_decision['score']} | "
-                      f"TierA: {len(master_decision['tierA'])} | "
-                      f"TierB: {len(master_decision['tierB'])} | "
-                      f"TierC: {len(master_decision['tierC'])}")
-            
-            # تنفيذ الدخول بناءً على قرار المجلس
-            if (master_decision.get("allow", False) and 
-                not STATE["open"] and 
-                px is not None):
+            if not STATE["open"]:
+                # جمع بيانات مجلس الإدارة
+                council_data = super_council_ai_enhanced(df)
                 
-                side = master_decision["side"]
-                mode = master_decision["mode"]
+                # استخدام المحرك الرئيسي للدخول
+                entry_decision = master_entry_engine(council_data, px or info["price"])
                 
-                # تحديد حجم الصفقة حسب النوع
-                if mode == "trend":
-                    size_multiplier = 1.0  # 100% حجم
-                elif mode == "studied_scalp":
-                    size_multiplier = 0.75  # 75% حجم
-                else:  # cautious_scalp
-                    size_multiplier = 0.5  # 50% حجم
-                
-                base_qty = compute_size(bal, px)
-                final_qty = safe_qty(base_qty * size_multiplier)
-                
-                if final_qty > 0:
-                    ok = open_market_enhanced(side, final_qty, px)
-                    if ok:
-                        STATE["mode"] = mode
-                        STATE["entry_reasons"] = {
-                            "tierA": master_decision['tierA'],
-                            "tierB": master_decision['tierB'],
-                            "tierC": master_decision['tierC'],
-                            "total_score": master_decision['score']
-                        }
-                        log_g(f"🎯 SMART ENTRY: {side.upper()} | {mode} | Size: {size_multiplier*100}%")
-            
-            # إدارة الصفقة المفتوحة مع SMC
+                if entry_decision["allow"]:
+                    direction = entry_decision["direction"]
+                    mode = entry_decision["mode"]
+                    quality = entry_decision["quality"]
+                    
+                    # حساب الحجم
+                    qty = compute_size(bal, px or info["price"])
+                    if qty > 0:
+                        # فتح الصفقة
+                        success = open_market_enhanced(direction, qty, px or info["price"])
+                        if success:
+                            log_i(f"🎯 PROFESSIONAL ENTRY EXECUTED | {direction.upper()} {mode.upper()} | "
+                                  f"Quality Score: {quality['score']:.1f} | "
+                                  f"Tier A: {', '.join(quality['tier_a']) or 'None'} | "
+                                  f"Tier B: {', '.join(quality['tier_b']) or 'None'} | "
+                                  f"Tier C: {', '.join(quality['tier_c']) or 'None'}")
+                        else:
+                            log_e("❌ Failed to execute professional entry")
+                    else:
+                        log_w("❌ Invalid quantity for professional entry")
+                        
+                else:
+                    # تسجيل سبب الرفض
+                    quality = entry_decision.get("quality", {})
+                    log_i(f"⛔ PROFESSIONAL ENTRY REJECTED | {entry_decision.get('reason', 'unknown')} | "
+                          f"Score: {quality.get('score', 0):.1f} | "
+                          f"Tier A: {', '.join(quality.get('tier_a', [])) or 'None'} | "
+                          f"Reasons: {', '.join(entry_decision.get('reasons', []))}")
+
+            # إدارة الصفقة المفتوحة
             if STATE["open"]:
-                manage_position_enhanced_with_smc(df, ind, {
-                    "price": px or info["price"],
-                    "smc_analysis": smc_detector.get_smc_analysis(df, current_price),
-                    **info
+                manage_trade_by_profile(df, ind, {
+                    "price": px or info["price"], 
+                    "trend_ctx": trend_ctx
                 })
             
             loop_i += 1
@@ -710,85 +1453,115 @@ def trade_loop_enhanced_with_smc():
             time.sleep(sleep_s)
             
         except Exception as e:
-            log_e(f"SMC Enhanced loop error: {e}")
+            log_e(f"Professional trade loop error: {e}\n{traceback.format_exc()}")
             time.sleep(BASE_SLEEP)
 
-# =================== ADVANCED DASHBOARD API ===================
+# =================== API / KEEPALIVE ===================
+app = Flask(__name__)
 
-@app.route("/smc_dashboard")
-def smc_dashboard():
-    """لوحة تحكم متقدمة لعرض قرارات SMC والمجلس"""
-    df = fetch_ohlcv(limit=100)
-    current_price = price_now()
+@app.get("/mark/<color>")
+def mark_position(color):
+    color = color.lower()
+    if color not in ["green", "red"]:
+        return jsonify({"ok": False, "error": "Use /mark/green or /mark/red"}), 400
     
-    if df.empty or current_price is None:
-        return jsonify({"error": "No data available"})
-    
-    # جمع كل البيانات
-    smc_analysis = smc_detector.get_smc_analysis(df, current_price)
-    council_data = super_council_ai_enhanced_with_smc(df)
-    master_decision = council_data.get("master_decision", {})
-    price_structure = analyze_price_structure(df)
-    vwap_analysis = calculate_vwap(df)
-    gz = golden_zone_check(df, compute_indicators(df))
-    
+    return jsonify({"ok": True, "marked": color, "timestamp": datetime.utcnow().isoformat()})
+
+@app.route("/")
+def home():
+    mode='LIVE' if MODE_LIVE else 'PAPER'
+    return f"✅ SUI ULTRA PRO AI BOT — {EXCHANGE_NAME.upper()} — {SYMBOL} {INTERVAL} — {mode} — PROFESSIONAL TIER SYSTEM"
+
+@app.route("/metrics")
+def metrics():
     return jsonify({
-        "timestamp": datetime.utcnow().isoformat(),
-        "price": current_price,
-        "master_decision": master_decision,
-        "council_summary": {
-            "buy_votes": council_data.get("b", 0),
-            "sell_votes": council_data.get("s", 0),
-            "buy_score": council_data.get("score_b", 0),
-            "sell_score": council_data.get("score_s", 0),
-            "confidence": council_data.get("confidence", 0)
+        "exchange": EXCHANGE_NAME,
+        "symbol": SYMBOL, "interval": INTERVAL, "mode": "live" if MODE_LIVE else "paper",
+        "leverage": LEVERAGE, "risk_alloc": RISK_ALLOC, "price": price_now(),
+        "state": STATE, "compound_pnl": compound_pnl,
+        "entry_system": "PROFESSIONAL_TIER_SYSTEM",
+        "tier_weights": {
+            "tier_a": TIER_A_WEIGHT,
+            "tier_b": TIER_B_WEIGHT, 
+            "tier_c": TIER_C_WEIGHT
         },
-        "smc_analysis": {
-            "pivot_highs": len(smc_analysis.get('pivot_highs', [])),
-            "pivot_lows": len(smc_analysis.get('pivot_lows', [])),
-            "order_blocks": len(smc_analysis.get('order_blocks', [])),
-            "fair_value_gaps": len(smc_analysis.get('fair_value_gaps', [])),
-            "liquidity_zones": smc_analysis.get('liquidity_pools', {})
-        },
-        "market_structure": price_structure,
-        "vwap_analysis": vwap_analysis,
-        "golden_zone": gz,
-        "current_position": {
-            "open": STATE["open"],
-            "side": STATE["side"],
-            "mode": STATE.get("mode", "none"),
-            "entry_reasons": STATE.get("entry_reasons", {})
+        "min_scores": {
+            "trend": TREND_MIN_SCORE,
+            "scalp": SCALP_MIN_SCORE
         }
     })
 
-# =================== INITIALIZATION ===================
+@app.route("/health")
+def health():
+    return jsonify({
+        "ok": True, "exchange": EXCHANGE_NAME, "mode": "live" if MODE_LIVE else "paper",
+        "open": STATE["open"], "side": STATE["side"], "qty": STATE["qty"],
+        "compound_pnl": compound_pnl, "timestamp": datetime.utcnow().isoformat(),
+        "entry_system": "PROFESSIONAL_TIER_SYSTEM"
+    }), 200
 
-# تهيئة محرك SMC العالمي
-smc_detector = SmartMoneyConcepts()
+@app.route("/entry_quality")
+def get_entry_quality():
+    """عرض جودة الدخول الحالية"""
+    current_quality = STATE.get("entry_quality", {})
+    return jsonify({
+        "current_quality": current_quality,
+        "thresholds": {
+            "trend_min_score": TREND_MIN_SCORE,
+            "scalp_min_score": SCALP_MIN_SCORE,
+            "trend_need_tier_a": TREND_NEED_TIER_A
+        }
+    })
 
-# استبدال الدورة الرئيسية
-trade_loop = trade_loop_enhanced_with_smc
+@app.route("/tier_stats")
+def get_tier_stats():
+    """إحصائيات الـ Tiers"""
+    quality = STATE.get("entry_quality", {})
+    return jsonify({
+        "current_tiers": {
+            "tier_a": quality.get("tier_a", []),
+            "tier_b": quality.get("tier_b", []),
+            "tier_c": quality.get("tier_c", [])
+        },
+        "total_score": quality.get("score", 0),
+        "entry_mode": STATE.get("mode", "unknown")
+    })
 
-# تحديث التحقق من البيئة
+def keepalive_loop():
+    url=(SELF_URL or "").strip().rstrip("/")
+    if not url:
+        log_w("keepalive disabled (SELF_URL not set)")
+        return
+    import requests
+    sess=requests.Session(); sess.headers.update({"User-Agent":"rf-live-bot/keepalive"})
+    log_i(f"KEEPALIVE every 50s → {url}")
+    while True:
+        try: sess.get(url, timeout=8)
+        except Exception: pass
+        time.sleep(50)
+
+# =================== EXECUTION VERIFICATION ===================
 def verify_execution_environment():
-    print(f"⚙️ EXECUTION ENVIRONMENT", flush=True)
+    print(f"⚙️ PROFESSIONAL EXECUTION ENVIRONMENT", flush=True)
     print(f"🔧 EXCHANGE: {EXCHANGE_NAME.upper()} | SYMBOL: {SYMBOL}", flush=True)
     print(f"🔧 EXECUTE_ORDERS: {EXECUTE_ORDERS} | DRY_RUN: {DRY_RUN}", flush=True)
-    print(f"🎯 SMART MONEY CONCEPTS: Full SMC Integration Activated", flush=True)
-    print(f"🏛 MASTER ENTRY ENGINE: Tier-Based Decision Making", flush=True)
-    print(f"📊 ADVANCED ANALYSIS: Price Structure + VWAP + Liquidity Zones", flush=True)
-    print(f"🧠 ENHANCED COUNCIL: SMC + Golden Zones + Volume + Flow", flush=True)
+    print(f"🎯 PROFESSIONAL TIER SYSTEM ACTIVATED", flush=True)
+    print(f"   Tier A Weight: {TIER_A_WEIGHT} | Tier B Weight: {TIER_B_WEIGHT} | Tier C Weight: {TIER_C_WEIGHT}", flush=True)
+    print(f"   Trend Min Score: {TREND_MIN_SCORE} | Scalp Min Score: {SCALP_MIN_SCORE}", flush=True)
+    print(f"   Trend Requires Tier A: {TREND_NEED_TIER_A}", flush=True)
 
-# تشغيل البوت المحدث
 if __name__ == "__main__":
     verify_execution_environment()
     
     import threading
     threading.Thread(target=keepalive_loop, daemon=True).start()
-    threading.Thread(target=trade_loop, daemon=True).start()
+    threading.Thread(target=professional_trade_loop, daemon=True).start()
     
     log_i(f"🚀 SUI ULTRA PRO AI BOT STARTED - {BOT_VERSION}")
     log_i(f"🎯 SYMBOL: {SYMBOL} | INTERVAL: {INTERVAL} | LEVERAGE: {LEVERAGE}x")
-    log_i(f"💡 SMART MONEY CONCEPTS FULLY INTEGRATED: SMC + Master Entry Engine + Advanced Dashboard")
+    log_i(f"💡 PROFESSIONAL TIER SYSTEM ACTIVATED")
+    log_i(f"   • Tier A: Golden/SMC/Liquidity (Required for Trend)")
+    log_i(f"   • Tier B: FVG/OB/Structure (Strong Support)") 
+    log_i(f"   • Tier C: RSI/ADX/Candles (Optimization)")
     
     app.run(host="0.0.0.0", port=PORT, debug=False)
