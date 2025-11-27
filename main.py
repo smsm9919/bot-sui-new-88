@@ -11,6 +11,7 @@ SUI ULTRA PRO AI BOT - الإصدار الذكي المتقدم المتكامل
 • SMART PROFIT AI - نظام جني الأرباح الذكي المتقدم
 • TP PROFILE SYSTEM - نظام جني الأرباح الذكي (1→2→3 مرات)
 • COUNCIL STRONG ENTRY - دخول ذكي من مجلس الإدارة في المناطق القوية
+• SMART RF PATCH - نظام الدخول الذكي المتقدم بإشارات RF الحقيقية
 """
 
 import os, time, math, random, signal, sys, traceback, logging, json
@@ -440,7 +441,7 @@ SHADOW_MODE_DASHBOARD = False
 DRY_RUN = False
 
 # ==== Addon: Logging + Recovery Settings ====
-BOT_VERSION = f"SUI ULTRA PRO AI v7.0 — {EXCHANGE_NAME.upper()} - SMART PROFIT AI + TP PROFILE + COUNCIL STRONG ENTRY"
+BOT_VERSION = f"SUI ULTRA PRO AI v7.0 — {EXCHANGE_NAME.upper()} - SMART PROFIT AI + TP PROFILE + COUNCIL STRONG ENTRY + SMART RF PATCH"
 print("🚀 Booting:", BOT_VERSION, flush=True)
 
 STATE_PATH = "./bot_state.json"
@@ -736,6 +737,528 @@ FG_G="\x1b[32m"; FG_R="\x1b[31m"; FG_C="\x1b[36m"; FG_Y="\x1b[33m"; FG_M="\x1b[3
 # ===== SMART QUANTITY FIX =====
 MIN_QTY = 0.1  # الحد الأدنى للكمية المسموح بها
 MIN_BALANCE_FOR_TRADE = 10.0  # الحد الأدنى للرصيد لفتح صفقة
+
+# ============================================
+#  SMART RF PATCH - نظام الدخول الذكي المتقدم
+# ============================================
+
+class Side:
+    LONG = "long"
+    SHORT = "short"
+
+class SignalClass:
+    WEAK = "weak"
+    MID = "mid" 
+    TREND = "trend"
+
+class SizingMode:
+    FIXED_BASE_QTY = "fixed_base"
+    FIXED_QUOTE_VALUE = "fixed_quote"
+
+class SmartRFPatch:
+    """باتش RF الذكي - دخول فوري على إشارة RF الحقيقية"""
+    
+    def __init__(self):
+        self.config = {
+            # RF Settings
+            'rf_period': 20,
+            'rf_qty': 3.5,
+            
+            # المؤشرات الداعمة
+            'adx_period': 14,
+            'atr_period': 14,
+            'vwap_lookback': 300,
+            'smc_pivot_width': 3,
+            'smc_lookback': 50,
+            
+            # Council & الدخول
+            'min_council_for_entry': 3,
+            'adx_trend_threshold': 18.0,
+            'vwap_extension_threshold': 1.2,
+            'allow_strong_without_rf_label': False,
+            
+            # الحماية والخروج
+            'hard_sl_pct': 0.005,  # 0.50%
+            'min_rr': 1.2,
+            'trail_atr_mult': 2.0,
+            
+            # أهداف الربح
+            'tp_weak': [0.0125],           # 1.25%
+            'tp_mid': [0.0075, 0.015],     # 0.75%, 1.50%  
+            'tp_trend': [0.008, 0.016, 0.024],  # 0.8%, 1.6%, 2.4%
+            'tp_splits_mid': [0.5, 0.5],
+            'tp_splits_trend': [0.34, 0.33, 0.33],
+            
+            # حجم التداول الثابت
+            'fixed_base_qty': 50.0,  # كمية ثابتة
+            'fixed_quote_value': 200.0,  # قيمة ثابتة بالدولار
+            
+            # OTC Filter
+            'otc_min_vol_sma_ratio': 0.6,
+            'otc_max_spread_to_atr': 0.6,
+            'otc_enabled': True
+        }
+        
+        self.last_signal = None
+        self.consecutive_signals = 0
+        
+    def _ema(self, x, period):
+        """المتوسط المتحرك الأسّي"""
+        if period <= 1:
+            return x
+        return pd.Series(x).ewm(span=period, adjust=False).mean().values
+    
+    def _atr(self, df, period):
+        """متوسط المدى الحقيقي"""
+        high = df['high'].astype(float).values
+        low = df['low'].astype(float).values
+        close = df['close'].astype(float).values
+        
+        prev_close = np.concatenate([[close[0]], close[:-1]])
+        tr = np.maximum(high - low, 
+                       np.maximum(np.abs(high - prev_close), 
+                                 np.abs(low - prev_close)))
+        return self._ema(tr, period)
+    
+    def _adx(self, df, period):
+        """مؤشر ADX"""
+        high = df['high'].astype(float).values
+        low = df['low'].astype(float).values
+        close = df['close'].astype(float).values
+        
+        # حركة الاتجاه
+        up_move = high[1:] - high[:-1]
+        down_move = low[:-1] - low[1:]
+        
+        plus_dm = np.where((up_move > down_move) & (up_move > 0), up_move, 0)
+        minus_dm = np.where((down_move > up_move) & (down_move > 0), down_move, 0)
+        
+        # المدى الحقيقي
+        tr = self._atr(df, 1)
+        tr_smoothed = self._ema(tr, period)
+        
+        # مؤشرات الاتجاه
+        plus_di = 100 * self._ema(plus_dm, period) / np.maximum(tr_smoothed[1:], 1e-12)
+        minus_di = 100 * self._ema(minus_dm, period) / np.maximum(tr_smoothed[1:], 1e-12)
+        
+        # مؤشر ADX
+        dx = 100 * np.abs(plus_di - minus_di) / np.maximum(plus_di + minus_di, 1e-12)
+        adx = self._ema(dx, period)
+        
+        # محاذاة الطول
+        adx = np.concatenate([adx, [adx[-1]]])
+        plus_di = np.concatenate([plus_di, [plus_di[-1]]])
+        minus_di = np.concatenate([minus_di, [minus_di[-1]]])
+        
+        return adx, plus_di, minus_di
+    
+    def _vwap_window(self, df, lookback):
+        """VWAP للنافذة المحددة"""
+        close = df['close'].astype(float).values
+        volume = df['volume'].astype(float).values if 'volume' in df.columns else np.ones(len(close))
+        
+        pv = close * volume
+        cumulative_pv = np.cumsum(pv)
+        cumulative_volume = np.cumsum(volume)
+        
+        vwap = cumulative_pv / np.maximum(cumulative_volume, 1e-12)
+        
+        if lookback > 0 and lookback < len(close):
+            # VWAP المتحرك
+            vwap_moving = []
+            for i in range(len(close)):
+                start_idx = max(0, i - lookback + 1)
+                window_pv = np.sum(pv[start_idx:i+1])
+                window_vol = np.sum(volume[start_idx:i+1])
+                vwap_moving.append(window_pv / np.maximum(window_vol, 1e-12))
+            return np.array(vwap_moving)
+        
+        return vwap
+    
+    def _range_size(self, x, qty, n):
+        """حساب حجم النطاق"""
+        dx = np.abs(x - np.concatenate([[x[0]], x[:-1]]))
+        avrng = self._ema(dx, n)
+        wper = max(1, (2 * n) - 1)
+        return self._ema(avrng, wper) * qty
+    
+    def _range_filter(self, x, r):
+        """فلتر النطاق - بدون إعادة رسم"""
+        out = np.zeros_like(x)
+        out[0] = x[0]
+        
+        for i in range(1, len(x)):
+            prev = out[i-1]
+            current_x = x[i]
+            current_r = r[i]
+            
+            up_band = current_x - current_r
+            dn_band = current_x + current_r
+            
+            new_val = prev
+            if up_band > prev:
+                new_val = up_band
+            elif dn_band < prev:
+                new_val = dn_band
+                
+            out[i] = new_val
+            
+        return out
+    
+    def compute_rf_signals(self, df):
+        """حساب إشارات RF الحقيقية"""
+        close = df['close'].astype(float).values
+        n = self.config['rf_period']
+        qty = self.config['rf_qty']
+        
+        # حجم النطاق
+        r = self._range_size(close, qty, n)
+        
+        # فلتر النطاق
+        filt = self._range_filter(close, r)
+        
+        # النطاقات
+        hi_band = filt + r
+        lo_band = filt - r
+        
+        # اتجاه الفلتر
+        fdir = np.zeros(len(close))
+        fdir[0] = 1
+        
+        for i in range(1, len(close)):
+            if filt[i] > filt[i-1]:
+                fdir[i] = 1
+            elif filt[i] < filt[i-1]:
+                fdir[i] = -1
+            else:
+                fdir[i] = fdir[i-1]
+        
+        upward = fdir == 1
+        downward = fdir == -1
+        
+        # شروط الدخول - مطابقة لكود Pine
+        long_cond = ((close > filt) & (close > np.concatenate([[close[0]], close[:-1]])) & upward) | \
+                   ((close > filt) & (close < np.concatenate([[close[0]], close[:-1]])) & upward)
+                   
+        short_cond = ((close < filt) & (close < np.concatenate([[close[0]], close[:-1]])) & downward) | \
+                    ((close < filt) & (close > np.concatenate([[close[0]], close[:-1]])) & downward)
+        
+        # الحالة الأولية
+        cond_ini = np.zeros(len(close), dtype=int)
+        for i in range(1, len(close)):
+            if long_cond[i]:
+                cond_ini[i] = 1
+            elif short_cond[i]:
+                cond_ini[i] = -1
+            else:
+                cond_ini[i] = cond_ini[i-1]
+        
+        # إشارات الدخول النهائية
+        long_label = long_cond & (np.concatenate([[0], cond_ini[:-1]]) == -1)
+        short_label = short_cond & (np.concatenate([[0], cond_ini[:-1]]) == 1)
+        
+        return {
+            'filt': filt,
+            'hi_band': hi_band,
+            'lo_band': lo_band,
+            'long_label': long_label,
+            'short_label': short_label,
+            'fdir': fdir
+        }
+    
+    def _smc_structure(self, df):
+        """هيكل SMC - اكتشاف القمم والقيعان"""
+        high = df['high'].astype(float).values
+        low = df['low'].astype(float).values
+        width = self.config['smc_pivot_width']
+        lookback = self.config['smc_lookback']
+        
+        highs, lows = [], []
+        
+        for i in range(width, len(high) - width):
+            # قمم
+            if high[i] == np.max(high[i-width:i+width+1]):
+                highs.append(i)
+            # قيعان
+            if low[i] == np.min(low[i-width:i+width+1]):
+                lows.append(i)
+        
+        # التحقق من الهيكل الحديث
+        recent_highs = [i for i in highs if i >= max(0, len(high) - lookback)]
+        recent_lows = [i for i in lows if i >= max(0, len(low) - lookback)]
+        
+        up_structure = down_structure = False
+        
+        if len(recent_highs) >= 2 and len(recent_lows) >= 2:
+            # هيكل صاعد: قمم وقيعان متصاعدة
+            higher_highs = high[recent_highs[-1]] > high[recent_highs[-2]]
+            higher_lows = low[recent_lows[-1]] > low[recent_lows[-2]]
+            up_structure = higher_highs and higher_lows
+            
+            # هيكل هابط: قمم وقيعان متراجعة
+            lower_highs = high[recent_highs[-1]] < high[recent_highs[-2]]
+            lower_lows = low[recent_lows[-1]] < low[recent_lows[-2]]
+            down_structure = lower_highs and lower_lows
+            
+        return up_structure, down_structure
+    
+    def council_analysis(self, df, rf_signals):
+        """تحليل مجلس التداول - تجميع الأصوات"""
+        close = df['close'].astype(float).values
+        adx, plus_di, minus_di = self._adx(df, self.config['adx_period'])
+        atr = self._atr(df, self.config['atr_period'])
+        vwap = self._vwap_window(df, self.config['vwap_lookback'])
+        
+        i = len(close) - 1
+        
+        # 1. تصويت RF
+        rf_vote = 1 if rf_signals['fdir'][i] > 0 else (-1 if rf_signals['fdir'][i] < 0 else 0)
+        
+        # 2. تصويت VWAP
+        vwap_vote = 1 if close[i] > vwap[i] else -1
+        
+        # 3. تصويت ADX
+        adx_vote = 0
+        if adx[i] >= self.config['adx_trend_threshold']:
+            adx_vote = 1 if plus_di[i] > minus_di[i] else -1
+        
+        # 4. تصويت SMC
+        smc_up, smc_down = self._smc_structure(df)
+        smc_vote = 1 if smc_up else (-1 if smc_down else 0)
+        
+        # تجميع الأصوات
+        votes = [rf_vote, vwap_vote, adx_vote, smc_vote]
+        positive_votes = sum(1 for v in votes if v > 0)
+        negative_votes = sum(1 for v in votes if v < 0)
+        
+        # قوة الإشارة
+        rf_strength = abs(rf_signals['filt'][i] - rf_signals['filt'][i-1]) / max(rf_signals['filt'][i], 1e-8)
+        vwap_strength = abs(close[i] - vwap[i]) / max(atr[i], 1e-8)
+        strength_score = 0.5 * (adx[i] / 25.0) + 0.3 * min(vwap_strength / self.config['vwap_extension_threshold'], 1.5) + 0.2 * rf_strength
+        
+        return {
+            'votes_buy': positive_votes,
+            'votes_sell': negative_votes,
+            'total_votes': positive_votes + negative_votes,
+            'strength': strength_score,
+            'adx_value': adx[i],
+            'atr_value': atr[i],
+            'vwap_value': vwap[i]
+        }
+    
+    def otc_filter(self, df, atr):
+        """فلتر OTC - فحص السيولة والسبريد"""
+        if not self.config['otc_enabled']:
+            return True
+            
+        i = len(df) - 1
+        volume = df['volume'].astype(float).values if 'volume' in df.columns else np.ones(len(df))
+        
+        # فحص الحجم
+        vol_sma = pd.Series(volume).rolling(20).mean().values
+        if i < 20 or np.isnan(vol_sma[i]):
+            return False
+            
+        volume_ok = volume[i] >= self.config['otc_min_vol_sma_ratio'] * vol_sma[i]
+        
+        # فحص السبريد
+        spread = df['high'].iloc[i] - df['low'].iloc[i]
+        spread_ok = (spread / atr[i]) <= self.config['otc_max_spread_to_atr']
+        
+        return volume_ok and spread_ok
+    
+    def classify_signal(self, council_data):
+        """تصنيف قوة الإشارة"""
+        votes = council_data['total_votes']
+        strength = council_data['strength']
+        
+        if votes >= 3 and strength >= 1.2:
+            return SignalClass.TREND
+        elif votes >= 2 and strength >= 0.8:
+            return SignalClass.MID
+        else:
+            return SignalClass.WEAK
+    
+    def calculate_position_size(self, entry_price):
+        """حساب حجم المركز الثابت"""
+        if self.config.get('fixed_base_qty', 0) > 0:
+            return self.config['fixed_base_qty']
+        elif self.config.get('fixed_quote_value', 0) > 0:
+            return self.config['fixed_quote_value'] / entry_price
+        else:
+            return 50.0  # قيمة افتراضية
+    
+    def generate_order_plan(self, df, current_price):
+        """إنشاء خطة الأوامر الشاملة"""
+        
+        # حساب إشارات RF
+        rf_signals = self.compute_rf_signals(df)
+        
+        # تحليل المجلس
+        council_data = self.council_analysis(df, rf_signals)
+        
+        # فحص OTC
+        atr = self._atr(df, self.config['atr_period'])
+        if not self.otc_filter(df, atr):
+            return None
+        
+        i = len(df) - 1
+        
+        # تحديد اتجاه الإشارة
+        signal_side = None
+        if rf_signals['long_label'][i] and council_data['votes_buy'] >= self.config['min_council_for_entry']:
+            signal_side = Side.LONG
+        elif rf_signals['short_label'][i] and council_data['votes_sell'] >= self.config['min_council_for_entry']:
+            signal_side = Side.SHORT
+        elif self.config['allow_strong_without_rf_label']:
+            # دخول قوي بدون إشارة RF
+            if council_data['votes_buy'] >= 3 and council_data['strength'] >= 1.4:
+                signal_side = Side.LONG
+            elif council_data['votes_sell'] >= 3 and council_data['strength'] >= 1.4:
+                signal_side = Side.SHORT
+        
+        if not signal_side:
+            return None
+        
+        # تصنيف قوة الإشارة
+        signal_class = self.classify_signal(council_data)
+        
+        # حساب حجم المركز
+        position_size = self.calculate_position_size(current_price)
+        
+        # نقطة وقف الخسارة
+        stop_loss_price = current_price * (1 - self.config['hard_sl_pct']) if signal_side == Side.LONG else current_price * (1 + self.config['hard_sl_pct'])
+        
+        # أهداف الربح
+        take_profits = []
+        if signal_class == SignalClass.WEAK:
+            tp_prices = [current_price * (1 + tp) if signal_side == Side.LONG else current_price * (1 - tp) 
+                        for tp in self.config['tp_weak']]
+            take_profits = [(tp_prices[0], 1.0)]  # هدف واحد كامل
+        elif signal_class == SignalClass.MID:
+            tp_prices = [current_price * (1 + tp) if signal_side == Side.LONG else current_price * (1 - tp)
+                        for tp in self.config['tp_mid']]
+            take_profits = [(tp_prices[0], 0.5), (tp_prices[1], 0.5)]  # هدفان متساويان
+        else:  # TREND
+            tp_prices = [current_price * (1 + tp) if signal_side == Side.LONG else current_price * (1 - tp)
+                        for tp in self.config['tp_trend']]
+            take_profits = [(tp_prices[0], 0.34), (tp_prices[1], 0.33), (tp_prices[2], 0.33)]  # ثلاثة أهداف
+        
+        # التأكد من نسبة المخاطرة إلى العائد
+        risk = abs(current_price - stop_loss_price)
+        for j, (tp_price, _) in enumerate(take_profits):
+            reward = abs(tp_price - current_price)
+            if reward / risk < self.config['min_rr']:
+                # تعديل TP لتحقيق الحد الأدنى من RR
+                adjustment = risk * self.config['min_rr']
+                new_tp = current_price + adjustment if signal_side == Side.LONG else current_price - adjustment
+                take_profits[j] = (new_tp, take_profits[j][1])
+        
+        # الوقف المتحرك للترند القوي
+        trail_offset = atr[i] * self.config['trail_atr_mult'] if signal_class == SignalClass.TREND else None
+        
+        return {
+            'side': signal_side,
+            'entry_price': current_price,
+            'size': position_size,
+            'stop_loss': stop_loss_price,
+            'take_profits': take_profits,
+            'trailing_stop': trail_offset,
+            'signal_class': signal_class,
+            'council_data': council_data,
+            'metadata': {
+                'adx': council_data['adx_value'],
+                'atr': council_data['atr_value'],
+                'vwap': council_data['vwap_value'],
+                'strength': council_data['strength'],
+                'votes': council_data['total_votes']
+            }
+        }
+
+# إنشاء نسخة من الباتش
+smart_rf_patch = SmartRFPatch()
+
+def integrate_smart_rf_patch_in_loop():
+    """دمج باتش RF الذكي في اللوب الرئيسي"""
+    
+    # إضافة الباتش إلى STATE العالمية
+    if 'smart_rf_patch' not in STATE:
+        STATE['smart_rf_patch'] = {
+            'enabled': True,
+            'last_signal': None,
+            'consecutive_trades': 0,
+            'total_profit': 0.0
+        }
+    
+    # تنفيذ الباتش في كل دورة
+    try:
+        if not STATE['smart_rf_patch']['enabled']:
+            return
+            
+        # تجنب الدخول إذا كانت هناك صفقة مفتوحة
+        if STATE.get("open", False):
+            return
+            
+        # الحصول على البيانات الحالية
+        df = fetch_ohlcv(limit=200)
+        if len(df) < 50:
+            return
+            
+        current_price = price_now()
+        if not current_price:
+            return
+            
+        # توليد خطة التداول
+        order_plan = smart_rf_patch.generate_order_plan(df, current_price)
+        if not order_plan:
+            return
+            
+        # تسجيل الإشارة
+        signal_info = {
+            'side': order_plan['side'],
+            'price': current_price,
+            'size': order_plan['size'],
+            'signal_class': order_plan['signal_class'],
+            'strength': order_plan['metadata']['strength'],
+            'timestamp': time.time()
+        }
+        
+        STATE['smart_rf_patch']['last_signal'] = signal_info
+        
+        # تنفيذ الأوامر
+        if MODE_LIVE and EXECUTE_ORDERS and not DRY_RUN:
+            # استخدام دالة فتح الصفقة الموجودة في البوت
+            success = open_market_enhanced(
+                order_plan['side'], 
+                order_plan['size'], 
+                current_price
+            )
+            
+            if success:
+                log_g(f"🎯 SMART RF PATCH: تنفيذ صفقة {order_plan['side'].upper()} | قوة: {order_plan['signal_class']}")
+                
+                # تحديث حالة البوت
+                STATE.update({
+                    "tp_levels": [tp[0] for tp in order_plan['take_profits']],
+                    "tp_weights": [tp[1] for tp in order_plan['take_profits']],
+                    "stop_loss": order_plan['stop_loss'],
+                    "mode": "smart_rf_patch"
+                })
+                
+                STATE['smart_rf_patch']['consecutive_trades'] += 1
+                
+                # طباعة تفاصيل الصفقة
+                log_i(f"🧠 SMART RF PATCH DETAILS:")
+                log_i(f"   📊 القوة: {order_plan['signal_class']} | الأصوات: {order_plan['metadata']['votes']}")
+                log_i(f"   📈 ADX: {order_plan['metadata']['adx']:.1f} | ATR: {order_plan['metadata']['atr']:.4f}")
+                log_i(f"   🎯 TP Levels: {[f'{tp[0]:.4f} ({tp[1]*100}%)' for tp in order_plan['take_profits']]}")
+                log_i(f"   🛡️  SL: {order_plan['stop_loss']:.6f}")
+                
+        else:
+            log_i(f"🧠 SMART RF PATCH SIGNAL: {order_plan['side'].upper()} | القوة: {order_plan['signal_class']} | الحجم: {order_plan['size']:.2f}")
+            
+    except Exception as e:
+        log_w(f"⚠️ خطأ في Smart RF Patch: {e}")
 
 # =================== PROFESSIONAL LOGGING ===================
 def log_i(msg): print(f"ℹ️ {msg}", flush=True)
@@ -3533,6 +4056,9 @@ def trade_loop_enhanced_with_smart_patch():
             if STATE.get("open") and px:
                 apply_smart_profit_strategy()
                 
+            # ✅ تنفيذ باتش RF الذكي
+            integrate_smart_rf_patch_in_loop()
+                
             # تحديث جميع المحركات الذكية
             close_prices = df['close'].astype(float).tolist()
             volumes = df['volume'].astype(float).tolist()
@@ -3853,7 +4379,7 @@ def pretty_snapshot(bal, info, ind, spread_bps, reason=None, df=None):
         print("📈 INDICATORS & RF")
         print(f"   💲 Price {fmt(info.get('price'))} | RF filt={fmt(info.get('filter'))}  hi={fmt(info.get('hi'))} lo={fmt(info.get('lo'))}")
         print(f"   🧮 RSI={fmt(safe_get(ind, 'rsi'))}  +DI={fmt(safe_get(ind, 'plus_di'))}  -DI={fmt(safe_get(ind, 'minus_di'))}  ADX={fmt(safe_get(ind, 'adx'))}  ATR={fmt(safe_get(ind, 'atr'))}")
-        print(f"   🎯 ENTRY: SUPER COUNCIL AI + GOLDEN ENTRY + SUPER SCALP + SMART PROFIT AI + TP PROFILE |  spread_bps={fmt(spread_bps,2)}")
+        print(f"   🎯 ENTRY: SUPER COUNCIL AI + GOLDEN ENTRY + SUPER SCALP + SMART PROFIT AI + TP PROFILE + SMART RF PATCH |  spread_bps={fmt(spread_bps,2)}")
         print(f"   ⏱️ closes_in ≈ {left_s}s")
         print("\n🧭 POSITION")
         bal_line = f"Balance={fmt(bal,2)}  Risk={int(RISK_ALLOC*100)}%×{LEVERAGE}x  CompoundPnL={fmt(compound_pnl)}  Eq~{fmt((bal or 0)+compound_pnl,2)}"
@@ -3885,7 +4411,7 @@ def mark_position(color):
 @app.route("/")
 def home():
     mode='LIVE' if MODE_LIVE else 'PAPER'
-    return f"✅ SUI ULTRA PRO AI Bot — {EXCHANGE_NAME.upper()} — {SYMBOL} {INTERVAL} — {mode} — Super Council AI + Intelligent Trend Riding + Smart Profit AI + TP Profile System + Council Strong Entry"
+    return f"✅ SUI ULTRA PRO AI Bot — {EXCHANGE_NAME.upper()} — {SYMBOL} {INTERVAL} — {mode} — Super Council AI + Intelligent Trend Riding + Smart Profit AI + TP Profile System + Council Strong Entry + Smart RF Patch"
 
 @app.route("/metrics")
 def metrics():
@@ -3894,7 +4420,7 @@ def metrics():
         "symbol": SYMBOL, "interval": INTERVAL, "mode": "live" if MODE_LIVE else "paper",
         "leverage": LEVERAGE, "risk_alloc": RISK_ALLOC, "price": price_now(),
         "state": STATE, "compound_pnl": compound_pnl,
-        "entry_mode": "SUPER_COUNCIL_AI_GOLDEN_SCALP_SMART_PROFIT_TP_PROFILE_COUNCIL_STRONG", 
+        "entry_mode": "SUPER_COUNCIL_AI_GOLDEN_SCALP_SMART_PROFIT_TP_PROFILE_COUNCIL_STRONG_SMART_RF", 
         "wait_for_next_signal": wait_for_next_signal_side,
         "guards": {"max_spread_bps": MAX_SPREAD_BPS, "final_chunk_qty": FINAL_CHUNK_QTY},
         "scalp_mode": SCALP_MODE,
@@ -3902,7 +4428,8 @@ def metrics():
         "intelligent_trend_riding": TREND_RIDING_AI,
         "smart_profit_ai": True,
         "tp_profile_system": True,
-        "council_strong_entry": COUNCIL_STRONG_ENTRY
+        "council_strong_entry": COUNCIL_STRONG_ENTRY,
+        "smart_rf_patch": STATE.get('smart_rf_patch', {})
     })
 
 @app.route("/health")
@@ -3911,13 +4438,14 @@ def health():
         "ok": True, "exchange": EXCHANGE_NAME, "mode": "live" if MODE_LIVE else "paper",
         "open": STATE["open"], "side": STATE["side"], "qty": STATE["qty"],
         "compound_pnl": compound_pnl, "timestamp": datetime.utcnow().isoformat(),
-        "entry_mode": "SUPER_COUNCIL_AI_GOLDEN_SCALP_SMART_PROFIT_TP_PROFILE_COUNCIL_STRONG", 
+        "entry_mode": "SUPER_COUNCIL_AI_GOLDEN_SCALP_SMART_PROFIT_TP_PROFILE_COUNCIL_STRONG_SMART_RF", 
         "wait_for_next_signal": wait_for_next_signal_side,
         "scalp_mode": SCALP_MODE,
         "super_council_ai": COUNCIL_AI_MODE,
         "smart_profit_ai": True,
         "tp_profile_system": True,
-        "council_strong_entry": COUNCIL_STRONG_ENTRY
+        "council_strong_entry": COUNCIL_STRONG_ENTRY,
+        "smart_rf_patch": STATE.get('smart_rf_patch', {}).get('enabled', False)
     }), 200
 
 # ============================================
@@ -3955,7 +4483,8 @@ def smart_stats():
         "council_strong_entry": {
             "active": COUNCIL_STRONG_ENTRY,
             "current_trade": STATE.get("council_controlled", False)
-        }
+        },
+        "smart_rf_patch": STATE.get('smart_rf_patch', {})
     })
 
 @app.route("/market_context")
@@ -3996,8 +4525,8 @@ def verify_execution_environment():
     print(f"🔧 EXCHANGE: {EXCHANGE_NAME.upper()} | SYMBOL: {SYMBOL}", flush=True)
     print(f"🔧 EXECUTE_ORDERS: {EXECUTE_ORDERS} | DRY_RUN: {DRY_RUN}", flush=True)
     print(f"🎯 GOLDEN ENTRY: score={GOLDEN_ENTRY_SCORE} | ADX={GOLDEN_ENTRY_ADX}", flush=True)
-    print(f"🚀 SMART PATCH: OB/FVG + SMC + Golden Zones + Volume Confirmation + SMART PROFIT AI + TP PROFILE + COUNCIL STRONG ENTRY", flush=True)
-    print(f"🧠 SMART PROFIT AI: Scalp + Trend + Volume Analysis + TP Profile (1→2→3) + Council Strong Entry Activated", flush=True)
+    print(f"🚀 SMART PATCH: OB/FVG + SMC + Golden Zones + Volume Confirmation + SMART PROFIT AI + TP PROFILE + COUNCIL STRONG ENTRY + SMART RF PATCH", flush=True)
+    print(f"🧠 SMART PROFIT AI: Scalp + Trend + Volume Analysis + TP Profile (1→2→3) + Council Strong Entry + Smart RF Patch Activated", flush=True)
 
 if __name__ == "__main__":
     verify_execution_environment()
@@ -4008,6 +4537,6 @@ if __name__ == "__main__":
     
     log_i(f"🚀 SUI ULTRA PRO AI BOT STARTED - {BOT_VERSION}")
     log_i(f"🎯 SYMBOL: {SYMBOL} | INTERVAL: {INTERVAL} | LEVERAGE: {LEVERAGE}x")
-    log_i(f"💡 SMART PATCH ACTIVATED: Golden Zones + SMC + OB/FVG + Zero Reversal Scalping + SMART PROFIT AI + TP PROFILE + COUNCIL STRONG ENTRY")
+    log_i(f"💡 SMART PATCH ACTIVATED: Golden Zones + SMC + OB/FVG + Zero Reversal Scalping + SMART PROFIT AI + TP PROFILE + COUNCIL STRONG ENTRY + SMART RF PATCH")
     
     app.run(host="0.0.0.0", port=PORT, debug=False)
