@@ -11,6 +11,7 @@ SUI ULTRA PRO AI BOT - الإصدار الذكي المتقدم المتكامل
 • SMART PROFIT AI - نظام جني الأرباح الذكي المتقدم
 • TP PROFILE SYSTEM - نظام جني الأرباح الذكي (1→2→3 مرات)
 • COUNCIL STRONG ENTRY - دخول ذكي من مجلس الإدارة في المناطق القوية
+• NEW INTELLIGENT PATCH - Advanced Market Analysis & Smart Monitoring
 """
 
 import os, time, math, random, signal, sys, traceback, logging, json
@@ -645,7 +646,7 @@ SHADOW_MODE_DASHBOARD = False
 DRY_RUN = False
 
 # ==== Addon: Logging + Recovery Settings ====
-BOT_VERSION = f"SUI ULTRA PRO AI v7.0 — {EXCHANGE_NAME.upper()} - SMART PROFIT AI + TP PROFILE + COUNCIL STRONG ENTRY + BOX ENGINE"
+BOT_VERSION = f"SUI ULTRA PRO AI v7.0 — {EXCHANGE_NAME.upper()} - SMART PROFIT AI + TP PROFILE + COUNCIL STRONG ENTRY + BOX ENGINE + NEW INTELLIGENT PATCH"
 print("🚀 Booting:", BOT_VERSION, flush=True)
 
 STATE_PATH = "./bot_state.json"
@@ -2934,6 +2935,7 @@ def decide_tp_profile(council_conf, council_total_score, trend_strength, mode="t
     if (council_conf >= COUNCIL_STRONG_TH and 
         trend_strength >= TREND_STRONG_TH and
         mode == "trend"):
+
         reason = f"ترند قوي ({trend_strength}) | مجلس عالي ({council_conf:.1%})"
         return "strong", TP_STRONG_LEVELS, TP_STRONG_WEIGHTS, "🟢", reason
     
@@ -3708,7 +3710,7 @@ def manage_after_entry_enhanced_with_smart_patch(df, ind, info, performance_stat
     STATE["bars"] += 1
 
 # ============================================
-#  ENHANCED TRADE LOOP WITH SMART PATCH + BOX ENGINE
+#  ENHANCED TRADE LOOP WITH SMART PATCH + BOX ENGINE + NEW INTELLIGENT PATCH
 # ============================================
 
 def trade_loop_enhanced_with_smart_patch():
@@ -3738,6 +3740,240 @@ def trade_loop_enhanced_with_smart_patch():
             # ✅ إضافة نظام جني الأرباح الذكي
             if STATE.get("open") and px:
                 apply_smart_profit_strategy()
+                
+            # ============================================
+            #  🚀 NEW INTELLIGENT PATCH - ADVANCED MARKET ANALYSIS
+            # ============================================
+            
+            # 1. SMART LIQUIDITY ANALYSIS
+            try:
+                orderbook = ex.fetch_order_book(SYMBOL, limit=25)
+                bids = orderbook.get('bids', [])
+                asks = orderbook.get('asks', [])
+                
+                if bids and asks:
+                    # حساب قوة الشراء والبيع في الـ orderbook
+                    top_bid_volume = sum([bid[1] for bid in bids[:3]])  # أعلى 3 عروض شراء
+                    top_ask_volume = sum([ask[1] for ask in asks[:3]])  # أدنى 3 عروض بيع
+                    total_bid_volume = sum([bid[1] for bid in bids])
+                    total_ask_volume = sum([ask[1] for ask in asks])
+                    
+                    liquidity_ratio = total_bid_volume / total_ask_volume if total_ask_volume > 0 else 1.0
+                    top_liquidity_ratio = top_bid_volume / top_ask_volume if top_ask_volume > 0 else 1.0
+                    
+                    STATE['liquidity_ratio'] = liquidity_ratio
+                    STATE['top_liquidity_ratio'] = top_liquidity_ratio
+                    
+                    # اكتشاف جدران السيولة الكبيرة
+                    avg_bid_size = total_bid_volume / len(bids) if bids else 0
+                    avg_ask_size = total_ask_volume / len(asks) if asks else 0
+                    
+                    bid_walls = [bid for bid in bids if bid[1] > avg_bid_size * 2.5]
+                    ask_walls = [ask for ask in asks if ask[1] > avg_ask_size * 2.5]
+                    
+                    STATE['bid_walls'] = len(bid_walls)
+                    STATE['ask_walls'] = len(ask_walls)
+                    STATE['liquidity_imbalance'] = "BULLISH" if liquidity_ratio > 1.3 else ("BEARISH" if liquidity_ratio < 0.7 else "BALANCED")
+                    
+                    if LOG_ADDONS:
+                        log_i(f"🧱 LIQUIDITY ANALYSIS | Ratio: {liquidity_ratio:.2f} | Top Ratio: {top_liquidity_ratio:.2f} | Walls: B{len(bid_walls)}/A{len(ask_walls)} | Imbalance: {STATE['liquidity_imbalance']}")
+                    
+            except Exception as e:
+                log_w(f"Advanced liquidity analysis error: {e}")
+            
+            # 2. ADVANCED MOMENTUM DETECTION
+            if len(df) >= 20:
+                try:
+                    closes = df['close'].astype(float)
+                    highs = df['high'].astype(float)
+                    lows = df['low'].astype(float)
+                    volumes = df['volume'].astype(float)
+                    
+                    # حساب زخم متعدد الأطر الزمنية
+                    momentum_3 = ((closes.iloc[-1] - closes.iloc[-3]) / closes.iloc[-3]) * 100
+                    momentum_5 = ((closes.iloc[-1] - closes.iloc[-5]) / closes.iloc[-5]) * 100
+                    momentum_8 = ((closes.iloc[-1] - closes.iloc[-8]) / closes.iloc[-8]) * 100
+                    
+                    # اكتشاف الاختراقات مع تأكيد الحجم
+                    resistance_10 = highs.tail(10).max()
+                    support_10 = lows.tail(10).min()
+                    resistance_20 = highs.tail(20).max()
+                    support_20 = lows.tail(20).min()
+                    
+                    current_high = highs.iloc[-1]
+                    current_low = lows.iloc[-1]
+                    current_close = closes.iloc[-1]
+                    
+                    # تأكيد الحجم للاختراقات
+                    volume_ma = volumes.rolling(10).mean().iloc[-1]
+                    volume_spike = volumes.iloc[-1] > volume_ma * 1.5
+                    
+                    breakout_up = (current_high > resistance_10) and volume_spike
+                    breakdown_down = (current_low < support_10) and volume_spike
+                    
+                    # قوة الاختراق
+                    breakout_strength = (current_high - resistance_10) / resistance_10 * 100 if breakout_up else 0
+                    breakdown_strength = (support_10 - current_low) / support_10 * 100 if breakdown_down else 0
+                    
+                    STATE['momentum_3'] = momentum_3
+                    STATE['momentum_5'] = momentum_5
+                    STATE['momentum_8'] = momentum_8
+                    STATE['breakout_up'] = breakout_up
+                    STATE['breakdown_down'] = breakdown_down
+                    STATE['breakout_strength'] = breakout_strength
+                    STATE['breakdown_strength'] = breakdown_strength
+                    STATE['resistance_10'] = resistance_10
+                    STATE['support_10'] = support_10
+                    STATE['volume_spike'] = volume_spike
+                    
+                    if LOG_ADDONS and (breakout_up or breakdown_down):
+                        log_i(f"🎯 MOMENTUM DETECTION | Breakout: {breakout_up} | Breakdown: {breakdown_down} | Strength: {max(breakout_strength, breakdown_strength):.2f}% | Volume Spike: {volume_spike}")
+                    
+                except Exception as e:
+                    log_w(f"Advanced momentum analysis error: {e}")
+            
+            # 3. ADVANCED VOLATILITY ANALYSIS & REGIME DETECTION
+            if len(df) >= 14:
+                try:
+                    # حساب ATR النسبي ومؤشرات التقلب المتقدمة
+                    atr_value = safe_get(compute_indicators(df), 'atr', 0)
+                    current_price = px or float(df['close'].iloc[-1])
+                    atr_percentage = (atr_value / current_price) * 100 if current_price > 0 else 0
+                    
+                    # تحليل نطاق التداول
+                    high_20 = df['high'].astype(float).tail(20).max()
+                    low_20 = df['low'].astype(float).tail(20).min()
+                    range_20 = high_20 - low_20
+                    range_percentage = (range_20 / current_price) * 100
+                    
+                    # تصنيف نظام التقلب
+                    if atr_percentage > 2.5 or range_percentage > 4.0:
+                        volatility_regime = "HIGH"
+                        regime_color = "🔴"
+                    elif atr_percentage > 1.2 or range_percentage > 2.0:
+                        volatility_regime = "MEDIUM" 
+                        regime_color = "🟡"
+                    else:
+                        volatility_regime = "LOW"
+                        regime_color = "🟢"
+                    
+                    # اكتشاف الانضغاط (الضغط قبل الاختراق)
+                    range_5 = df['high'].astype(float).tail(5).max() - df['low'].astype(float).tail(5).min()
+                    range_10 = df['high'].astype(float).tail(10).max() - df['low'].astype(float).tail(10).min()
+                    compression_ratio = range_5 / range_10 if range_10 > 0 else 1.0
+                    is_compressed = compression_ratio < 0.5
+                    
+                    STATE['atr_percentage'] = atr_percentage
+                    STATE['range_percentage'] = range_percentage
+                    STATE['volatility_regime'] = volatility_regime
+                    STATE['compression_ratio'] = compression_ratio
+                    STATE['is_compressed'] = is_compressed
+                    
+                    if LOG_ADDONS:
+                        log_i(f"📊 VOLATILITY REGIME | {regime_color} {volatility_regime} | ATR: {atr_percentage:.2f}% | Range: {range_percentage:.2f}% | Compression: {compression_ratio:.2f} {'🔷' if is_compressed else ''}")
+                    
+                    # تعديل إستراتيجية التداول حسب نظام التقلب
+                    if volatility_regime == "HIGH" and not STATE.get("open"):
+                        log_i(f"🎚️ HIGH VOLATILITY MODE - Tightening filters and reducing position aggression")
+                    elif volatility_regime == "LOW" and not STATE.get("open"):
+                        log_i(f"🎚️ LOW VOLATILITY MODE - Normal trading parameters")
+                        
+                except Exception as e:
+                    log_w(f"Advanced volatility analysis error: {e}")
+            
+            # 4. SMART POSITION MONITORING & ALERT SYSTEM
+            if STATE.get("open"):
+                try:
+                    entry_price = STATE.get("entry")
+                    current_pnl = STATE.get("pnl", 0)
+                    position_age = time.time() - STATE.get("opened_at", time.time())
+                    position_side = STATE.get("side")
+                    
+                    # مراقبة أداء الصفقة المتقدمة
+                    if position_age > 1800 and abs(current_pnl) < 0.3:  # 30 دقيقة مع ربح ضعيف
+                        log_i("🕒 POSITION AGING - Low PnL after extended period - Consider review")
+                        STATE['aging_alert'] = True
+                    
+                    if position_age > 3600:  # 60 دقيقة
+                        log_i("⏳ EXTENDED POSITION - Consider partial exit or trail adjustment")
+                        STATE['extended_alert'] = True
+                    
+                    # مراقبة انعكاس الترند ضد الصفقة
+                    trend_aligned = True
+                    if position_side == "long" and STATE.get('breakdown_down', False):
+                        log_w("📉 BREAKDOWN DETECTED against LONG position")
+                        STATE['against_trend_alert'] = True
+                        trend_aligned = False
+                    elif position_side == "short" and STATE.get('breakout_up', False):
+                        log_w("📈 BREAKOUT DETECTED against SHORT position") 
+                        STATE['against_trend_alert'] = True
+                        trend_aligned = False
+                    
+                    # تحليل سيولة الـ orderbook ضد الصفقة
+                    if not trend_aligned and STATE.get('liquidity_imbalance') == ("BEARISH" if position_side == "long" else "BULLISH"):
+                        log_w("💧 LIQUIDITY IMBALANCE against position - High caution")
+                        STATE['liquidity_risk_alert'] = True
+                    
+                    # نظام إنذار الذروات (تأمين الأرباح في ظروف معينة)
+                    if current_pnl > 1.5 and STATE.get('volatility_regime') == "HIGH":
+                        log_i("💰 HIGH PROFIT + HIGH VOLATILITY - Consider securing profits")
+                        STATE['profit_protection_alert'] = True
+                        
+                    if current_pnl > 2.0 and not STATE.get('trail_active'):
+                        log_i("🎯 STRONG PROFIT - Activating aggressive trailing")
+                        STATE['trail_activation_alert'] = True
+                    
+                except Exception as e:
+                    log_w(f"Smart position monitoring error: {e}")
+            
+            # 5. MARKET REGIME DETECTION & STRATEGY ADAPTATION
+            try:
+                # تحليل ظروف السوق الشاملة
+                adx_value = safe_get(compute_indicators(df), 'adx', 0)
+                rsi_value = safe_get(compute_indicators(df), 'rsi', 50)
+                
+                # تحديد نظام السوق
+                if adx_value > 35:
+                    market_regime = "TRENDING"
+                    regime_icon = "📈"
+                elif adx_value < 15:
+                    market_regime = "RANGING" 
+                    regime_icon = "➰"
+                else:
+                    market_regime = "TRANSITION"
+                    regime_icon = "🔄"
+                
+                # تحديد جودة السوق
+                if 40 <= rsi_value <= 60 and STATE.get('volatility_regime') == "MEDIUM":
+                    market_quality = "OPTIMAL"
+                    quality_icon = "🟢"
+                elif (rsi_value < 30 or rsi_value > 70) and STATE.get('volatility_regime') == "HIGH":
+                    market_quality = "EXTREME"
+                    quality_icon = "🔴"
+                else:
+                    market_quality = "NORMAL"
+                    quality_icon = "🟡"
+                
+                STATE['market_regime'] = market_regime
+                STATE['market_quality'] = market_quality
+                
+                if LOG_ADDONS:
+                    log_i(f"🏛️ MARKET REGIME | {regime_icon} {market_regime} | {quality_icon} {market_quality} | ADX: {adx_value:.1f} | RSI: {rsi_value:.1f}")
+                
+                # تعديل الإستراتيجية حسب نظام السوق
+                if market_regime == "RANGING" and market_quality == "OPTIMAL":
+                    log_i("🎯 RANGING MARKET - Favoring mean reversion strategies")
+                elif market_regime == "TRENDING" and market_quality == "OPTIMAL":
+                    log_i("🎯 TRENDING MARKET - Favoring trend following strategies")
+                elif market_quality == "EXTREME":
+                    log_i("⚠️ EXTREME MARKET CONDITIONS - High caution recommended")
+                    
+            except Exception as e:
+                log_w(f"Market regime detection error: {e}")
+            
+            # ============================================
+            #  END OF NEW INTELLIGENT PATCH
+            # ============================================
                 
             # تحديث جميع المحركات الذكية
             close_prices = df['close'].astype(float).tolist()
@@ -4108,7 +4344,7 @@ def pretty_snapshot(bal, info, ind, spread_bps, reason=None, df=None):
         print("📈 INDICATORS & RF")
         print(f"   💲 Price {fmt(info.get('price'))} | RF filt={fmt(info.get('filter'))}  hi={fmt(info.get('hi'))} lo={fmt(info.get('lo'))}")
         print(f"   🧮 RSI={fmt(safe_get(ind, 'rsi'))}  +DI={fmt(safe_get(ind, 'plus_di'))}  -DI={fmt(safe_get(ind, 'minus_di'))}  ADX={fmt(safe_get(ind, 'adx'))}  ATR={fmt(safe_get(ind, 'atr'))}")
-        print(f"   🎯 ENTRY: SUPER COUNCIL AI + GOLDEN ENTRY + SUPER SCALP + SMART PROFIT AI + TP PROFILE + BOX ENGINE |  spread_bps={fmt(spread_bps,2)}")
+        print(f"   🎯 ENTRY: SUPER COUNCIL AI + GOLDEN ENTRY + SUPER SCALP + SMART PROFIT AI + TP PROFILE + BOX ENGINE + NEW INTELLIGENT PATCH |  spread_bps={fmt(spread_bps,2)}")
         print(f"   ⏱️ closes_in ≈ {left_s}s")
         print("\n🧭 POSITION")
         bal_line = f"Balance={fmt(bal,2)}  Risk={int(RISK_ALLOC*100)}%×{LEVERAGE}x  CompoundPnL={fmt(compound_pnl)}  Eq~{fmt((bal or 0)+compound_pnl,2)}"
@@ -4140,7 +4376,7 @@ def mark_position(color):
 @app.route("/")
 def home():
     mode='LIVE' if MODE_LIVE else 'PAPER'
-    return f"✅ SUI ULTRA PRO AI Bot — {EXCHANGE_NAME.upper()} — {SYMBOL} {INTERVAL} — {mode} — Super Council AI + Intelligent Trend Riding + Smart Profit AI + TP Profile System + Council Strong Entry + BOX ENGINE"
+    return f"✅ SUI ULTRA PRO AI Bot — {EXCHANGE_NAME.upper()} — {SYMBOL} {INTERVAL} — {mode} — Super Council AI + Intelligent Trend Riding + Smart Profit AI + TP Profile System + Council Strong Entry + BOX ENGINE + NEW INTELLIGENT PATCH"
 
 @app.route("/metrics")
 def metrics():
@@ -4149,7 +4385,7 @@ def metrics():
         "symbol": SYMBOL, "interval": INTERVAL, "mode": "live" if MODE_LIVE else "paper",
         "leverage": LEVERAGE, "risk_alloc": RISK_ALLOC, "price": price_now(),
         "state": STATE, "compound_pnl": compound_pnl,
-        "entry_mode": "SUPER_COUNCIL_AI_GOLDEN_SCALP_SMART_PROFIT_TP_PROFILE_COUNCIL_STRONG_BOX_ENGINE", 
+        "entry_mode": "SUPER_COUNCIL_AI_GOLDEN_SCALP_SMART_PROFIT_TP_PROFILE_COUNCIL_STRONG_BOX_ENGINE_NEW_INTELLIGENT_PATCH", 
         "wait_for_next_signal": wait_for_next_signal_side,
         "guards": {"max_spread_bps": MAX_SPREAD_BPS, "final_chunk_qty": FINAL_CHUNK_QTY},
         "scalp_mode": SCALP_MODE,
@@ -4158,7 +4394,8 @@ def metrics():
         "smart_profit_ai": True,
         "tp_profile_system": True,
         "council_strong_entry": COUNCIL_STRONG_ENTRY,
-        "box_engine": True
+        "box_engine": True,
+        "new_intelligent_patch": True
     })
 
 @app.route("/health")
@@ -4167,14 +4404,15 @@ def health():
         "ok": True, "exchange": EXCHANGE_NAME, "mode": "live" if MODE_LIVE else "paper",
         "open": STATE["open"], "side": STATE["side"], "qty": STATE["qty"],
         "compound_pnl": compound_pnl, "timestamp": datetime.utcnow().isoformat(),
-        "entry_mode": "SUPER_COUNCIL_AI_GOLDEN_SCALP_SMART_PROFIT_TP_PROFILE_COUNCIL_STRONG_BOX_ENGINE", 
+        "entry_mode": "SUPER_COUNCIL_AI_GOLDEN_SCALP_SMART_PROFIT_TP_PROFILE_COUNCIL_STRONG_BOX_ENGINE_NEW_INTELLIGENT_PATCH", 
         "wait_for_next_signal": wait_for_next_signal_side,
         "scalp_mode": SCALP_MODE,
         "super_council_ai": COUNCIL_AI_MODE,
         "smart_profit_ai": True,
         "tp_profile_system": True,
         "council_strong_entry": COUNCIL_STRONG_ENTRY,
-        "box_engine": True
+        "box_engine": True,
+        "new_intelligent_patch": True
     }), 200
 
 # ============================================
@@ -4217,6 +4455,10 @@ def smart_stats():
             "active": True,
             "version": "1.0",
             "features": ["demand_supply_boxes", "breakout_retest", "strong_reversal"]
+        },
+        "new_intelligent_patch": {
+            "active": True,
+            "features": ["liquidity_analysis", "momentum_detection", "volatility_regime", "position_monitoring", "market_regime"]
         }
     })
 
@@ -4261,8 +4503,8 @@ def verify_execution_environment():
     print(f"🔧 EXCHANGE: {EXCHANGE_NAME.upper()} | SYMBOL: {SYMBOL}", flush=True)
     print(f"🔧 EXECUTE_ORDERS: {EXECUTE_ORDERS} | DRY_RUN: {DRY_RUN}", flush=True)
     print(f"🎯 GOLDEN ENTRY: score={GOLDEN_ENTRY_SCORE} | ADX={GOLDEN_ENTRY_ADX}", flush=True)
-    print(f"🚀 SMART PATCH: OB/FVG + SMC + Golden Zones + Volume Confirmation + SMART PROFIT AI + TP PROFILE + COUNCIL STRONG ENTRY + BOX ENGINE", flush=True)
-    print(f"🧠 SMART PROFIT AI: Scalp + Trend + Volume Analysis + TP Profile (1→2→3) + Council Strong Entry + Box Engine Activated", flush=True)
+    print(f"🚀 SMART PATCH: OB/FVG + SMC + Golden Zones + Volume Confirmation + SMART PROFIT AI + TP PROFILE + COUNCIL STRONG ENTRY + BOX ENGINE + NEW INTELLIGENT PATCH", flush=True)
+    print(f"🧠 SMART PROFIT AI: Scalp + Trend + Volume Analysis + TP Profile (1→2→3) + Council Strong Entry + Box Engine + Advanced Market Analysis Activated", flush=True)
 
 if __name__ == "__main__":
     verify_execution_environment()
@@ -4273,6 +4515,6 @@ if __name__ == "__main__":
     
     log_i(f"🚀 SUI ULTRA PRO AI BOT STARTED - {BOT_VERSION}")
     log_i(f"🎯 SYMBOL: {SYMBOL} | INTERVAL: {INTERVAL} | LEVERAGE: {LEVERAGE}x")
-    log_i(f"💡 SMART PATCH ACTIVATED: Golden Zones + SMC + OB/FVG + Zero Reversal Scalping + SMART PROFIT AI + TP PROFILE + COUNCIL STRONG ENTRY + BOX ENGINE")
+    log_i(f"💡 SMART PATCH ACTIVATED: Golden Zones + SMC + OB/FVG + Zero Reversal Scalping + SMART PROFIT AI + TP PROFILE + COUNCIL STRONG ENTRY + BOX ENGINE + NEW INTELLIGENT PATCH")
     
     app.run(host="0.0.0.0", port=PORT, debug=False)
