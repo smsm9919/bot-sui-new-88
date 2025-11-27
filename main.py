@@ -7,7 +7,7 @@ SUI ULTRA PRO AI BOT - الإصدار الذكي المتقدم المتكامل
 • إدارة صفقات ذكية متكيفة مع قوة الترند
 • نظام Footprint + Diagonal Order-Flow المتقدم
 • Multi-Exchange Support: BingX & Bybit
-• HQ Trading Intelligence Patch - مناطق ذهبية + SMC + OB/FVG
+• HQ Trading Intelligence Patch - مناطق ذهبية + SMC + OB/FVG + BOX ENGINE
 • SMART PROFIT AI - نظام جني الأرباح الذكي المتقدم
 • TP PROFILE SYSTEM - نظام جني الأرباح الذكي (1→2→3 مرات)
 • COUNCIL STRONG ENTRY - دخول ذكي من مجلس الإدارة في المناطق القوية
@@ -122,6 +122,211 @@ class SMCDetector:
                 zones.append(("buy_liquidity", low))
                 
         return zones
+
+# =================== BOX ENGINE SETTINGS ===================
+BOX_LOOKBACK      = 120    # عدد الشمعات اللي نبني منها البوكسات
+BOX_MIN_TOUCHES   = 2      # كام لمسة عشان نعتبره بوكس محترم
+BOX_MAX_HEIGHT_BP = 60     # أقصى ارتفاع للبوكس (bps) عشان ما يكونش منطقة واسعة ضعيفة
+BOX_RET_TEST_BARS = 6      # كام شمعة نسمح بيها لإعادة الاختبار
+BOX_STRONG_WICK_R = 1.8    # نسبة طول الذيل/الجسم لاعتبار ارتداد قوي
+BOX_MIN_RR_SCALP  = 1.4    # أقل RR لصفقة سكالب
+BOX_MIN_RR_TREND  = 2.0    # أقل RR لصفقة ترند
+BALANCED_MIN_SCORE = 4.0   # عتبة عامة
+BALANCED_MIN_BOX   = 0.0   # لو عايز تجبره يستخدم بوكس قوي ارفعها
+
+# =================== BOX DETECTION ENGINE ===================
+
+class SRBox:
+    def __init__(self, kind, low, high, touches, start_idx, last_touch_idx):
+        self.kind = kind          # "demand" أو "supply"
+        self.low = low
+        self.high = high
+        self.touches = touches
+        self.start_idx = start_idx
+        self.last_touch_idx = last_touch_idx
+
+    @property
+    def mid(self):
+        return (self.low + self.high) / 2.0
+
+def _detect_swings(df, window=3):
+    h = df["high"].astype(float).values
+    l = df["low"].astype(float).values
+    swings_hi = []
+    swings_lo = []
+
+    for i in range(window, len(df) - window):
+        if h[i] == max(h[i-window:i+window+1]):
+            swings_hi.append(i)
+        if l[i] == min(l[i-window:i+window+1]):
+            swings_lo.append(i)
+    return swings_hi, swings_lo
+
+def build_sr_boxes(df):
+    """
+    يبني بوكسات عرض/طلب بسيطة من الـ swing highs/lows
+    ويرمي البوكسات الواسعة أو اللي مالهاش لمسات كفاية
+    """
+    if len(df) < 40:
+        return []
+
+    swings_hi, swings_lo = _detect_swings(df)
+    closes = df["close"].astype(float).values
+    boxes = []
+
+    # Demand boxes من swing lows
+    for idx in swings_lo:
+        base = closes[idx]
+        low  = df["low"].astype(float).values[idx]
+        high = base
+        height_bps = abs(high - low) / base * 10000
+        if height_bps > BOX_MAX_HEIGHT_BP:
+            continue
+
+        touches = 0
+        last_touch = idx
+        for j in range(idx, len(df)):
+            if df["low"].iloc[j] <= high and df["low"].iloc[j] >= low:
+                touches += 1
+                last_touch = j
+        if touches >= BOX_MIN_TOUCHES:
+            boxes.append(SRBox("demand", low, high, touches, idx, last_touch))
+
+    # Supply boxes من swing highs
+    for idx in swings_hi:
+        base = closes[idx]
+        high = df["high"].astype(float).values[idx]
+        low  = base
+        height_bps = abs(high - low) / base * 10000
+        if height_bps > BOX_MAX_HEIGHT_BP:
+            continue
+
+        touches = 0
+        last_touch = idx
+        for j in range(idx, len(df)):
+            if df["high"].iloc[j] >= low and df["high"].iloc[j] <= high:
+                touches += 1
+                last_touch = j
+        if touches >= BOX_MIN_TOUCHES:
+            boxes.append(SRBox("supply", low, high, touches, idx, last_touch))
+
+    return boxes
+
+def analyze_box_context(df, boxes):
+    """
+    يرجّع سياق البوكس الأقرب للسعر الحالي:
+    - breakout_retest_long / short
+    - strong_reversal_long / short
+    - weak_retest / no_setup
+    """
+    if not boxes or len(df) < 10:
+        return {"ctx": "none", "tier": "none", "score": 0.0, "rr": 0.0, "dir": None, "debug": "no_boxes"}
+
+    close = float(df["close"].iloc[-1])
+    high  = float(df["high"].iloc[-1])
+    low   = float(df["low"].iloc[-1])
+    o     = float(df["open"].iloc[-1])
+
+    # بوكس الأقرب للسعر
+    best = None
+    best_dist = 1e9
+    for b in boxes:
+        if b.low <= close <= b.high:
+            dist = 0
+        else:
+            dist = min(abs(close - b.low), abs(close - b.high))
+        if dist < best_dist:
+            best = b
+            best_dist = dist
+
+    if not best:
+        return {"ctx": "none", "tier": "none", "score": 0.0, "rr": 0.0, "dir": None, "debug": "no_near_box"}
+
+    # نحسب شوية معلومات
+    body = abs(close - o)
+    rng  = max(high - low, 1e-9)
+    up_wick   = high - max(o, close)
+    down_wick = min(o, close) - low
+
+    # نجيب أقرب بوكس عكسي عشان نحسب RR
+    opp_dir = "supply" if best.kind == "demand" else "demand"
+    opp_levels = [ (b.low, b.high) for b in boxes if b.kind == opp_dir ]
+    if opp_levels:
+        if best.kind == "demand":
+            target_price = min(l for (l, h) in opp_levels)  # أعلى بوكس عرض فوق
+        else:
+            target_price = max(h for (l, h) in opp_levels)  # أدنى بوكس طلب تحت
+        rr = abs(target_price - close) / max(close - best.low, best.high - close, 1e-9)
+    else:
+        rr = 2.0  # نفترض RR محترم لو مفيش عكس قريب
+
+    ctx = "none"
+    tier = "weak"
+    score = 0.0
+    direction = None
+    debug = []
+
+    # ----- Demand box حالات -----
+    if best.kind == "demand":
+        # اختراق تحت البوكس ثم رجوع فوقه بفتيلة قوية = ارتداد قوي (قاع قوي)
+        if low < best.low and close > best.low:
+            wick_ratio = down_wick / max(body, 1e-9)
+            if wick_ratio >= BOX_STRONG_WICK_R:
+                ctx = "strong_reversal_long"
+                tier = "strong"
+                score += 3.0
+                direction = "buy"
+                debug.append("sweep_below_demand_with_strong_wick")
+        # إعادة اختبار أعلى البوكس بعد اختراق سابق
+        elif best.low <= close <= best.high:
+            ctx = "retest_long"
+            tier = "mid"
+            score += 1.5
+            direction = "buy"
+            debug.append("retest_demand_box")
+
+    # ----- Supply box حالات -----
+    else:
+        if high > best.high and close < best.high:
+            wick_ratio = up_wick / max(body, 1e-9)
+            if wick_ratio >= BOX_STRONG_WICK_R:
+                ctx = "strong_reversal_short"
+                tier = "strong"
+                score += 3.0
+                direction = "sell"
+                debug.append("sweep_above_supply_with_strong_wick")
+        elif best.low <= close <= best.high:
+            ctx = "retest_short"
+            tier = "mid"
+            score += 1.5
+            direction = "sell"
+            debug.append("retest_supply_box")
+
+    # تعديل القوة بالـ RR
+    if rr >= BOX_MIN_RR_TREND:
+        score += 2.0
+        if tier == "mid":
+            tier = "strong"
+        debug.append(f"good_trend_rr={rr:.2f}")
+    elif rr >= BOX_MIN_RR_SCALP:
+        score += 1.0
+        debug.append(f"ok_scalp_rr={rr:.2f}")
+    else:
+        score -= 1.0
+        debug.append(f"poor_rr={rr:.2f}")
+
+    if ctx == "none":
+        tier = "none"
+
+    return {
+        "ctx": ctx,
+        "tier": tier,
+        "score": round(score, 2),
+        "rr": round(rr, 2),
+        "dir": direction,
+        "debug": ";".join(debug),
+        "box": best,
+    }
 
 # ---------- Volume Confirmation ----------
 def volume_is_strong(vol_list, window=20, threshold=1.4):
@@ -440,7 +645,7 @@ SHADOW_MODE_DASHBOARD = False
 DRY_RUN = False
 
 # ==== Addon: Logging + Recovery Settings ====
-BOT_VERSION = f"SUI ULTRA PRO AI v7.0 — {EXCHANGE_NAME.upper()} - SMART PROFIT AI + TP PROFILE + COUNCIL STRONG ENTRY"
+BOT_VERSION = f"SUI ULTRA PRO AI v7.0 — {EXCHANGE_NAME.upper()} - SMART PROFIT AI + TP PROFILE + COUNCIL STRONG ENTRY + BOX ENGINE"
 print("🚀 Booting:", BOT_VERSION, flush=True)
 
 STATE_PATH = "./bot_state.json"
@@ -742,6 +947,7 @@ def log_i(msg): print(f"ℹ️ {msg}", flush=True)
 def log_g(msg): print(f"✅ {msg}", flush=True)
 def log_w(msg): print(f"🟨 {msg}", flush=True)
 def log_e(msg): print(f"❌ {msg}", flush=True)
+def log_y(msg): print(f"🟡 {msg}", flush=True)  # إضافة للتحذيرات الصفراء
 
 def log_banner(text): print(f"\n{'—'*12} {text} {'—'*12}\n", flush=True)
 
@@ -3502,7 +3708,7 @@ def manage_after_entry_enhanced_with_smart_patch(df, ind, info, performance_stat
     STATE["bars"] += 1
 
 # ============================================
-#  ENHANCED TRADE LOOP WITH SMART PATCH
+#  ENHANCED TRADE LOOP WITH SMART PATCH + BOX ENGINE
 # ============================================
 
 def trade_loop_enhanced_with_smart_patch():
@@ -3559,8 +3765,19 @@ def trade_loop_enhanced_with_smart_patch():
                 STATE["pnl"] = (px-STATE["entry"])*STATE["qty"] if STATE["side"]=="long" else (STATE["entry"]-px)*STATE["qty"]
             
             # ============================================
-            #  SMART DECISION INTELLIGENCE BLOCK
+            #  SMART DECISION INTELLIGENCE BLOCK + BOX ENGINE
             # ============================================
+            
+            # ===== BOX ENGINE INTEGRATION =====
+            boxes = build_sr_boxes(df)
+            box_ctx = analyze_box_context(df, boxes)
+            
+            if box_ctx["ctx"] != "none":
+                log_i(
+                    f"📦 BOX CONTEXT: {box_ctx['ctx']} | tier={box_ctx['tier']} "
+                    f"score={box_ctx['score']:.2f} rr={box_ctx['rr']:.2f} dir={box_ctx['dir']} "
+                    f"| debug={box_ctx['debug']}"
+                )
             
             entry_reasons = []
             allow_buy = False
@@ -3679,6 +3896,17 @@ def trade_loop_enhanced_with_smart_patch():
             conf = float(council_data.get("confidence", 0.0))
             total_score = sb + ss
 
+            # ===== BOX ENGINE BOOST =====
+            if box_ctx["ctx"] != "none":
+                if box_ctx["dir"] == "buy":
+                    cb += 3
+                    sb += 1.5
+                    log_i(f"📦 BOX BOOST: +3 votes BUY | score +1.5")
+                elif box_ctx["dir"] == "sell":
+                    cs += 3
+                    ss += 1.5
+                    log_i(f"📦 BOX BOOST: +3 votes SELL | score +1.5")
+            
             council_side = None
             if COUNCIL_STRONG_ENTRY and conf >= COUNCIL_STRONG_CONF and total_score >= COUNCIL_STRONG_SCORE:
                 if cb >= COUNCIL_STRONG_VOTES and sb > ss:
@@ -3722,6 +3950,19 @@ def trade_loop_enhanced_with_smart_patch():
                 else:
                     log_i("🏛 COUNCIL STRONG ENTRY blocked by opposite strong trend")
 
+            # ===== فلتر BALANCED MODE =====
+            combined_score = total_score + box_ctx.get("score", 0.0)
+
+            if combined_score < BALANCED_MIN_SCORE or box_ctx.get("tier") == "weak":
+                # لا سكالب ضعيف
+                if council_side or allow_buy or allow_sell:
+                    log_y(f"⚠️ BALANCED FILTER: skipped weak setup | combined_score={combined_score:.2f} "
+                          f"| box_tier={box_ctx.get('tier')} | ctx={box_ctx.get('ctx')}")
+                council_side = None
+                allow_buy = False
+                allow_sell = False
+                final_signal = None
+
             # ===== تنفيذ الدخول إن وجد إشارة نهائية =====
             if final_signal and not STATE["open"]:
                 allow_wait, wait_reason = wait_gate_allow(df, info)
@@ -3758,11 +3999,25 @@ def trade_loop_enhanced_with_smart_patch():
                         STATE["last_entry_reasons"] = " | ".join(entry_reasons) if entry_reasons else ""
                         STATE["last_balance"] = float(bal or 0.0)
 
+                        # تحديد قوة الإشارة وملف TP
+                        signal_strength = "weak"
+                        tp_profile = "SCALP_1"
+
+                        if box_ctx["tier"] == "strong" and trend_ctx.trend == "trend":
+                            signal_strength = "strong"
+                            tp_profile = "TREND_3"
+                        elif box_ctx["tier"] in ("mid", "strong"):
+                            signal_strength = "mid"
+                            tp_profile = "MID_2"
+
+                        STATE["signal_strength"] = signal_strength
+                        STATE["tp_profile"] = tp_profile
+
                         ok = open_market_enhanced(final_signal, qty, px or info["price"])
                         if ok:
                             wait_for_next_signal_side = None
                             log_i(f"🎯 SMART EXECUTION: {final_signal.upper()} | src={entry_source} | "
-                                  f"Reasons: {' | '.join(entry_reasons)}")
+                                  f"Reasons: {' | '.join(entry_reasons)} | Strength: {signal_strength} | TP: {tp_profile}")
                             if SCALP_MODE:
                                 zero_scalper.record_trade(current_time, True)
                     else:
@@ -3853,7 +4108,7 @@ def pretty_snapshot(bal, info, ind, spread_bps, reason=None, df=None):
         print("📈 INDICATORS & RF")
         print(f"   💲 Price {fmt(info.get('price'))} | RF filt={fmt(info.get('filter'))}  hi={fmt(info.get('hi'))} lo={fmt(info.get('lo'))}")
         print(f"   🧮 RSI={fmt(safe_get(ind, 'rsi'))}  +DI={fmt(safe_get(ind, 'plus_di'))}  -DI={fmt(safe_get(ind, 'minus_di'))}  ADX={fmt(safe_get(ind, 'adx'))}  ATR={fmt(safe_get(ind, 'atr'))}")
-        print(f"   🎯 ENTRY: SUPER COUNCIL AI + GOLDEN ENTRY + SUPER SCALP + SMART PROFIT AI + TP PROFILE |  spread_bps={fmt(spread_bps,2)}")
+        print(f"   🎯 ENTRY: SUPER COUNCIL AI + GOLDEN ENTRY + SUPER SCALP + SMART PROFIT AI + TP PROFILE + BOX ENGINE |  spread_bps={fmt(spread_bps,2)}")
         print(f"   ⏱️ closes_in ≈ {left_s}s")
         print("\n🧭 POSITION")
         bal_line = f"Balance={fmt(bal,2)}  Risk={int(RISK_ALLOC*100)}%×{LEVERAGE}x  CompoundPnL={fmt(compound_pnl)}  Eq~{fmt((bal or 0)+compound_pnl,2)}"
@@ -3862,7 +4117,7 @@ def pretty_snapshot(bal, info, ind, spread_bps, reason=None, df=None):
             lamp='🟩 LONG' if STATE['side']=='long' else '🟥 SHORT'
             print(f"   {lamp}  Entry={fmt(STATE['entry'])}  Qty={fmt(STATE['qty'],4)}  Bars={STATE['bars']}  Trail={fmt(STATE['trail'])}  BE={fmt(STATE['breakeven'])}")
             print(f"   🎯 TP_done={STATE['profit_targets_achieved']}  HP={fmt(STATE['highest_profit_pct'],2)}%")
-            print(f"   🎯 MODE={STATE.get('mode', 'trend')}  TP_PROFILE={STATE.get('tp_profile', 'none')}")
+            print(f"   🎯 MODE={STATE.get('mode', 'trend')}  TP_PROFILE={STATE.get('tp_profile', 'none')}  SIGNAL_STRENGTH={STATE.get('signal_strength', 'none')}")
         else:
             print("   ⚪ FLAT")
             if wait_for_next_signal_side:
@@ -3885,7 +4140,7 @@ def mark_position(color):
 @app.route("/")
 def home():
     mode='LIVE' if MODE_LIVE else 'PAPER'
-    return f"✅ SUI ULTRA PRO AI Bot — {EXCHANGE_NAME.upper()} — {SYMBOL} {INTERVAL} — {mode} — Super Council AI + Intelligent Trend Riding + Smart Profit AI + TP Profile System + Council Strong Entry"
+    return f"✅ SUI ULTRA PRO AI Bot — {EXCHANGE_NAME.upper()} — {SYMBOL} {INTERVAL} — {mode} — Super Council AI + Intelligent Trend Riding + Smart Profit AI + TP Profile System + Council Strong Entry + BOX ENGINE"
 
 @app.route("/metrics")
 def metrics():
@@ -3894,7 +4149,7 @@ def metrics():
         "symbol": SYMBOL, "interval": INTERVAL, "mode": "live" if MODE_LIVE else "paper",
         "leverage": LEVERAGE, "risk_alloc": RISK_ALLOC, "price": price_now(),
         "state": STATE, "compound_pnl": compound_pnl,
-        "entry_mode": "SUPER_COUNCIL_AI_GOLDEN_SCALP_SMART_PROFIT_TP_PROFILE_COUNCIL_STRONG", 
+        "entry_mode": "SUPER_COUNCIL_AI_GOLDEN_SCALP_SMART_PROFIT_TP_PROFILE_COUNCIL_STRONG_BOX_ENGINE", 
         "wait_for_next_signal": wait_for_next_signal_side,
         "guards": {"max_spread_bps": MAX_SPREAD_BPS, "final_chunk_qty": FINAL_CHUNK_QTY},
         "scalp_mode": SCALP_MODE,
@@ -3902,7 +4157,8 @@ def metrics():
         "intelligent_trend_riding": TREND_RIDING_AI,
         "smart_profit_ai": True,
         "tp_profile_system": True,
-        "council_strong_entry": COUNCIL_STRONG_ENTRY
+        "council_strong_entry": COUNCIL_STRONG_ENTRY,
+        "box_engine": True
     })
 
 @app.route("/health")
@@ -3911,13 +4167,14 @@ def health():
         "ok": True, "exchange": EXCHANGE_NAME, "mode": "live" if MODE_LIVE else "paper",
         "open": STATE["open"], "side": STATE["side"], "qty": STATE["qty"],
         "compound_pnl": compound_pnl, "timestamp": datetime.utcnow().isoformat(),
-        "entry_mode": "SUPER_COUNCIL_AI_GOLDEN_SCALP_SMART_PROFIT_TP_PROFILE_COUNCIL_STRONG", 
+        "entry_mode": "SUPER_COUNCIL_AI_GOLDEN_SCALP_SMART_PROFIT_TP_PROFILE_COUNCIL_STRONG_BOX_ENGINE", 
         "wait_for_next_signal": wait_for_next_signal_side,
         "scalp_mode": SCALP_MODE,
         "super_council_ai": COUNCIL_AI_MODE,
         "smart_profit_ai": True,
         "tp_profile_system": True,
-        "council_strong_entry": COUNCIL_STRONG_ENTRY
+        "council_strong_entry": COUNCIL_STRONG_ENTRY,
+        "box_engine": True
     }), 200
 
 # ============================================
@@ -3955,6 +4212,11 @@ def smart_stats():
         "council_strong_entry": {
             "active": COUNCIL_STRONG_ENTRY,
             "current_trade": STATE.get("council_controlled", False)
+        },
+        "box_engine": {
+            "active": True,
+            "version": "1.0",
+            "features": ["demand_supply_boxes", "breakout_retest", "strong_reversal"]
         }
     })
 
@@ -3967,12 +4229,15 @@ def market_context():
     fvg = detect_fvg(df)
     golden = golden_zone_check(df)
     liquidity = smc_detector.detect_liquidity_zones(current_price or 0)
+    boxes = build_sr_boxes(df)
+    box_ctx = analyze_box_context(df, boxes)
     
     return jsonify({
         "order_block": ob,
         "fair_value_gap": fvg,
         "golden_zone": golden,
         "liquidity_zones": liquidity,
+        "box_context": box_ctx,
         "current_price": current_price,
         "timestamp": datetime.utcnow().isoformat()
     })
@@ -3996,8 +4261,8 @@ def verify_execution_environment():
     print(f"🔧 EXCHANGE: {EXCHANGE_NAME.upper()} | SYMBOL: {SYMBOL}", flush=True)
     print(f"🔧 EXECUTE_ORDERS: {EXECUTE_ORDERS} | DRY_RUN: {DRY_RUN}", flush=True)
     print(f"🎯 GOLDEN ENTRY: score={GOLDEN_ENTRY_SCORE} | ADX={GOLDEN_ENTRY_ADX}", flush=True)
-    print(f"🚀 SMART PATCH: OB/FVG + SMC + Golden Zones + Volume Confirmation + SMART PROFIT AI + TP PROFILE + COUNCIL STRONG ENTRY", flush=True)
-    print(f"🧠 SMART PROFIT AI: Scalp + Trend + Volume Analysis + TP Profile (1→2→3) + Council Strong Entry Activated", flush=True)
+    print(f"🚀 SMART PATCH: OB/FVG + SMC + Golden Zones + Volume Confirmation + SMART PROFIT AI + TP PROFILE + COUNCIL STRONG ENTRY + BOX ENGINE", flush=True)
+    print(f"🧠 SMART PROFIT AI: Scalp + Trend + Volume Analysis + TP Profile (1→2→3) + Council Strong Entry + Box Engine Activated", flush=True)
 
 if __name__ == "__main__":
     verify_execution_environment()
@@ -4008,6 +4273,6 @@ if __name__ == "__main__":
     
     log_i(f"🚀 SUI ULTRA PRO AI BOT STARTED - {BOT_VERSION}")
     log_i(f"🎯 SYMBOL: {SYMBOL} | INTERVAL: {INTERVAL} | LEVERAGE: {LEVERAGE}x")
-    log_i(f"💡 SMART PATCH ACTIVATED: Golden Zones + SMC + OB/FVG + Zero Reversal Scalping + SMART PROFIT AI + TP PROFILE + COUNCIL STRONG ENTRY")
+    log_i(f"💡 SMART PATCH ACTIVATED: Golden Zones + SMC + OB/FVG + Zero Reversal Scalping + SMART PROFIT AI + TP PROFILE + COUNCIL STRONG ENTRY + BOX ENGINE")
     
     app.run(host="0.0.0.0", port=PORT, debug=False)
