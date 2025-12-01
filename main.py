@@ -12,6 +12,10 @@ ULTRA PRO AI BOT - الإصدار المتكامل الذكي المحسن
 • BOX REJECTION ENGINE + SMC CONTEXT + GOLDEN ZONES
 • TRAP MODE - استغلال مناطق ضرب الستوبات بذكاء
 • STOP-HUNT PREDICTION ENGINE - توقع مناطق ضرب الستوبات القادمة
+• TRADE PROFILE SYSTEM - 3 أنواع صفقات + TP/SL ديناميكي
+• TRAP OVERRIDE ENGINE - دخول قسري في فرص الستوب هانت
+• EQUITY TRACKING - تتبع الربح التراكمي والرصيد
+• WEB SERVICE - واجهة ويب للرصد والإدارة
 """
 
 import os
@@ -28,6 +32,7 @@ from datetime import datetime
 from decimal import Decimal, ROUND_DOWN
 from collections import deque
 from typing import Literal, Dict, Any, Optional, Tuple
+from flask import Flask, jsonify
 
 Side = Literal["BUY", "SELL"]
 
@@ -53,8 +58,11 @@ EXECUTE_ORDERS = True
 DRY_RUN = False
 LOG_LEVEL = "INFO"
 
+# Web Service Configuration
+PORT = int(os.getenv("PORT", "5000"))
+
 # Bot Version
-BOT_VERSION = f"ULTRA PRO AI v10.0 - MASTER EDITION - {EXCHANGE_NAME.upper()}"
+BOT_VERSION = f"ULTRA PRO AI v12.0 - WEB SERVICE EDITION - {EXCHANGE_NAME.upper()}"
 
 print(f"🚀 Booting: {BOT_VERSION}", flush=True)
 
@@ -97,6 +105,16 @@ log_g = ColorLogger.success
 log_w = ColorLogger.warning
 log_e = ColorLogger.error
 log_r = ColorLogger.critical
+
+def log_equity_snapshot(balance_usdt: float, compound_pnl: float):
+    """
+    لوج موحَّد يوضح الرصيد والربح التراكمي
+    """
+    log_i(
+        f"💼 BALANCE SNAPSHOT | "
+        f"Balance: {balance_usdt:.2f} USDT  | "
+        f"👑 CumPnL: {compound_pnl:.2f} USDT"
+    )
 
 # ============================================
 #  EXCHANGE MANAGER
@@ -225,7 +243,15 @@ class StateManager:
             "tp_mode": None,
             "trade_type": "normal",  # normal, trap, golden, predictive
             "tp1_hit": False,
-            "tp2_hit": False
+            "tp2_hit": False,
+            "compound_pnl": 0.0,    # الربح التراكمي
+            "total_trades": 0,      # إجمالي الصفقات
+            "trade_profile": "MID_TREND",  # نوع الصفقة
+            "dynamic_sl": None,     # ستوب ديناميكي
+            "high_water": None,     # أعلى سعر للمركز
+            "tp_levels": [],        # مستويات جني الأرباح
+            "entry_price": None,    # سعر الدخول
+            "edge_setup": None      # إعدادات EdgeAlgo
         }
         self.state_file = "bot_state.json"
         self.load_state()
@@ -273,7 +299,12 @@ class StateManager:
             "tp_mode": None,
             "trade_type": "normal",
             "tp1_hit": False,
-            "tp2_hit": False
+            "tp2_hit": False,
+            "dynamic_sl": None,
+            "high_water": None,
+            "tp_levels": [],
+            "entry_price": None,
+            "edge_setup": None
         })
         self.save_state()
     
@@ -580,6 +611,7 @@ class TrendAnalyzer:
         self.trend = "flat"
         self.strength = 0.0
         self.momentum = 0.0
+        self.adx = 0.0
         
     def update(self, df):
         """تحديث تحليل الاتجاه"""
@@ -609,6 +641,9 @@ class TrendAnalyzer:
             recent = close_prices.tail(5).values
             self.momentum = (recent[-1] - recent[0]) / recent[0] * 100 if recent[0] != 0 else 0
             
+        # حساب ADX مبسط
+        self.adx = self._calculate_simple_adx(df)
+            
         # تحديد الاتجاه
         if delta > 0 and self.strength > 0.1:
             self.trend = "up"
@@ -616,6 +651,42 @@ class TrendAnalyzer:
             self.trend = "down" 
         else:
             self.trend = "flat"
+            
+    def _calculate_simple_adx(self, df):
+        """حساب ADX مبسط"""
+        try:
+            if len(df) < 14:
+                return 0.0
+                
+            high = df['high'].astype(float)
+            low = df['low'].astype(float)
+            close = df['close'].astype(float)
+            
+            # حساب +DM و -DM
+            plus_dm = high.diff()
+            minus_dm = -low.diff()
+            
+            plus_dm = np.where((plus_dm > minus_dm) & (plus_dm > 0), plus_dm, 0)
+            minus_dm = np.where((minus_dm > plus_dm) & (minus_dm > 0), minus_dm, 0)
+            
+            # حساب TR
+            tr1 = high - low
+            tr2 = abs(high - close.shift(1))
+            tr3 = abs(low - close.shift(1))
+            tr = np.maximum(np.maximum(tr1, tr2), tr3)
+            
+            # حساب المتوسطات
+            atr = tr.rolling(14).mean()
+            plus_di = 100 * (plus_dm.rolling(14).mean() / atr)
+            minus_di = 100 * (minus_dm.rolling(14).mean() / atr)
+            
+            # حساب ADX
+            dx = 100 * abs(plus_di - minus_di) / (plus_di + minus_di)
+            adx = dx.rolling(14).mean()
+            
+            return float(adx.iloc[-1]) if not pd.isna(adx.iloc[-1]) else 0.0
+        except:
+            return 0.0
             
     def is_strong_trend(self):
         """التحقق من قوة الاتجاه"""
@@ -627,6 +698,7 @@ class TrendAnalyzer:
             "direction": self.trend,
             "strength": self.strength,
             "momentum": self.momentum,
+            "adx": self.adx,
             "is_strong": self.is_strong_trend()
         }
 
@@ -1047,6 +1119,63 @@ class GoldenZoneEngine:
         return {"type": None, "valid": False}
 
 # ============================================
+#  TRADE PROFILE CLASSIFIER
+# ============================================
+
+class TradeProfileClassifier:
+    """مصنف أنواع الصفقات"""
+    
+    @staticmethod
+    def classify_trade_profile(analysis, edge_setup):
+        """
+        analysis: نتيجة مجلس الإدارة (scores, trend, adx...)
+        edge_setup: من EdgeAlgo (rr1, rr2, rr3, grade=weak/mid/strong)
+        """
+        if not edge_setup or not edge_setup.get("valid"):
+            return "SKIP"
+
+        rr1 = edge_setup.get("rr1", 1.0)
+        trend = analysis["trend"]
+        adx = trend.get("adx", 0)
+
+        strength_score = 0.0
+
+        # قوة الـ RR
+        if rr1 >= 1.5:
+            strength_score += 2
+        elif rr1 >= 1.2:
+            strength_score += 1
+        else:
+            strength_score -= 2  # سكالب ضعيف
+
+        # قوة الترند
+        if trend["direction"] in ("up", "down") and trend["is_strong"]:
+            strength_score += 2
+        elif trend["direction"] in ("up", "down"):
+            strength_score += 1
+
+        # ADX
+        if adx >= 30:
+            strength_score += 2
+        elif adx >= 20:
+            strength_score += 1
+
+        # Golden / Trap / Stop-Hunt معانا
+        if analysis.get("smc_ctx", {}).get("stop_hunt_zone"):
+            strength_score += 1
+        if analysis.get("golden_zone", {}).get("valid"):
+            strength_score += 1
+
+        # تصنيف
+        if rr1 < 1.0 or strength_score < 0:
+            return "SKIP"          # سكالب ضعيف → ما ندخلش
+        if strength_score < 3:
+            return "SCALP_STRONG"  # سكالب محترم (هدف واحد)
+        if strength_score < 5:
+            return "MID_TREND"     # نص ترند
+        return "FULL_TREND"        # ترند كبير
+
+# ============================================
 #  ULTRA COUNCIL AI - نظام التصويت الذكي المتكامل
 # ============================================
 
@@ -1066,7 +1195,8 @@ class UltraCouncilAI:
         self.box_rejection_engine = BoxRejectionEngine()
         self.advanced_fvg = AdvancedFVGDetector()
         self.golden_engine = GoldenZoneEngine()
-        self.sh_predictor = StopHuntPredictor()  # المحرك الجديد للتنبؤ بالستوب هانت
+        self.sh_predictor = StopHuntPredictor()
+        self.profile_classifier = TradeProfileClassifier()
         
         # معايير القرار
         self.min_confidence = 0.6
@@ -1237,7 +1367,7 @@ class UltraCouncilAI:
                         else:
                             score_sell += 1.0
 
-            # 9. التنبؤ بالستوب هانت (المحرك الجديد)
+            # 9. التنبؤ بالستوب هانت
             predicted_sh = self.sh_predictor.predict(df)
             if predicted_sh.get("up_target"):
                 signals.append(f"🎯 Predicted Stop-Hunt UP @ {predicted_sh['up_target']:.6f}")
@@ -1269,7 +1399,7 @@ class UltraCouncilAI:
                 "stop_hunt_trap_side": trap_side,
                 "stop_hunt_trap_quality": trap_quality,
                 "golden_zone": golden,
-                "predicted_stop_hunt": predicted_sh  # إضافة التوقعات
+                "predicted_stop_hunt": predicted_sh
             }
             
         except Exception as e:
@@ -1281,7 +1411,7 @@ class UltraCouncilAI:
         return {
             "score_buy": 0, "score_sell": 0, "confidence": 0, 
             "signals": [], "rf": {}, "edge_setup": None,
-            "trend": {"direction": "flat", "strength": 0, "momentum": 0, "is_strong": False},
+            "trend": {"direction": "flat", "strength": 0, "momentum": 0, "adx": 0, "is_strong": False},
             "fvg_analysis": None, "stop_hunt_zones": 0, "smc_ctx": {}, 
             "box_rejection": {"buy": {"valid": False}, "sell": {"valid": False}},
             "stop_hunt_trap_side": None, "stop_hunt_trap_quality": 0,
@@ -1293,11 +1423,26 @@ class UltraCouncilAI:
         """تحديد ما إذا كان يجب الدخول في صفقة"""
         analysis = self.analyze_market(df)
         
-        # أولاً: لو الثقة قليلة، نجرب TRAP MODE قبل ما نرفض
-        if analysis["confidence"] < self.min_confidence:
-            trap_side = analysis.get("stop_hunt_trap_side")
-            trap_q = analysis.get("stop_hunt_trap_quality", 0.0)
+        # أولاً: TRAP OVERRIDE MODE - دخول قسري
+        trap_side = analysis.get("stop_hunt_trap_side")
+        trap_q = analysis.get("stop_hunt_trap_quality", 0.0)
+        predicted = analysis.get("predicted_stop_hunt", {})
 
+        if trap_side and trap_q >= 2.5:
+            log_w("🧨 TRAP OVERRIDE MODE ACTIVATED")
+            
+            # لو السوق عامل Stop Hunt + Sweep + Liquidity
+            sweep = analysis.get("smc_ctx", {}).get("liquidity_sweep", False)
+            fake = analysis.get("smc_ctx", {}).get("fake_break", False)
+            fvg = analysis.get("fvg_analysis", {}).get("real", False)
+
+            if sweep or fake or fvg:
+                entry_signal = trap_side.lower()
+                reason = f"TRAP_OVERRIDE | StopHunt={trap_q:.1f} | sweep={sweep} | fake={fake} | fvg={fvg}"
+                return entry_signal, reason, analysis
+        
+        # ثانياً: لو الثقة قليلة، نجرب TRAP MODE قبل ما نرفض
+        if analysis["confidence"] < self.min_confidence:
             # لو في منطقة Trap قوية (ضرب استوبات واضح + ترند معاه)
             if trap_side and trap_q >= 3.0:
                 entry_signal = trap_side.lower()   # "buy" أو "sell"
@@ -1310,9 +1455,7 @@ class UltraCouncilAI:
         entry_signal = None
         reason = ""
         
-        # التوقع الخبيث لضرب الاستوبات (المحرك الجديد)
-        pred = analysis.get("predicted_stop_hunt", {})
-
+        # التوقع الخبيث لضرب الاستوبات
         # لو في target فوق + السعر تحت الهدف + ترند هابط = SELL خبيث
         if pred.get("up_target") and analysis["trend"]["direction"] == "down":
             if analysis["score_sell"] >= self.min_score - 3:
@@ -1391,9 +1534,15 @@ class SmartPositionManager:
             
         # تحليل السوق لتحديد نوع الصفقة
         analysis = self.council.analyze_market(df)
-        trade_type = "normal"
+        edge_setup = analysis.get("edge_setup")
         
         # تحديد نوع الصفقة
+        trade_profile = self.council.profile_classifier.classify_trade_profile(analysis, edge_setup)
+        if trade_profile == "SKIP":
+            log_w("⛔ Skip weak scalp (RR سيئ)")
+            return False
+            
+        trade_type = "normal"
         if analysis.get("stop_hunt_trap_side") and analysis.get("stop_hunt_trap_quality", 0) >= 3.0:
             trade_type = "trap"
         elif analysis.get("golden_zone", {}).get("valid"):
@@ -1403,24 +1552,8 @@ class SmartPositionManager:
             
         # تنفيذ الأمر
         if self.exchange.execute_order(side, position_size, current_price):
-            # حفظ بيانات EdgeAlgo إن وجدت
-            edge_setup = analysis.get("edge_setup")
-            if edge_setup and edge_setup.get("valid"):
-                self.state.update({
-                    "sl": edge_setup["sl"],
-                    "tp1": edge_setup["tp1"],
-                    "tp2": edge_setup["tp2"],
-                    "tp3": edge_setup["tp3"],
-                    "tp_mode": edge_setup["grade"]
-                })
-            else:
-                self.state.update({
-                    "sl": None,
-                    "tp1": None,
-                    "tp2": None,
-                    "tp3": None,
-                    "tp_mode": None
-                })
+            # إعداد TP/SL حسب نوع الصفقة
+            self._setup_tp_levels(side, current_price, trade_profile, edge_setup)
                 
             self.state.update({
                 "open": True,
@@ -1434,13 +1567,146 @@ class SmartPositionManager:
                 "opened_at": time.time(),
                 "last_signal": side,
                 "trade_type": trade_type,
+                "trade_profile": trade_profile,
+                "edge_setup": edge_setup,
+                "entry_price": current_price,
                 "tp1_hit": False,
                 "tp2_hit": False
             })
             
-            log_g(f"✅ New Position Opened: {side.upper()} | Size: {position_size:.4f} | Entry: {current_price:.6f} | Type: {trade_type.upper()}")
+            log_g(f"✅ New Position Opened: {side.upper()} | Size: {position_size:.4f} | Entry: {current_price:.6f} | Type: {trade_type.upper()} | Profile: {trade_profile}")
+            
+            # لوج الرصيد بعد فتح الصفقة
+            balance_now = self.exchange.get_balance()
+            log_equity_snapshot(balance_now, self.state.get("compound_pnl", 0.0))
+            
             return True
             
+        return False
+    
+    def _setup_tp_levels(self, side, current_price, profile, edge_setup):
+        """إعداد مستويات جني الأرباح حسب نوع الصفقة"""
+        entry = current_price
+        sl = None
+        
+        if edge_setup and edge_setup.get("valid"):
+            entry = edge_setup["entry"]
+            sl = edge_setup["sl"]
+
+        self.state["entry_price"] = entry
+        self.state["dynamic_sl"] = sl
+        self.state["high_water"] = entry
+
+        r = abs(entry - sl) if sl else entry * 0.004  # لو مفيش SL من EdgeAlgo
+
+        tp_levels = []
+
+        if profile == "SCALP_STRONG":
+            # سكالب محترم: هدف واحد كبير، اغلاق كامل
+            tp = entry + (r * 1.2 if side == "long" else -r * 1.2)
+            tp_levels.append({
+                "price": tp,
+                "close_frac": 1.0,
+                "sl_mode": "FINAL",
+                "hit": False,
+            })
+
+        elif profile == "MID_TREND":
+            # نص ترند: على مرتين
+            tp1 = entry + (r * 1.0 if side == "long" else -r * 1.0)
+            tp2 = entry + (r * 2.0 if side == "long" else -r * 2.0)
+            tp_levels.extend([
+                {"price": tp1, "close_frac": 0.5, "sl_mode": "BE",         "hit": False},
+                {"price": tp2, "close_frac": 0.5, "sl_mode": "FINAL",      "hit": False},
+            ])
+
+        elif profile == "FULL_TREND":
+            # ترند كبير: على 3 مرات + تريل
+            tp1 = entry + (r * 1.0 if side == "long" else -r * 1.0)
+            tp2 = entry + (r * 2.0 if side == "long" else -r * 2.0)
+            tp3 = entry + (r * 3.0 if side == "long" else -r * 3.0)
+            tp_levels.extend([
+                {"price": tp1, "close_frac": 0.3, "sl_mode": "BE",         "hit": False},
+                {"price": tp2, "close_frac": 0.4, "sl_mode": "LOCK_TP1",   "hit": False},
+                {"price": tp3, "close_frac": 0.3, "sl_mode": "TRAIL",      "hit": False},
+            ])
+
+        self.state["tp_levels"] = tp_levels
+        log_i(f"🎯 TP PROFILE = {profile} | levels={[(l['price'], l['close_frac']) for l in tp_levels]}")
+    
+    def _run_tp_engine(self, current_price, df):
+        """محرك جني الأرباح الديناميكي"""
+        st = self.state
+        if "tp_levels" not in st:
+            return
+
+        side = st["side"]
+        entry = st["entry_price"]
+        levels = st["tp_levels"]
+
+        # high_water للتريل
+        if side == "long":
+            st["high_water"] = max(st.get("high_water", current_price), current_price)
+        else:
+            st["high_water"] = min(st.get("high_water", current_price), current_price)
+
+        for level in levels:
+            if level["hit"]:
+                continue
+
+            price = level["price"]
+            hit = (side == "long" and current_price >= price) or \
+                  (side == "short" and current_price <= price)
+
+            if not hit:
+                continue
+
+            frac = level["close_frac"]
+            self._partial_close(frac, reason=f"TP_HIT_{st['trade_profile']}")
+
+            level["hit"] = True
+
+            mode = level["sl_mode"]
+            if mode == "BE":
+                st["dynamic_sl"] = entry
+            elif mode == "LOCK_TP1":
+                st["dynamic_sl"] = levels[0]["price"]
+            elif mode == "FINAL":
+                # نقفل الباقي ونخرج
+                self.close_position("TP_FINAL")
+                return
+            elif mode == "TRAIL":
+                # هنسيب التريل يكمل
+                pass
+
+            log_i(f"✅ TP HIT | profile={st['trade_profile']} | mode={mode} | newSL={st.get('dynamic_sl')}")
+    
+    def _partial_close(self, percentage, reason):
+        """إغلاق جزء من المركز"""
+        try:
+            current_qty = self.state["qty"]
+            close_qty = current_qty * (percentage / 100.0)
+            side = "sell" if self.state["side"] == "long" else "buy"
+            current_price = self.exchange.get_current_price()
+            
+            if self.exchange.execute_order(side, close_qty, current_price):
+                new_qty = current_qty - close_qty
+                self.state["qty"] = new_qty
+                
+                # حساب الربح المحقق
+                entry_price = self.state["entry_price"]
+                if self.state["side"] == "long":
+                    realized_pnl = (current_price - entry_price) * close_qty
+                else:
+                    realized_pnl = (entry_price - current_price) * close_qty
+                    
+                # تحديث الربح التراكمي
+                self.state["compound_pnl"] = self.state.get("compound_pnl", 0.0) + realized_pnl
+                
+                log_g(f"✅ Partial Close: {percentage}% | Reason: {reason} | New Qty: {new_qty:.4f} | PnL: {realized_pnl:.3f} USDT")
+                return True
+        except Exception as e:
+            log_e(f"❌ Partial close failed: {e}")
         return False
     
     def manage_position(self, df):
@@ -1452,7 +1718,7 @@ class SmartPositionManager:
         if not current_price:
             return
             
-        entry_price = self.state["entry"]
+        entry_price = self.state["entry_price"]
         side = self.state["side"]
         trade_type = self.state.get("trade_type", "normal")
         
@@ -1471,73 +1737,24 @@ class SmartPositionManager:
         # تحليل السوق الحالي
         analysis = self.council.analyze_market(df)
         
-        # 1. إدارة SL/TP من EdgeAlgo
-        sl = self.state["sl"]
-        if sl:
-            if side == "long" and current_price <= sl:
-                return self.close_position("HIT_SL_EDGE")
-            if side == "short" and current_price >= sl:
-                return self.close_position("HIT_SL_EDGE")
+        # 1. إدارة TP الديناميكي
+        self._run_tp_engine(current_price, df)
+        
+        # 2. إدارة SL الديناميكي
+        dsl = self.state.get("dynamic_sl")
+        if dsl:
+            if side == "long" and current_price <= dsl:
+                return self.close_position("DYNAMIC_SL_HIT")
+            if side == "short" and current_price >= dsl:
+                return self.close_position("DYNAMIC_SL_HIT")
 
-        # إدارة TP بناءً على نوع الصفقة
-        self._manage_take_profits(current_price, side, trade_type, pnl_pct)
-
-        # 2. حماية متقدمة بناءً على نوع الصفقة
+        # 3. حماية متقدمة بناءً على نوع الصفقة
         exit_reason = self._get_advanced_exit_reason(pnl_pct, analysis, side, trade_type)
         
         if exit_reason:
             self.close_position(exit_reason)
         else:
             self.state["bars"] += 1
-    
-    def _manage_take_profits(self, current_price, side, trade_type, pnl_pct):
-        """إدارة مستويات جني الأرباح"""
-        tp1 = self.state["tp1"]
-        tp2 = self.state["tp2"] 
-        tp3 = self.state["tp3"]
-        
-        if not tp1:
-            return
-            
-        # TP1
-        if not self.state["tp1_hit"]:
-            if (side == "long" and current_price >= tp1) or (side == "short" and current_price <= tp1):
-                self.state["tp1_hit"] = True
-                log_g("🎯 TP1 HIT")
-                # في صفقات TRAP نغلق جزء عند TP1
-                if trade_type == "trap" and pnl_pct >= 1.5:
-                    self._partial_close(50, "TRAP_TP1_PARTIAL")
-        
-        # TP2
-        if not self.state["tp2_hit"] and self.state["tp1_hit"]:
-            if (side == "long" and current_price >= tp2) or (side == "short" and current_price <= tp2):
-                self.state["tp2_hit"] = True
-                log_g("🔥 TP2 HIT")
-                # في صفقات GOLDEN نغلق جزء عند TP2
-                if trade_type == "golden" and pnl_pct >= 3.0:
-                    self._partial_close(30, "GOLDEN_TP2_PARTIAL")
-        
-        # TP3
-        if self.state["tp1_hit"] and self.state["tp2_hit"] and tp3:
-            if (side == "long" and current_price >= tp3) or (side == "short" and current_price <= tp3):
-                self.close_position("TP3_FINAL")
-    
-    def _partial_close(self, percentage, reason):
-        """إغلاق جزء من المركز"""
-        try:
-            current_qty = self.state["qty"]
-            close_qty = current_qty * (percentage / 100.0)
-            side = "sell" if self.state["side"] == "long" else "buy"
-            current_price = self.exchange.get_current_price()
-            
-            if self.exchange.execute_order(side, close_qty, current_price):
-                new_qty = current_qty - close_qty
-                self.state["qty"] = new_qty
-                log_g(f"✅ Partial Close: {percentage}% | Reason: {reason} | New Qty: {new_qty:.4f}")
-                return True
-        except Exception as e:
-            log_e(f"❌ Partial close failed: {e}")
-        return False
     
     def _get_advanced_exit_reason(self, pnl_pct, analysis, current_side, trade_type):
         """تحديد سبب الخروج المتقدم بناءً على نوع الصفقة"""
@@ -1616,13 +1833,34 @@ class SmartPositionManager:
     def close_position(self, reason=""):
         """إغلاق المركز الحالي"""
         if not self.state["open"]:
-            return
+            return False
             
         side = "sell" if self.state["side"] == "long" else "buy"
         current_price = self.exchange.get_current_price()
         
         if current_price and self.exchange.execute_order(side, self.state["qty"], current_price):
-            log_g(f"✅ Position Closed: {reason} | PnL: {self.state['pnl']:.2f}% | Type: {self.state.get('trade_type', 'normal').upper()}")
+            # حساب الربح النهائي
+            entry_price = self.state["entry_price"]
+            if self.state["side"] == "long":
+                realized_pnl = (current_price - entry_price) * self.state["qty"]
+            else:
+                realized_pnl = (entry_price - current_price) * self.state["qty"]
+            
+            # تحديث الربح التراكمي وعداد الصفقات
+            self.state["total_trades"] = self.state.get("total_trades", 0) + 1
+            self.state["compound_pnl"] = self.state.get("compound_pnl", 0.0) + realized_pnl
+            
+            # لوج إغلاق الصفقة
+            log_g(
+                f"💰 TRADE CLOSED | side={self.state['side']} | qty={self.state['qty']:.4f} | "
+                f"pnl={realized_pnl:.3f} USDT | "
+                f"🔄 trade#{self.state['total_trades']} | Reason: {reason}"
+            )
+            
+            # لوج الرصيد النهائي
+            balance_after = self.exchange.get_balance()
+            log_equity_snapshot(balance_after, self.state["compound_pnl"])
+            
             self.state.reset()
             return True
             
@@ -1645,25 +1883,25 @@ class UltraProAIBot:
         
     def start(self):
         """بدء تشغيل البوت"""
-        log_g("🚀 Starting ULTRA PRO AI Trading Bot - MASTER EDITION...")
+        log_g("🚀 Starting ULTRA PRO AI Trading Bot - WEB SERVICE EDITION...")
         log_g(f"🔹 Exchange: {EXCHANGE_NAME.upper()}")
         log_g(f"🔹 Symbol: {SYMBOL}")
         log_g(f"🔹 Timeframe: {INTERVAL}")
         log_g(f"🔹 Leverage: {LEVERAGE}x")
         log_g(f"🔹 Risk Allocation: {RISK_ALLOC*100}%")
         log_g(f"🔹 Mode: {'LIVE' if MODE_LIVE else 'PAPER'} {'(DRY RUN)' if DRY_RUN else ''}")
-        log_g("🔹 FEATURES: RF Real + EdgeAlgo + SMC + Box Rejection + Advanced FVG + Golden Zones + Trap Mode + Stop-Hunt Prediction")
+        log_g(f"🔹 Web Service: http://0.0.0.0:{PORT}")
+        log_g("🔹 FEATURES: RF Real + EdgeAlgo + SMC + Box Rejection + Advanced FVG + Golden Zones + Trap Mode + Stop-Hunt Prediction + Trade Profiles + Web Service")
         
         self.running = True
-        self._main_loop()
-    
+        
     def stop(self):
         """إيقاف البوت"""
         self.running = False
         log_i("🛑 Bot stopped by user")
     
-    def _main_loop(self):
-        """الحلقة الرئيسية للتداول المتكامل"""
+    def trade_loop(self):
+        """حلقة التداول الرئيسية"""
         consecutive_errors = 0
         max_errors = 5
         
@@ -1754,9 +1992,69 @@ class UltraProAIBot:
             "exchange": EXCHANGE_NAME,
             "symbol": SYMBOL,
             "balance": self.exchange.get_balance(),
-            "position": self.state.state
+            "position": self.state.state,
+            "version": BOT_VERSION
         }
         return status
+
+    def keepalive_loop(self):
+        """حلقة الحفاظ على التشغيل"""
+        while self.running:
+            try:
+                # مجرد تأكيد أن البوت شغال
+                time.sleep(30)
+            except:
+                pass
+
+# ============================================
+#  WEB SERVICE
+# ============================================
+
+app = Flask(__name__)
+bot = None
+
+@app.route("/health")
+def health():
+    """نقطة فحص الصحة"""
+    return jsonify({"status": "healthy", "timestamp": datetime.now().isoformat()})
+
+@app.route("/metrics")
+def metrics():
+    """نقطة المقاييس والإحصائيات"""
+    if not bot:
+        return jsonify({"error": "Bot not initialized"})
+    
+    status = bot.get_status()
+    return jsonify({
+        "status": "running" if bot.running else "stopped",
+        "exchange": status["exchange"],
+        "symbol": status["symbol"],
+        "balance": status["balance"],
+        "position_open": status["position"]["open"],
+        "position_side": status["position"]["side"],
+        "position_pnl": status["position"]["pnl"],
+        "compound_pnl": status["position"].get("compound_pnl", 0),
+        "total_trades": status["position"].get("total_trades", 0),
+        "trade_profile": status["position"].get("trade_profile", "N/A"),
+        "version": status["version"],
+        "timestamp": datetime.now().isoformat()
+    })
+
+@app.route("/stop")
+def stop_bot():
+    """إيقاف البوت"""
+    if bot:
+        bot.stop()
+        return jsonify({"status": "stopping"})
+    return jsonify({"error": "Bot not running"})
+
+@app.route("/start")
+def start_bot():
+    """تشغيل البوت"""
+    if bot and not bot.running:
+        bot.start()
+        return jsonify({"status": "starting"})
+    return jsonify({"error": "Bot already running or not initialized"})
 
 # ============================================
 #  START APPLICATION
@@ -1764,12 +2062,28 @@ class UltraProAIBot:
 
 def main():
     """الدالة الرئيسية لتشغيل التطبيق"""
+    global bot
+    
     try:
-        # إنشاء وتشغيل البوت
+        # إنشاء البوت
         bot = UltraProAIBot()
         
-        # تشغيل البوت
+        # تشغيل البوت في خيط منفصل
+        import threading
         bot.start()
+        
+        # تشغيل حلقة التداول في خيط منفصل
+        trade_thread = threading.Thread(target=bot.trade_loop, daemon=True)
+        trade_thread.start()
+        
+        # تشغيل حلقة الحفاظ على التشغيل في خيط منفصل
+        keepalive_thread = threading.Thread(target=bot.keepalive_loop, daemon=True)
+        keepalive_thread.start()
+        
+        log_g(f"🌐 Web Service starting on port {PORT}...")
+        
+        # تشغيل Flask
+        app.run(host="0.0.0.0", port=PORT, debug=False, use_reloader=False)
         
     except KeyboardInterrupt:
         log_i("🛑 Application stopped by user")
@@ -1779,8 +2093,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
-def run_server():
-    app.run(host="0.0.0.0", port=10000)
-
-threading.Thread(target=run_server).start()
