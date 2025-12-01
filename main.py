@@ -1282,6 +1282,34 @@ class UltraCouncilAI:
         self.min_confidence = 0.6
         self.min_score = 8
 
+    def _empty_analysis(self):
+        """تحليل فارغ عند الخطأ"""
+        return {
+            "score_buy": 0.0,
+            "score_sell": 0.0,
+            "confidence": 0.0,
+            "signals": [],
+            "trend": {
+                "direction": "flat",
+                "strength": 0.0,
+                "momentum": 0.0,
+                "is_strong": False,
+            },
+            "fvg_analysis": {},
+            "stop_hunt_zones": 0,
+            "rf": {},
+            "smc_ctx": {},
+            "edge_setup": None,
+            "box_rejection": {
+                "buy": {"valid": False},
+                "sell": {"valid": False},
+            },
+            "stop_hunt_trap_side": None,
+            "stop_hunt_trap_quality": 0.0,
+            "golden_zone": {"type": None, "valid": False},
+            "predicted_stop_hunt": {},
+        }
+
     def analyze_market(self, df):
         """تحليل السوق الشامل المتكامل"""
         if len(df) < 20:
@@ -1486,96 +1514,99 @@ class UltraCouncilAI:
             log_e(f"❌ Ultra market analysis error: {e}")
             return self._empty_analysis()
 
-    def _empty_analysis(self):
-        """تحليل فارغ عند الخطأ"""
-        return {
-            "score_buy": 0, "score_sell": 0, "confidence": 0, 
-            "signals": [], "rf": {}, "edge_setup": None,
-            "trend": {"direction": "flat", "strength": 0, "momentum": 0, "adx": 0, "is_strong": False},
-            "fvg_analysis": None, "stop_hunt_zones": 0, "smc_ctx": {}, 
-            "box_rejection": {"buy": {"valid": False}, "sell": {"valid": False}},
-            "stop_hunt_trap_side": None, "stop_hunt_trap_quality": 0,
-            "golden_zone": {"valid": False},
-            "predicted_stop_hunt": {"up_target": None, "down_target": None}
-        }
-
     def should_enter_trade(self, df):
         """تحديد ما إذا كان يجب الدخول في صفقة"""
         analysis = self.analyze_market(df)
-        
+
         # حماية من analysis None
         if analysis is None:
             return None, "NO_ANALYSIS", {}
-        
-        # حماية analysis
+
         analysis = analysis or {}
-        
-        # أولاً: TRAP OVERRIDE MODE - دخول قسري
+
         trap_side = analysis.get("stop_hunt_trap_side")
         trap_q = analysis.get("stop_hunt_trap_quality", 0.0)
-        predicted = analysis.get("predicted_stop_hunt", {})
-        smc_ctx = analysis.get("smc_ctx", {})
-        fvg_ctx = analysis.get("fvg_analysis", {})
+        predicted = analysis.get("predicted_stop_hunt", {}) or {}
+        smc_ctx = analysis.get("smc_ctx", {}) or {}
+        fvg_ctx = analysis.get("fvg_analysis", {}) or {}
 
+        # 1) TRAP OVERRIDE MODE – دخول قسري لو الفرصة خبيثة جدًا
         if trap_side and trap_q >= 2.5:
             log_w("🧨 TRAP OVERRIDE MODE ACTIVATED")
-            
-            # لو السوق عامل Stop Hunt + Sweep + Liquidity
+
             sweep = smc_ctx.get("liquidity_sweep", False)
             fake = smc_ctx.get("fake_break", False)
-            fvg = fvg_ctx.get("real", False)
+            fvg_real = fvg_ctx.get("real", False)
 
-            if sweep or fake or fvg:
+            if sweep or fake or fvg_real:
                 entry_signal = trap_side.lower()
-                reason = f"TRAP_OVERRIDE | StopHunt={trap_q:.1f} | sweep={sweep} | fake={fake} | fvg={fvg}"
+                reason = (
+                    f"TRAP_OVERRIDE | StopHunt={trap_q:.1f} "
+                    f"| sweep={sweep} | fake={fake} | fvg={fvg_real}"
+                )
                 return entry_signal, reason, analysis
-        
-        # ثانياً: لو الثقة قليلة، نجرب TRAP MODE قبل ما نرفض
-        if analysis.get("confidence", 0) < self.min_confidence:
-            # لو في منطقة Trap قوية (ضرب استوبات واضح + ترند معاه)
+
+        # 2) لو الثقة قليلة جرّب Trap Mode قبل الرفض
+        if analysis.get("confidence", 0.0) < self.min_confidence:
             if trap_side and trap_q >= 3.0:
-                entry_signal = trap_side.lower()   # "buy" أو "sell"
+                entry_signal = trap_side.lower()
                 reason = f"TRAP MODE {trap_side} | Stop-Hunt Exploit | Q={trap_q:.1f}"
                 return entry_signal, reason, analysis
 
-            # مافيش Trap محترم -> فعلاً Low confidence
             return None, "Low confidence", analysis
-        
-        entry_signal = None
-        reason = ""
-        
-        # التوقع الخبيث لضرب الاستوبات
-        # لو في target فوق + السعر تحت الهدف + ترند هابط = SELL خبيث
-        if predicted.get("up_target") and analysis["trend"]["direction"] == "down":
-            if analysis["score_sell"] >= self.min_score - 3:
+
+        # 3) توقع ضرب الاستوبات (Predictive Stop-Hunt)
+        trend_dir = analysis.get("trend", {}).get("direction", "flat")
+
+        # لو في هدف ستوب هانت فوق والسوق ترنده هابط → بيع خبيث
+        if predicted.get("up_target") and trend_dir == "down":
+            if analysis.get("score_sell", 0) >= self.min_score - 3:
                 return "sell", "PREDICTIVE STOP-HUNT SELL", analysis
 
-        # لو في target تحت + السعر فوق الهدف + ترند صاعد = BUY خبيث
-        if predicted.get("down_target") and analysis["trend"]["direction"] == "up":
-            if analysis["score_buy"] >= self.min_score - 3:
+        # لو في هدف ستوب هانت تحت والسوق ترنده صاعد → شراء خبيث
+        if predicted.get("down_target") and trend_dir == "up":
+            if analysis.get("score_buy", 0) >= self.min_score - 3:
                 return "buy", "PREDICTIVE STOP-HUNT BUY", analysis
 
-        # Golden Zone Override
-        golden = analysis.get("golden_zone", {})
+        # 4) Golden Zone Override
+        entry_signal = None
+        reason = ""
+        golden = analysis.get("golden_zone", {}) or {}
+
         if golden.get("valid"):
-            if golden["type"] == "golden_bottom" and analysis["score_buy"] >= self.min_score - 2:
+            if golden.get("type") == "golden_bottom" and analysis.get("score_buy", 0) >= self.min_score - 2:
                 entry_signal = "buy"
-                reason = f"ULTRA BUY | Golden Override | Score: {analysis['score_buy']} | Confidence: {analysis['confidence']}"
-            elif golden["type"] == "golden_top" and analysis["score_sell"] >= self.min_score - 2:
+                reason = (
+                    f"ULTRA BUY | Golden Override | "
+                    f"Score: {analysis['score_buy']} | Conf: {analysis['confidence']}"
+                )
+            elif golden.get("type") == "golden_top" and analysis.get("score_sell", 0) >= self.min_score - 2:
                 entry_signal = "sell"
-                reason = f"ULTRA SELL | Golden Override | Score: {analysis['score_sell']} | Confidence: {analysis['confidence']}"
-        
-        if analysis["score_buy"] >= self.min_score and analysis["score_buy"] > analysis["score_sell"]:
-            entry_signal = "buy"
-            reason = f"ULTRA BUY | Score: {analysis['score_buy']} | Confidence: {analysis['confidence']}"
-            
-        elif analysis["score_sell"] >= self.min_score and analysis["score_sell"] > analysis["score_buy"]:
-            entry_signal = "sell"
-            reason = f"ULTRA SELL | Score: {analysis['score_sell']} | Confidence: {analysis['confidence']}"
-            
-        else:
-            reason = f"No clear signal | Buy: {analysis['score_buy']} | Sell: {analysis['score_sell']}"
-            
+                reason = (
+                    f"ULTRA SELL | Golden Override | "
+                    f"Score: {analysis['score_sell']} | Conf: {analysis['confidence']}"
+                )
+
+        # 5) القرار العادي لو مفيش Override
+        if entry_signal is None:
+            if analysis.get("score_buy", 0) >= self.min_score and analysis["score_buy"] > analysis["score_sell"]:
+                entry_signal = "buy"
+                reason = (
+                    f"ULTRA BUY | Score: {analysis['score_buy']} "
+                    f"| Confidence: {analysis['confidence']}"
+                )
+            elif analysis.get("score_sell", 0) >= self.min_score and analysis["score_sell"] > analysis["score_buy"]:
+                entry_signal = "sell"
+                reason = (
+                    f"ULTRA SELL | Score: {analysis['score_sell']} "
+                    f"| Confidence: {analysis['confidence']}"
+                )
+            else:
+                reason = (
+                    f"No clear signal | Buy: {analysis.get('score_buy', 0)} "
+                    f"| Sell: {analysis.get('score_sell', 0)}"
+                )
+
         return entry_signal, reason, analysis
 
 # ============================================
@@ -1781,18 +1812,21 @@ class SmartPositionManager:
             if self.exchange.execute_order(side, close_qty, current_price):
                 new_qty = current_qty - close_qty
                 self.state["qty"] = new_qty
-                
-                # حساب الربح المحقق
+
+                # حساب الربح المحقق من الجزء المقفول
                 entry_price = self.state["entry_price"]
                 if self.state["side"] == "long":
                     realized_pnl = (current_price - entry_price) * close_qty
                 else:
                     realized_pnl = (entry_price - current_price) * close_qty
-                    
+
                 # تحديث الربح التراكمي
                 self.state["compound_pnl"] = self.state.get("compound_pnl", 0.0) + realized_pnl
-                
-                log_g(f"✅ Partial Close: {percentage}% | Reason: {reason} | New Qty: {new_qty:.4f} | PnL: {realized_pnl:.3f} USDT")
+
+                log_g(
+                    f"✅ Partial Close: {percentage}% | Reason: {reason} | "
+                    f"New Qty: {new_qty:.4f} | PnL: {realized_pnl:.3f} USDT"
+                )
                 return True
         except Exception as e:
             log_e(f"❌ Partial close failed: {e}")
@@ -1934,22 +1968,19 @@ class SmartPositionManager:
                 realized_pnl = (current_price - entry_price) * self.state["qty"]
             else:
                 realized_pnl = (entry_price - current_price) * self.state["qty"]
-            
-            # تحديث الربح التراكمي وعداد الصفقات
+
             self.state["total_trades"] = self.state.get("total_trades", 0) + 1
             self.state["compound_pnl"] = self.state.get("compound_pnl", 0.0) + realized_pnl
-            
-            # لوج إغلاق الصفقة
+
             log_g(
-                f"💰 TRADE CLOSED | side={self.state['side']} | qty={self.state['qty']:.4f} | "
-                f"pnl={realized_pnl:.3f} USDT | "
+                f"💰 TRADE CLOSED | side={self.state['side']} | "
+                f"qty={self.state['qty']:.4f} | pnl={realized_pnl:.3f} USDT | "
                 f"🔄 trade#{self.state['total_trades']} | Reason: {reason}"
             )
-            
-            # لوج الرصيد النهائي
+
             balance_after = self.exchange.get_balance()
             log_equity_snapshot(balance_after, self.state["compound_pnl"])
-            
+
             self.state.reset()
             return True
             
@@ -1982,8 +2013,12 @@ class UltraProAIBot:
         log_g(f"🔹 Web Service: http://0.0.0.0:{PORT}")
         log_g("🔹 FEATURES: RF Real + EdgeAlgo + SMC + Box Rejection + Advanced FVG + Golden Zones + Trap Mode + Stop-Hunt Prediction + Trade Profiles + Web Service")
         
-        self.running = True
+        # لوج الرصيد عند بداية التشغيل
+        balance_now = self.exchange.get_balance()
+        log_equity_snapshot(balance_now, self.state["compound_pnl"])
         
+        self.running = True
+    
     def stop(self):
         """إيقاف البوت"""
         self.running = False
@@ -1993,33 +2028,32 @@ class UltraProAIBot:
         """حلقة التداول الرئيسية"""
         consecutive_errors = 0
         max_errors = 5
-        
+
         while self.running:
             try:
-                # جلب بيانات السوق
                 df = self.exchange.fetch_ohlcv(limit=100)
                 if df.empty:
                     time.sleep(5)
                     continue
-                
-                # تحديث السعر والرصيد
+
                 current_price = self.exchange.get_current_price()
                 balance = self.exchange.get_balance()
-                
+
                 if not current_price:
                     time.sleep(5)
                     continue
-                
-                # اتخاذ قرار التداول المتكامل
+
+                # Snapshot للرصيد كل دورة
+                log_equity_snapshot(balance, self.state.get("compound_pnl", 0.0))
+
                 if not self.state["open"]:
                     self._handle_trading_decision(df, current_price, balance)
                 else:
                     self.position_manager.manage_position(df)
-                
-                # إعادة تعيين عداد الأخطاء
+
                 consecutive_errors = 0
-                time.sleep(10)  # انتظار 10 ثواني بين الدورات
-                
+                time.sleep(10)
+
             except KeyboardInterrupt:
                 self.stop()
                 break
@@ -2027,14 +2061,14 @@ class UltraProAIBot:
                 consecutive_errors += 1
                 log_e(f"❌ Main loop error: {e}")
                 traceback.print_exc()
-                
+
                 if consecutive_errors >= max_errors:
                     log_r("🔴 Too many consecutive errors - restarting loop")
                     time.sleep(60)
                     consecutive_errors = 0
                 else:
                     time.sleep(5)
-    
+
     def _handle_trading_decision(self, df, current_price, balance):
         """معالجة قرار التداول المتكامل"""
         if balance <= 10:
