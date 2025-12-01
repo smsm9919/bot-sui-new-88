@@ -33,6 +33,9 @@ from decimal import Decimal, ROUND_DOWN
 from collections import deque
 from typing import Literal, Dict, Any, Optional, Tuple
 from flask import Flask, jsonify
+import threading
+import sys
+import signal
 
 Side = Literal["BUY", "SELL"]
 
@@ -67,11 +70,11 @@ BOT_VERSION = f"ULTRA PRO AI v12.0 - WEB SERVICE EDITION - {EXCHANGE_NAME.upper(
 print(f"🚀 Booting: {BOT_VERSION}", flush=True)
 
 # ============================================
-#  LOGGING SYSTEM
+#  COLORED LOGGING SYSTEM
 # ============================================
 
-class ColorLogger:
-    """نظام التسجيل الملوّن المحترف"""
+class ColorFormatter:
+    """تنسيق الألوان للوحة التحكم"""
     
     COLORS = {
         'INFO': '\033[94m',      # أزرق
@@ -79,14 +82,24 @@ class ColorLogger:
         'WARNING': '\033[93m',   # أصفر
         'ERROR': '\033[91m',     # أحمر
         'CRITICAL': '\033[95m',  # بنفسجي
+        'BANNER': '\033[96m',    # سماوي
+        'FEATURE': '\033[93m',   # أصفر
         'RESET': '\033[0m'       # إعادة الضبط
     }
     
     @staticmethod
+    def color_text(text, color_type):
+        color = ColorFormatter.COLORS.get(color_type, ColorFormatter.COLORS['RESET'])
+        return f"{color}{text}{ColorFormatter.COLORS['RESET']}"
+
+class ColorLogger:
+    """نظام التسجيل الملوّن المحترف"""
+    
+    @staticmethod
     def log(level, message):
-        color = ColorLogger.COLORS.get(level, ColorLogger.COLORS['RESET'])
+        color = ColorFormatter.COLORS.get(level, ColorFormatter.COLORS['RESET'])
         timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        print(f"{color}{timestamp} | {level} | {message}{ColorLogger.COLORS['RESET']}", flush=True)
+        print(f"{color}{timestamp} | {level} | {message}{ColorFormatter.COLORS['RESET']}", flush=True)
     
     @staticmethod
     def info(msg): ColorLogger.log('INFO', msg)
@@ -115,6 +128,73 @@ def log_equity_snapshot(balance_usdt: float, compound_pnl: float):
         f"Balance: {balance_usdt:.2f} USDT  | "
         f"👑 CumPnL: {compound_pnl:.2f} USDT"
     )
+
+# ============================================
+#  BOOT BANNER SYSTEM
+# ============================================
+
+def log_banner():
+    """طباعة بانر بداية التشغيل المحترف"""
+    mode = "LIVE" if MODE_LIVE else "PAPER"
+    if DRY_RUN:
+        mode += " (DRY RUN)"
+    
+    print("\n" + "="*80)
+    print(ColorFormatter.color_text(" ULTRA PRO AI TRADING ENGINE — STARTUP ", "BANNER"))
+    print("="*80)
+
+    print(ColorFormatter.color_text(f" MODE           : {mode}", "FEATURE"))
+    print(ColorFormatter.color_text(f" SYMBOL         : {SYMBOL}", "FEATURE"))
+    print(ColorFormatter.color_text(f" INTERVAL       : {INTERVAL}", "FEATURE"))
+    print(ColorFormatter.color_text(f" LEVERAGE       : {LEVERAGE}x", "FEATURE"))
+    print(ColorFormatter.color_text(f" RISK           : {int(RISK_ALLOC*100)}%", "FEATURE"))
+    print(ColorFormatter.color_text(f" EXCHANGE       : {EXCHANGE_NAME.upper()}", "FEATURE"))
+
+    print(ColorFormatter.color_text("\n ADVANCED FEATURES:", "SUCCESS"))
+    print(ColorFormatter.color_text("  • RF Real Engine", "FEATURE"))
+    print(ColorFormatter.color_text("  • EdgeAlgo Smart RR Zones", "FEATURE"))
+    print(ColorFormatter.color_text("  • SMC: Supply/Demand + OB + Breaker + BOS", "FEATURE"))
+    print(ColorFormatter.color_text("  • Box Rejection Engine", "FEATURE"))
+    print(ColorFormatter.color_text("  • Advanced FVG Detection", "FEATURE"))
+    print(ColorFormatter.color_text("  • Golden Zones (Top/Bottom)", "FEATURE"))
+    print(ColorFormatter.color_text("  • Stop-Hunt Prediction Engine", "FEATURE"))
+    print(ColorFormatter.color_text("  • Trap Mode & Liquidity Sweep", "FEATURE"))
+    print(ColorFormatter.color_text("  • Smart Profit AI (TP1/TP2/TP3)", "FEATURE"))
+    print(ColorFormatter.color_text("  • Dynamic Stop-Burn + Breakeven", "FEATURE"))
+    print(ColorFormatter.color_text("  • Trend Mode + Momentum Scanner", "FEATURE"))
+    print(ColorFormatter.color_text("  • Equity Tracking + Compound PnL", "FEATURE"))
+    print(ColorFormatter.color_text("  • Web Service + Health Metrics", "FEATURE"))
+
+    print("="*80)
+    print(ColorFormatter.color_text("🚀 INITIALIZING ULTRA PRO AI ENGINE...", "BANNER"))
+    print("="*80)
+    print()
+
+# ============================================
+#  KEEPALIVE SYSTEM
+# ============================================
+
+def keepalive_loop():
+    """
+    Loop لتثبيت العملية ومنع Render من قتل البوت.
+    """
+    log_i("🔄 KeepAlive loop started (50s intervals)")
+    while True:
+        try:
+            time.sleep(50)
+            # مجرد تأكيد أن البوت شغال
+            log_i("💓 KeepAlive pulse - Bot is running...")
+        except Exception as e:
+            log_w(f"⚠️ KeepAlive error: {e}")
+
+def setup_signal_handlers():
+    """إعداد معالجات الإشارات للإغلاق الآمن"""
+    def signal_handler(signum, frame):
+        log_i(f"🛑 Received signal {signum} - Shutting down gracefully...")
+        sys.exit(0)
+    
+    signal.signal(signal.SIGTERM, signal_handler)
+    signal.signal(signal.SIGINT, signal_handler)
 
 # ============================================
 #  EXCHANGE MANAGER
@@ -1423,18 +1503,27 @@ class UltraCouncilAI:
         """تحديد ما إذا كان يجب الدخول في صفقة"""
         analysis = self.analyze_market(df)
         
+        # حماية من analysis None
+        if analysis is None:
+            return None, "NO_ANALYSIS", {}
+        
+        # حماية analysis
+        analysis = analysis or {}
+        
         # أولاً: TRAP OVERRIDE MODE - دخول قسري
         trap_side = analysis.get("stop_hunt_trap_side")
         trap_q = analysis.get("stop_hunt_trap_quality", 0.0)
         predicted = analysis.get("predicted_stop_hunt", {})
+        smc_ctx = analysis.get("smc_ctx", {})
+        fvg_ctx = analysis.get("fvg_analysis", {})
 
         if trap_side and trap_q >= 2.5:
             log_w("🧨 TRAP OVERRIDE MODE ACTIVATED")
             
             # لو السوق عامل Stop Hunt + Sweep + Liquidity
-            sweep = analysis.get("smc_ctx", {}).get("liquidity_sweep", False)
-            fake = analysis.get("smc_ctx", {}).get("fake_break", False)
-            fvg = analysis.get("fvg_analysis", {}).get("real", False)
+            sweep = smc_ctx.get("liquidity_sweep", False)
+            fake = smc_ctx.get("fake_break", False)
+            fvg = fvg_ctx.get("real", False)
 
             if sweep or fake or fvg:
                 entry_signal = trap_side.lower()
@@ -1442,7 +1531,7 @@ class UltraCouncilAI:
                 return entry_signal, reason, analysis
         
         # ثانياً: لو الثقة قليلة، نجرب TRAP MODE قبل ما نرفض
-        if analysis["confidence"] < self.min_confidence:
+        if analysis.get("confidence", 0) < self.min_confidence:
             # لو في منطقة Trap قوية (ضرب استوبات واضح + ترند معاه)
             if trap_side and trap_q >= 3.0:
                 entry_signal = trap_side.lower()   # "buy" أو "sell"
@@ -1457,12 +1546,12 @@ class UltraCouncilAI:
         
         # التوقع الخبيث لضرب الاستوبات
         # لو في target فوق + السعر تحت الهدف + ترند هابط = SELL خبيث
-        if pred.get("up_target") and analysis["trend"]["direction"] == "down":
+        if predicted.get("up_target") and analysis["trend"]["direction"] == "down":
             if analysis["score_sell"] >= self.min_score - 3:
                 return "sell", "PREDICTIVE STOP-HUNT SELL", analysis
 
         # لو في target تحت + السعر فوق الهدف + ترند صاعد = BUY خبيث
-        if pred.get("down_target") and analysis["trend"]["direction"] == "up":
+        if predicted.get("down_target") and analysis["trend"]["direction"] == "up":
             if analysis["score_buy"] >= self.min_score - 3:
                 return "buy", "PREDICTIVE STOP-HUNT BUY", analysis
 
@@ -1954,8 +2043,11 @@ class UltraProAIBot:
         # تحليل السوق عبر مجلس الإدارة المتكامل
         decision, reason, analysis = self.council.should_enter_trade(df)
         
+        # حماية analysis
+        analysis = analysis or {}
+        
         # تسجيل التحليل المتكامل
-        if analysis["signals"]:
+        if analysis.get("signals"):
             log_i(f"🔍 ULTRA Analysis: {', '.join(analysis['signals'])}")
         
         if decision:
@@ -1982,7 +2074,7 @@ class UltraProAIBot:
                 log_e("❌ Failed to open ULTRA position")
         else:
             # تسجيل حالة عدم التداول
-            if analysis["confidence"] > 0.3:
+            if analysis.get("confidence", 0) > 0.3:
                 log_i(f"⏳ ULTRA Waiting for better opportunity: {reason}")
 
     def get_status(self):
@@ -2065,11 +2157,19 @@ def main():
     global bot
     
     try:
+        # طباعة البانر المحترف
+        log_banner()
+        
+        # إعداد معالجات الإشارات
+        setup_signal_handlers()
+        
+        # تشغيل KeepAlive loop
+        threading.Thread(target=keepalive_loop, daemon=True).start()
+        
         # إنشاء البوت
         bot = UltraProAIBot()
         
         # تشغيل البوت في خيط منفصل
-        import threading
         bot.start()
         
         # تشغيل حلقة التداول في خيط منفصل
