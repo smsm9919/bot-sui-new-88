@@ -1779,3 +1779,8 @@ def main():
 
 if __name__ == "__main__":
     main()
+
+def run_server():
+    app.run(host="0.0.0.0", port=10000)
+
+threading.Thread(target=run_server).start()
