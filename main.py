@@ -336,6 +336,10 @@ class StateManager:
         self.state_file = "bot_state.json"
         self.load_state()
     
+    def get(self, key, default=None):
+        """محاكاة دالة get الخاصة بالـ dict"""
+        return self.state.get(key, default)
+    
     def load_state(self):
         """تحميل حالة البوت"""
         try:
@@ -653,8 +657,8 @@ class FVGDetector:
             last_body = abs(closes[-1] - df["open"].astype(float).values[-1])
             last_range = max(last_high - last_low, 1e-9)
             
-            upper_wick = last_high - max(closes[-1], df["open"].astype(float).values[-1])
-            lower_wick = min(closes[-1], df["open"].astype(float).values[-1]) - last_low
+            upper_wick = last_high - max(closes[-1], df["open"].ast(float).values[-1])
+            lower_wick = min(closes[-1], df["open"].ast(float).values[-1]) - last_low
             
             stop_hunt = False
             if fvg_signal["type"] == "bullish":
