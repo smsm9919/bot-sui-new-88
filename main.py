@@ -112,6 +112,160 @@ def compute_indicators(df: pd.DataFrame) -> dict:
         "atr": float(atr.iloc[i]),
     }
 
+# =========================
+# ORDER FLOW / BOOKMAP ENGINE
+# =========================
+
+class OrderFlowEngine:
+    """
+    محرك OrderFlow / Footprint / Bookmap-Lite:
+    - يستخدم fetch_trades لحساب Delta / CVD / Buy/Sell Volume
+    - يستخدم fetch_orderbook لحساب Buy/Sell Walls + Imbalance
+    """
+    def __init__(self, exchange_manager: "ExchangeManager"):
+        self.ex = exchange_manager
+
+    def _compute_flow_from_trades(self, trades) -> dict:
+        if not trades:
+            return {
+                "buy_volume": 0.0,
+                "sell_volume": 0.0,
+                "delta": 0.0,
+                "cvd": 0.0,
+                "flow_side": "NEUTRAL",
+            }
+
+        buy_vol = 0.0
+        sell_vol = 0.0
+        cvd = 0.0
+
+        for t in trades:
+            try:
+                side = t.get("side")
+                amount = float(t.get("amount", 0.0))
+                if not amount:
+                    continue
+
+                if side == "buy":
+                    buy_vol += amount
+                    cvd += amount
+                elif side == "sell":
+                    sell_vol += amount
+                    cvd -= amount
+                else:
+                    # لو side مش موجود، نحاول نستنتج
+                    # بعض البورصات ما ترجعش side
+                    price = float(t.get("price", 0.0))
+                    # هنا ممكن لاحقًا نضيف مقارنة بسعر الـ mid
+                    # حالياً بنسيبه محايد
+                    pass
+            except Exception:
+                continue
+
+        delta = buy_vol - sell_vol
+        if buy_vol > sell_vol * 1.3:
+            flow_side = "BUY"
+        elif sell_vol > buy_vol * 1.3:
+            flow_side = "SELL"
+        else:
+            flow_side = "NEUTRAL"
+
+        return {
+            "buy_volume": buy_vol,
+            "sell_volume": sell_vol,
+            "delta": delta,
+            "cvd": cvd,
+            "flow_side": flow_side,
+        }
+
+    def _compute_bookmap_from_ob(self, orderbook, current_price: float) -> dict:
+        bids = orderbook.get("bids", []) or []
+        asks = orderbook.get("asks", []) or []
+
+        if not bids and not asks:
+            return {
+                "book_imbalance": 0.0,
+                "buy_wall": False,
+                "sell_wall": False,
+                "wall_side": None,
+                "wall_distance": None,
+            }
+
+        # نركز على 1% حول السعر الحالي
+        near_buy_vol = 0.0
+        near_sell_vol = 0.0
+        max_buy_level = None
+        max_sell_level = None
+        max_buy_vol = 0.0
+        max_sell_vol = 0.0
+
+        for price, vol in bids:
+            price = float(price); vol = float(vol)
+            if current_price and price >= current_price * 0.99:
+                near_buy_vol += vol
+                if vol > max_buy_vol:
+                    max_buy_vol = vol
+                    max_buy_level = price
+
+        for price, vol in asks:
+            price = float(price); vol = float(vol)
+            if current_price and price <= current_price * 1.01:
+                near_sell_vol += vol
+                if vol > max_sell_vol:
+                    max_sell_vol = vol
+                    max_sell_level = price
+
+        if (near_buy_vol + near_sell_vol) > 0:
+            book_imb = (near_buy_vol - near_sell_vol) / (near_buy_vol + near_sell_vol)
+        else:
+            book_imb = 0.0
+
+        buy_wall = max_buy_vol > 0 and max_buy_vol >= near_sell_vol * 1.5
+        sell_wall = max_sell_vol > 0 and max_sell_vol >= near_buy_vol * 1.5
+
+        wall_side = None
+        wall_distance = None
+        if buy_wall and max_buy_level:
+            wall_side = "BUY"
+            wall_distance = (current_price - max_buy_level) / current_price if current_price else None
+        elif sell_wall and max_sell_level:
+            wall_side = "SELL"
+            wall_distance = (max_sell_level - current_price) / current_price if current_price else None
+
+        return {
+            "book_imbalance": book_imb,
+            "buy_wall": buy_wall,
+            "sell_wall": sell_wall,
+            "wall_side": wall_side,
+            "wall_distance": wall_distance,
+        }
+
+    def compute(self, current_price: float) -> dict:
+        """يرجع سياق OrderFlow + Bookmap"""
+        try:
+            trades = self.ex.fetch_trades(limit=200)
+            ob = self.ex.fetch_orderbook(depth=50)
+
+            flow_ctx = self._compute_flow_from_trades(trades)
+            book_ctx = self._compute_bookmap_from_ob(ob, current_price)
+
+            ctx = {**flow_ctx, **book_ctx}
+            return ctx
+        except Exception as e:
+            log_w(f"⚠️ OrderFlowEngine error: {e}")
+            return {
+                "buy_volume": 0.0,
+                "sell_volume": 0.0,
+                "delta": 0.0,
+                "cvd": 0.0,
+                "flow_side": "NEUTRAL",
+                "book_imbalance": 0.0,
+                "buy_wall": False,
+                "sell_wall": False,
+                "wall_side": None,
+                "wall_distance": None,
+            }
+
 # ============================================
 #  CONFIGURATION
 # ============================================
@@ -268,29 +422,29 @@ def log_ultra_panel(analysis: dict, state: dict):
     edge      = a.get("edge_setup", {})
     rf_ctx    = a.get("rf", {})
     stop_hunt = a.get("predicted_stop_hunt", {})
+    of_ctx    = a.get("orderflow", {}) or {}
 
     balance        = state.get("balance", 0.0)
     compound_pnl   = state.get("compound_pnl", 0.0)
     mode           = "LIVE" if MODE_LIVE else "PAPER"
 
-    # 1) Bookmap / Imbalance
+    # 1) Bookmap / OrderBook Imbalance حقيقي
     log_i(
         f"📊 Bookmap: "
-        f"Imb={rf_ctx.get('imbalance', 0):.2f} | "
-        f"Buy[{rf_ctx.get('buy_wall', 0)}] | "
-        f"Sell[{rf_ctx.get('sell_wall', 0)}]"
+        f"Imb={of_ctx.get('book_imbalance', 0.0):.2f} | "
+        f"BuyWall[{of_ctx.get('buy_wall', False)}] | "
+        f"SellWall[{of_ctx.get('sell_wall', False)}]"
     )
 
-    # 2) Flow (OBI / Delta / CVD)
-    flow_side = "NEUTRAL"
-    if a.get("score_buy", 0) > a.get("score_sell", 0) + 2:
-        flow_side = "BUY"
-    elif a.get("score_sell", 0) > a.get("score_buy", 0) + 2:
-        flow_side = "SELL"
-    
+    # 2) Flow (Delta / CVD حقيقي)
+    flow_side = of_ctx.get("flow_side", "NEUTRAL")
+    delta_val = of_ctx.get("delta", 0.0)
+    cvd_val   = of_ctx.get("cvd", 0.0)
+
     log_i(
         f"🌊 Flow: {flow_side} "
-        f"Δ={a.get('score_buy', 0)-a.get('score_sell', 0):.1f} | "
+        f"Δ={delta_val:.4f} | "
+        f"CVD={cvd_val:.4f} | "
         f"Conf={a.get('confidence', 0):.2f}"
     )
 
@@ -475,6 +629,28 @@ class ExchangeManager:
         except Exception as e:
             log_e(f"❌ Failed to fetch OHLCV: {e}")
             return pd.DataFrame()
+    
+    def fetch_trades(self, limit: int = 200):
+        """جلب آخر الصفقات من البورصة لاستخدامها في OrderFlow / Footprint"""
+        if not self.initialized:
+            return []
+        try:
+            trades = self.exchange.fetch_trades(SYMBOL, limit=limit)
+            return trades or []
+        except Exception as e:
+            log_w(f"⚠️ Failed to fetch trades for orderflow: {e}")
+            return []
+
+    def fetch_orderbook(self, depth: int = 50):
+        """جلب الـ OrderBook لاستخدامه كـ Bookmap Lite"""
+        if not self.initialized:
+            return {"bids": [], "asks": []}
+        try:
+            ob = self.exchange.fetch_order_book(SYMBOL, limit=depth)
+            return ob or {"bids": [], "asks": []}
+        except Exception as e:
+            log_w(f"⚠️ Failed to fetch order book for bookmap: {e}")
+            return {"bids": [], "asks": []}
     
     def get_current_price(self):
         """الحصول على السعر الحالي"""
@@ -1375,10 +1551,14 @@ class SmartPositionManager:
             log_w("⚠️ Invalid position size")
             return False
             
+        # ✅ فرق بين اتجاه الصفقة في المنصة وبين اتجاه المركز في المنطق
+        exchange_side = "buy" if side.upper() == "BUY" else "sell"
+        pos_side = "long" if exchange_side == "buy" else "short"
+
         # تحديد نوع الصفقة (TRAP / GOLDEN / NORMAL)
         trade_type = "normal"
         trade_mode = "SCALP"
-        
+
         if analysis.get("stop_hunt_trap_side") and analysis.get("stop_hunt_trap_quality", 0) >= 3.0:
             trade_type = "trap"
             trade_mode = "TRAP"
@@ -1388,13 +1568,13 @@ class SmartPositionManager:
         elif "PREDICTIVE STOP-HUNT" in analysis.get("signals", []):
             trade_type = "predictive"
             trade_mode = "PREDICTIVE"
-        
-        # تنفيذ الأمر
-        if self.exchange.execute_order(side.lower(), position_size, current_price):
-            # تحديث حالة البوت
+
+        # تنفيذ الأمر على المنصة بـ buy/sell
+        if self.exchange.execute_order(exchange_side, position_size, current_price):
+            # ✅ نخزن "long"/"short" في الـ state
             self.state.update({
                 "open": True,
-                "side": side.lower(),
+                "side": pos_side,
                 "entry": current_price,
                 "qty": position_size,
                 "pnl": 0.0,
@@ -1402,27 +1582,29 @@ class SmartPositionManager:
                 "highest_profit_pct": 0.0,
                 "profit_targets_achieved": 0,
                 "opened_at": time.time(),
-                "last_signal": side,
+                "last_signal": pos_side,
                 "trade_type": trade_type,
-                "trade_profile": "SCALP_STRICT",  # سيتم تحديثه بواسطة Profit Engine
+                "trade_profile": "SCALP_STRICT",
                 "edge_setup": analysis.get("edge_setup"),
                 "entry_price": current_price,
                 "tp1_hit": False,
-                "tp2_hit": False
+                "tp2_hit": False,
             })
-            
-            log_g(f"✅ New Position Opened: {side.upper()} | Size: {position_size:.4f} | Entry: {current_price:.6f} | Type: {trade_type.upper()}")
-            
-            # تهيئة Profit Engine
+
+            log_g(
+                f"✅ New Position Opened: {pos_side.upper()} | "
+                f"Size={position_size:.4f} | Entry: {current_price:.6f} | "
+                f"Type: {trade_type.upper()}"
+            )
+
+            # تهيئة Profit Engine بـ "long"/"short"
             atr_value = analysis.get("trend", {}).get("atr", current_price * 0.01)
-            self.profit_engine.init_trade(side.lower(), current_price, atr_value, trade_mode, analysis)
-            
-            # لوج الرصيد بعد فتح الصفقة
+            self.profit_engine.init_trade(pos_side, current_price, atr_value, trade_mode, analysis)
+
             balance_now = self.exchange.get_balance()
             log_equity_snapshot(balance_now, self.state.get("compound_pnl", 0.0))
-            
             return True
-            
+
         return False
     
     def manage_position(self, df):
@@ -1492,12 +1674,18 @@ class SmartPositionManager:
 # ============================================
 
 class UltraCouncilAI:
-    """مجلس الإدارة الذكي المتكامل مع جميع المحركات"""
+    """مجلس الإدارة الذكي المتكامل مع جميع المحركات + OrderFlow/Bookmap"""
     
-    def __init__(self):
+    def __init__(self, exchange_manager: "ExchangeManager" = None):
+        # مرجع للبورصة لاستخدامه في OrderFlow
+        self.exchange_manager = exchange_manager
+        
         # المحركات الأساسية
         self.stop_hunt_detector = StopHuntDetector()
         self.trend_analyzer = TrendAnalyzer()
+        
+        # OrderFlow / Bookmap Engine
+        self.orderflow_engine = OrderFlowEngine(exchange_manager) if exchange_manager else None
         
         # المحركات المتقدمة
         self.edge_algo = EdgeAlgoEngine()
@@ -1535,6 +1723,18 @@ class UltraCouncilAI:
             "golden_zone": {"type": None, "valid": False},
             "predicted_stop_hunt": {},
             "volume_analysis": {},
+            "orderflow": {
+                "buy_volume": 0.0,
+                "sell_volume": 0.0,
+                "delta": 0.0,
+                "cvd": 0.0,
+                "flow_side": "NEUTRAL",
+                "book_imbalance": 0.0,
+                "buy_wall": False,
+                "sell_wall": False,
+                "wall_side": None,
+                "wall_distance": None,
+            }
         }
 
     def build_context(self, df, current_price, stop_hunt_info, fvg_ctx, liquidity_zones):
@@ -1582,6 +1782,27 @@ class UltraCouncilAI:
             # تحديث المحركات الأساسية
             self.trend_analyzer.update(df)
             trend_info = self.trend_analyzer.get_trend_info()
+            
+            # OrderFlow / Bookmap context
+            orderflow_ctx = {}
+            if self.orderflow_engine is not None:
+                orderflow_ctx = self.orderflow_engine.compute(current_price)
+                flow_side = orderflow_ctx.get("flow_side", "NEUTRAL")
+                
+                if flow_side == "BUY":
+                    score_buy += 1.5
+                    signals.append("🌊 OrderFlow BUY Pressure")
+                elif flow_side == "SELL":
+                    score_sell += 1.5
+                    signals.append("🌊 OrderFlow SELL Pressure")
+                
+                wall_side = orderflow_ctx.get("wall_side")
+                if wall_side == "BUY":
+                    score_buy += 0.5
+                    signals.append("🧱 Buy Wall Support")
+                elif wall_side == "SELL":
+                    score_sell += 0.5
+                    signals.append("🧱 Sell Wall Resistance")
             
             # 1. الستوب هانت والسيولة
             self.stop_hunt_detector.detect_swings(df)
@@ -1712,7 +1933,8 @@ class UltraCouncilAI:
                     "spike": False,
                     "abs_bull": False,
                     "abs_bear": False
-                }
+                },
+                "orderflow": orderflow_ctx
             }
             
         except Exception as e:
@@ -1997,7 +2219,7 @@ class UltraProAIBot:
         self.exchange = ExchangeManager()
         self.state = StateManager()
         self.position_manager = SmartPositionManager(self.exchange, self.state)
-        self.council = UltraCouncilAI()
+        self.council = UltraCouncilAI(self.exchange)
         self.running = False
         
     def start(self):
