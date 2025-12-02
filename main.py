@@ -113,6 +113,456 @@ def compute_indicators(df: pd.DataFrame) -> dict:
     }
 
 # =========================
+# RANGE FILTER REAL (RF) — PINE EXACT
+# =========================
+
+def compute_range_filter(df: pd.DataFrame, period: int = 20, qty: float = 3.5) -> dict:
+    """
+    تحويل سكريبت Pine Range Filter (DW) إلى Python
+    يرجّع:
+      - rf_filt, rf_dir
+      - rf_buy_signal, rf_sell_signal
+      - hi_band, lo_band
+    ويضيف الأعمدة دي في df أيضًا.
+    """
+    src = df["close"].astype(float).copy()
+
+    if len(src) < period + 2:
+        # df صغير → رجّع قيم افتراضية
+        df["rf_filt"] = src
+        df["rf_hi"] = src
+        df["rf_lo"] = src
+        df["rf_dir"] = 0
+        df["rf_buy_signal"] = False
+        df["rf_sell_signal"] = False
+        return {
+            "filt": float(src.iloc[-1]),
+            "hi_band": float(src.iloc[-1]),
+            "lo_band": float(src.iloc[-1]),
+            "dir": 0,
+            "buy_signal": False,
+            "sell_signal": False,
+        }
+
+    # ===== rng_size من Pine =====
+    diff = (src - src.shift(1)).abs()
+    avrng = diff.ewm(span=period, adjust=False).mean()
+    wper = (period * 2) - 1
+    ac = avrng.ewm(span=wper, adjust=False).mean() * qty  # AC في Pine
+
+    # ===== rng_filt array logic =====
+    filt_vals = []
+    hi_vals = []
+    lo_vals = []
+
+    # أول قيمة
+    first_x = float(src.iloc[0])
+    first_r = float(ac.iloc[0])
+    cur_filt = first_x
+    filt_vals.append(cur_filt)
+    hi_vals.append(cur_filt + first_r)
+    lo_vals.append(cur_filt - first_r)
+
+    for i in range(1, len(src)):
+        x = float(src.iloc[i])
+        r = float(ac.iloc[i])
+        prev = cur_filt
+
+        # نفس منطق:
+        # if x - r > rfilt[1] → rfilt[0] = x - r
+        if x - r > prev:
+            cur_filt = x - r
+        # if x + r < rfilt[1] → rfilt[0] = x + r
+        elif x + r < prev:
+            cur_filt = x + r
+        # else يبقى كما هو
+
+        filt_vals.append(cur_filt)
+        hi_vals.append(cur_filt + r)
+        lo_vals.append(cur_filt - r)
+
+    rf_filt = pd.Series(filt_vals, index=df.index)
+    hi_band = pd.Series(hi_vals, index=df.index)
+    lo_band = pd.Series(lo_vals, index=df.index)
+
+    # ===== Direction + Signals من Pine =====
+    fdir = [0] * len(src)
+    cond_ini = [0] * len(src)
+    long_sig = [False] * len(src)
+    short_sig = [False] * len(src)
+
+    for i in range(1, len(src)):
+        # fdir := filt > filt[1] ? 1 : filt < filt[1] ? -1 : fdir
+        if rf_filt.iloc[i] > rf_filt.iloc[i - 1]:
+            fdir[i] = 1
+        elif rf_filt.iloc[i] < rf_filt.iloc[i - 1]:
+            fdir[i] = -1
+        else:
+            fdir[i] = fdir[i - 1]
+
+        upward = fdir[i] == 1
+        downward = fdir[i] == -1
+
+        # longCond / shortCond من Pine بالظبط
+        longCond = (
+            (src.iloc[i] > rf_filt.iloc[i] and src.iloc[i] > src.iloc[i - 1] and upward)
+            or (src.iloc[i] > rf_filt.iloc[i] and src.iloc[i] < src.iloc[i - 1] and upward)
+        )
+        shortCond = (
+            (src.iloc[i] < rf_filt.iloc[i] and src.iloc[i] < src.iloc[i - 1] and downward)
+            or (src.iloc[i] < rf_filt.iloc[i] and src.iloc[i] > src.iloc[i - 1] and downward)
+        )
+
+        # CondIni := long ? 1 : short ? -1 : CondIni[1]
+        if longCond:
+            cond_ini[i] = 1
+        elif shortCond:
+            cond_ini[i] = -1
+        else:
+            cond_ini[i] = cond_ini[i - 1]
+
+        # longCondition = longCond and CondIni[1] == -1
+        if longCond and cond_ini[i - 1] == -1:
+            long_sig[i] = True
+        # shortCondition = shortCond and CondIni[1] == 1
+        if shortCond and cond_ini[i - 1] == 1:
+            short_sig[i] = True
+
+    rf_dir = pd.Series(fdir, index=df.index)
+    buy_series = pd.Series(long_sig, index=df.index)
+    sell_series = pd.Series(short_sig, index=df.index)
+
+    # الحق الأعمدة في df لاستخدامها لاحقاً لو حبّينا
+    df["rf_filt"] = rf_filt
+    df["rf_hi"] = hi_band
+    df["rf_lo"] = lo_band
+    df["rf_dir"] = rf_dir
+    df["rf_buy_signal"] = buy_series
+    df["rf_sell_signal"] = sell_series
+
+    return {
+        "filt": float(rf_filt.iloc[-1]),
+        "hi_band": float(hi_band.iloc[-1]),
+        "lo_band": float(lo_band.iloc[-1]),
+        "dir": int(rf_dir.iloc[-1]),
+        "buy_signal": bool(buy_series.iloc[-1]),
+        "sell_signal": bool(sell_series.iloc[-1]),
+    }
+
+
+# =========================
+# VWAP ENGINE (SESSION VWAP)
+# =========================
+
+def compute_vwap(df: pd.DataFrame) -> float:
+    """
+    VWAP الكلاسيكي:
+    sum(price * volume) / sum(volume) من بداية البيانات حتى آخر شمعة.
+    (لو حابب نخليه Daily جلسة منفصلة نعدّل لاحقاً بتجميع حسب اليوم.)
+    """
+    if "close" not in df.columns or "volume" not in df.columns or len(df) == 0:
+        return 0.0
+
+    close = df["close"].astype(float)
+    vol = df["volume"].astype(float)
+
+    pv = close * vol
+    cum_pv = pv.cumsum()
+    cum_vol = vol.cumsum().replace(0, np.nan)
+
+    vwap = cum_pv / cum_vol
+    df["vwap"] = vwap
+
+    return float(vwap.iloc[-1])
+
+# =========================
+# ULTRA MARKET STRUCTURE ENGINE
+# =========================
+
+class UltraMarketStructureEngine:
+    """
+    تبسيط علمي لمؤشر Ultra Market Structure:
+    - Internal / External structure (آخر قمم وقيعان + BOS / CHoCH)
+    - FVG (Bull / Bear) + فلتر حجم gap
+    - Premium / Discount zones بناءً على SMA200 + انحراف
+    - Liquidity Grab (كسرة وهمية فوق قمة أو تحت قاع)
+    """
+
+    def __init__(
+        self,
+        int_lookback: int = 20,
+        ext_lookback: int = 200,
+        fvg_threshold_mult: float = 1.0,
+        premium_mult_inner: float = 2.0,
+        premium_mult_outer: float = 3.0,
+    ):
+        self.int_lookback = int_lookback
+        self.ext_lookback = ext_lookback
+        self.fvg_threshold_mult = fvg_threshold_mult
+        self.prem_inner = premium_mult_inner
+        self.prem_outer = premium_mult_outer
+
+    def _detect_swings(self, df: pd.DataFrame, window: int = 3):
+        """
+        اكتشاف swing highs/lows البسيطة (internal).
+        """
+        h = df["high"].astype(float)
+        l = df["low"].astype(float)
+
+        swing_high_idx = []
+        swing_low_idx = []
+
+        for i in range(window, len(df) - window):
+            hi = h.iloc[i]
+            lo = l.iloc[i]
+
+            if hi == h.iloc[i - window : i + window + 1].max():
+                swing_high_idx.append(i)
+
+            if lo == l.iloc[i - window : i + window + 1].min():
+                swing_low_idx.append(i)
+
+        return swing_high_idx, swing_low_idx
+
+    def _last_swing_levels(self, df: pd.DataFrame, lookback: int):
+        """
+        استخراج آخر قمة وآخر قاع خلال نطاق lookback.
+        """
+        sub = df.iloc[-lookback:]
+        high = sub["high"].astype(float)
+        low = sub["low"].astype(float)
+
+        last_high_idx = high.idxmax()
+        last_low_idx = low.idxmin()
+
+        return (
+            float(df.loc[last_high_idx, "high"]),
+            int(df.index.get_loc(last_high_idx)),
+            float(df.loc[last_low_idx, "low"]),
+            int(df.index.get_loc(last_low_idx)),
+        )
+
+    def _detect_bos_choch(self, df: pd.DataFrame, lookback: int = 50):
+        """
+        BOS / CHoCH بسيط:
+        - BOS UP: إغلاق فوق آخر قمة مهمة.
+        - BOS DOWN: إغلاق تحت آخر قاع مهم.
+        """
+        if len(df) < lookback + 5:
+            return None, None
+
+        close = df["close"].astype(float)
+        last_high, last_high_pos, last_low, last_low_pos = self._last_swing_levels(df, lookback)
+
+        bos = None
+        choch = None
+
+        # BOS UP
+        if close.iloc[-1] > last_high and close.iloc[-2] <= last_high:
+            bos = "up"
+        # BOS DOWN
+        if close.iloc[-1] < last_low and close.iloc[-2] >= last_low:
+            bos = "down"
+
+        # CHoCH = BOS عكس الاتجاه السابق البسيط (آخر ناتج)
+        # هنا نعمله بسيط: لو قبلها كنا بنعمل قمم أو قيعان عكسية
+        # نقدر نطوره لاحقاً، حالياً بنعيد نفس bos كـ choch لو قريب
+        if bos is not None:
+            choch = bos
+
+        return bos, choch
+
+    def _detect_fvg(self, df: pd.DataFrame, max_lookback: int = 40):
+        """
+        كشف أقرب FVG بسيط خلال آخر max_lookback شمعة.
+        تعريف كلاسيكي:
+        - Bullish FVG: low[i] > high[i-2]
+        - Bearish FVG: high[i] < low[i-2]
+        مع فلتر حجم gap بالـ ATR.
+        """
+        if len(df) < 5:
+            return None
+
+        h = df["high"].astype(float)
+        l = df["low"].astype(float)
+        c = df["close"].astype(float)
+
+        # ATR بسيط للفلتر
+        tr1 = (h - l).abs()
+        tr2 = (h - c.shift(1)).abs()
+        tr3 = (l - c.shift(1)).abs()
+        tr = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1)
+        atr = tr.rolling(window=14, min_periods=5).mean()
+        atr_val = float(atr.iloc[-1]) if not np.isnan(atr.iloc[-1]) else 0.0
+        if atr_val <= 0:
+            atr_val = (h.iloc[-1] - l.iloc[-1]) or 1e-6
+
+        start_idx = max(2, len(df) - max_lookback)
+        bull_fvg = None
+        bear_fvg = None
+
+        for i in range(start_idx, len(df)):
+            # Bullish FVG: المنطقة بين high[i-2] و low[i]
+            if l.iloc[i] > h.iloc[i - 2]:
+                gap = l.iloc[i] - h.iloc[i - 2]
+                if gap >= self.fvg_threshold_mult * (0.5 * atr_val):
+                    bull_fvg = {
+                        "type": "bull",
+                        "index": int(i),
+                        "upper": float(l.iloc[i]),
+                        "lower": float(h.iloc[i - 2]),
+                        "size": float(gap),
+                    }
+
+            # Bearish FVG: المنطقة بين low[i-2] و high[i]
+            if h.iloc[i] < l.iloc[i - 2]:
+                gap = l.iloc[i - 2] - h.iloc[i]
+                if gap >= self.fvg_threshold_mult * (0.5 * atr_val):
+                    bear_fvg = {
+                        "type": "bear",
+                        "index": int(i),
+                        "upper": float(l.iloc[i - 2]),
+                        "lower": float(h.iloc[i]),
+                        "size": float(gap),
+                    }
+
+        current_price = float(df["close"].iloc[-1])
+        fvg_ctx = {
+            "bull_near": False,
+            "bear_near": False,
+            "bull": bull_fvg,
+            "bear": bear_fvg,
+        }
+
+        if bull_fvg is not None:
+            # قريب لو السعر داخل أو على مسافة ATR من الفجوة
+            mid = 0.5 * (bull_fvg["upper"] + bull_fvg["lower"])
+            if abs(current_price - mid) <= atr_val:
+                fvg_ctx["bull_near"] = True
+
+        if bear_fvg is not None:
+            mid = 0.5 * (bear_fvg["upper"] + bear_fvg["lower"])
+            if abs(current_price - mid) <= atr_val:
+                fvg_ctx["bear_near"] = True
+
+        return fvg_ctx
+
+    def _premium_discount(self, df: pd.DataFrame):
+        """
+        Premium / Discount بناءً على SMA200 + انحراف قياسي.
+        مستوحى من مفهوم Bollinger على 200 SMA.
+        """
+        c = df["close"].astype(float)
+        if len(c) < 210:
+            return {
+                "zone": "mid",
+                "basis": float(c.iloc[-1]),
+                "upper": float(c.iloc[-1]),
+                "lower": float(c.iloc[-1]),
+            }
+
+        basis = c.rolling(window=200).mean()
+        std = c.rolling(window=200).std()
+
+        b = float(basis.iloc[-1])
+        s = float(std.iloc[-1])
+        if np.isnan(b) or np.isnan(s) or s == 0:
+            b = float(c.iloc[-1])
+            s = (c.max() - c.min()) / 10 or 1e-6
+
+        upper_outer = b + self.prem_outer * s
+        lower_outer = b - self.prem_outer * s
+
+        price = float(c.iloc[-1])
+
+        zone = "mid"
+        if price > upper_outer:
+            zone = "ultra_premium"
+        elif price > b + self.prem_inner * s:
+            zone = "premium"
+        elif price < lower_outer:
+            zone = "ultra_discount"
+        elif price < b - self.prem_inner * s:
+            zone = "discount"
+
+        return {
+            "zone": zone,
+            "basis": b,
+            "upper": upper_outer,
+            "lower": lower_outer,
+        }
+
+    def _detect_liquidity_grab(self, df: pd.DataFrame, lookback: int = 20):
+        """
+        Liquidity Grab بسيط:
+        - شمعة عملت ذيل فوق آخر قمة ثم أغلقت تحتها → grab up.
+        - أو تحت آخر قاع ثم أغلقت فوقه → grab down.
+        """
+        if len(df) < lookback + 3:
+            return {"grab_up": False, "grab_down": False}
+
+        sub = df.iloc[-lookback:]
+        high = sub["high"].astype(float)
+        low = sub["low"].astype(float)
+        close = sub["close"].astype(float)
+
+        last_high = float(high.max())
+        last_low = float(low.min())
+
+        # آخر شمعة
+        h_last = float(df["high"].iloc[-1])
+        l_last = float(df["low"].iloc[-1])
+        c_last = float(df["close"].iloc[-1])
+
+        grab_up = h_last > last_high and c_last < last_high
+        grab_down = l_last < last_low and c_last > last_low
+
+        return {
+            "grab_up": bool(grab_up),
+            "grab_down": bool(grab_down),
+        }
+
+    def analyze(self, df: pd.DataFrame) -> dict:
+        """
+        يرجّع سياق كامل لـ Ultra Market Structure:
+        - bias (bull/bear/neutral)
+        - bos / choch
+        - fvg context
+        - premium/discount zone
+        - liquidity grab flags
+        """
+        if df is None or len(df) < 30:
+            return {
+                "bias": "neutral",
+                "bos": None,
+                "choch": None,
+                "fvg": None,
+                "premium_discount": None,
+                "liq_grab": {"grab_up": False, "grab_down": False},
+            }
+
+        bos_int, choch_int = self._detect_bos_choch(df, lookback=self.int_lookback)
+        fvg_ctx = self._detect_fvg(df, max_lookback=40)
+        prem_ctx = self._premium_discount(df)
+        liq_ctx = self._detect_liquidity_grab(df, lookback=self.int_lookback)
+
+        # bias بسيط:
+        bias = "neutral"
+        if bos_int == "up":
+            bias = "bull"
+        elif bos_int == "down":
+            bias = "bear"
+
+        return {
+            "bias": bias,
+            "bos": bos_int,
+            "choch": choch_int,
+            "fvg": fvg_ctx,
+            "premium_discount": prem_ctx,
+            "liq_grab": liq_ctx,
+        }
+
+# =========================
 # ORDER FLOW / BOOKMAP ENGINE
 # =========================
 
@@ -423,6 +873,9 @@ def log_ultra_panel(analysis: dict, state: dict):
     rf_ctx    = a.get("rf", {})
     stop_hunt = a.get("predicted_stop_hunt", {})
     of_ctx    = a.get("orderflow", {}) or {}
+    ultra_ms  = a.get("ultra_ms", {}) or {}
+    ms_bias   = ultra_ms.get("bias", "neutral")
+    ms_zone   = (ultra_ms.get("premium_discount") or {}).get("zone", "mid")
 
     balance        = state.get("balance", 0.0)
     compound_pnl   = state.get("compound_pnl", 0.0)
@@ -448,7 +901,23 @@ def log_ultra_panel(analysis: dict, state: dict):
         f"Conf={a.get('confidence', 0):.2f}"
     )
 
-    # 3) Council summary (BUY/SELL hint)
+    # 3) RF REAL + VWAP
+    log_i(
+        f"📡 RF: dir={rf_ctx.get('dir', 0)} | "
+        f"filt={rf_ctx.get('filt', 0):.4f} | "
+        f"BUY={rf_ctx.get('buy_signal', False)} "
+        f"SELL={rf_ctx.get('sell_signal', False)} | "
+        f"VWAP={a.get('vwap', 0.0):.4f}"
+    )
+
+    # 4) Ultra Market Structure
+    log_i(
+        f"🏛 UltraMS: bias={ms_bias} | zone={ms_zone} | "
+        f"FVG bull_near={ (ultra_ms.get('fvg') or {}).get('bull_near', False) } "
+        f"bear_near={ (ultra_ms.get('fvg') or {}).get('bear_near', False) }"
+    )
+
+    # 5) Council summary (BUY/SELL hint)
     hint_side = "NEUTRAL"
     if a.get("score_buy", 0) > a.get("score_sell", 0):
         hint_side = "BUY"
@@ -464,7 +933,7 @@ def log_ultra_panel(analysis: dict, state: dict):
         f"DI+={trend.get('di_plus', 0):.1f} DI-={trend.get('di_minus', 0):.1f}"
     )
 
-    # 4) Strategy + Balance
+    # 6) Strategy + Balance
     strategy_label = "SCALP"
     if edge and edge.get("grade"):
         strategy_label = edge.get("grade", "MID").upper()
@@ -474,7 +943,7 @@ def log_ultra_panel(analysis: dict, state: dict):
         f"Balance={balance:.2f} | CompoundPnL={compound_pnl:.4f} | Mode={mode}"
     )
 
-    # 5) SMC BEST
+    # 7) SMC BEST
     smc_label = "order_block_entry"
     if smc_ctx.get("supply_box"):
         smc_label = "supply_box"
@@ -487,7 +956,7 @@ def log_ultra_panel(analysis: dict, state: dict):
         f"({a.get('confidence',0):.1f})"
     )
 
-    # 6) SNAP votes (Panel التصويت)
+    # 8) SNAP votes (Panel التصويت)
     votes_total = a.get("score_buy", 0) + a.get("score_sell", 0)
     votes_side = "?" if votes_total == 0 else ("BUY" if a.get("score_buy", 0) > a.get("score_sell", 0) else "SELL")
     
@@ -499,7 +968,7 @@ def log_ultra_panel(analysis: dict, state: dict):
         f"DI={trend.get('di_plus',0)-trend.get('di_minus',0):.1f}"
     )
 
-    # 7) Footprint / Volume delta
+    # 9) Footprint / Volume delta
     volume_ctx = a.get("volume_analysis", {})
     log_i(
         f"🦶 FOOTPRINT | Δ={volume_ctx.get('delta',0):.0f} | "
@@ -508,7 +977,7 @@ def log_ultra_panel(analysis: dict, state: dict):
         f"AbsBear={volume_ctx.get('abs_bear', False)}"
     )
 
-    # 8) SMC addons / FVG / Golden
+    # 10) SMC addons / FVG / Golden
     golden = a.get("golden_zone", {})
     log_i(
         f"🧠 ENHANCED SMC ADDONS | "
@@ -555,6 +1024,8 @@ def log_banner():
     print(colored("  • Web Service + Health Metrics", "yellow"))
     print(colored("  • ULTRA PANEL - Professional Logging System", "yellow"))
     print(colored("  • ADX+ATR FILTER - Smart Trend Filter", "yellow"))
+    print(colored("  • VWAP Engine - Fair Value Axis", "yellow"))
+    print(colored("  • Ultra Market Structure Engine", "yellow"))
 
     print("="*80)
     print(colored("🚀 INITIALIZING ULTRA PRO AI ENGINE...", "cyan", attrs=["bold"]))
@@ -1670,369 +2141,6 @@ class SmartPositionManager:
         return False
 
 # ============================================
-#  ULTRA COUNCIL AI - نظام التصويت الذكي المتكامل
-# ============================================
-
-class UltraCouncilAI:
-    """مجلس الإدارة الذكي المتكامل مع جميع المحركات + OrderFlow/Bookmap"""
-    
-    def __init__(self, exchange_manager: "ExchangeManager" = None):
-        # مرجع للبورصة لاستخدامه في OrderFlow
-        self.exchange_manager = exchange_manager
-        
-        # المحركات الأساسية
-        self.stop_hunt_detector = StopHuntDetector()
-        self.trend_analyzer = TrendAnalyzer()
-        
-        # OrderFlow / Bookmap Engine
-        self.orderflow_engine = OrderFlowEngine(exchange_manager) if exchange_manager else None
-        
-        # المحركات المتقدمة
-        self.edge_algo = EdgeAlgoEngine()
-        self.smc_ctx_engine = self  # سأستخدم نفس الكلاس للسياق
-        self.golden_engine = GoldenZoneEngine()
-        self.sh_predictor = StopHuntPredictor()
-        
-        # معايير القرار
-        self.min_confidence = 0.6
-        self.min_score = 8
-
-    def _empty_analysis(self):
-        """تحليل فارغ عند الخطأ"""
-        return {
-            "score_buy": 0.0,
-            "score_sell": 0.0,
-            "confidence": 0.0,
-            "signals": [],
-            "trend": {
-                "direction": "flat",
-                "strength": 0.0,
-                "momentum": 0.0,
-                "rsi": 50.0,
-                "adx": 0.0,
-                "di_plus": 0.0,
-                "di_minus": 0.0,
-                "atr": 0.0,
-                "is_strong": False,
-            },
-            "stop_hunt_zones": 0,
-            "smc_ctx": {},
-            "edge_setup": None,
-            "stop_hunt_trap_side": None,
-            "stop_hunt_trap_quality": 0.0,
-            "golden_zone": {"type": None, "valid": False},
-            "predicted_stop_hunt": {},
-            "volume_analysis": {},
-            "orderflow": {
-                "buy_volume": 0.0,
-                "sell_volume": 0.0,
-                "delta": 0.0,
-                "cvd": 0.0,
-                "flow_side": "NEUTRAL",
-                "book_imbalance": 0.0,
-                "buy_wall": False,
-                "sell_wall": False,
-                "wall_side": None,
-                "wall_distance": None,
-            }
-        }
-
-    def build_context(self, df, current_price, stop_hunt_info, fvg_ctx, liquidity_zones):
-        """بناء سياق SMC مبسط"""
-        ctx = {
-            "supply_box": False,
-            "demand_box": False,
-            "liquidity_sweep": False,
-            "fake_break": False,
-            "stop_hunt_zone": False,
-        }
-
-        high = df["high"].astype(float)
-        low = df["low"].astype(float)
-        lookback = 20
-        recent_high = high.tail(lookback).max()
-        recent_low = low.tail(lookback).min()
-
-        if current_price >= recent_high * 0.995:
-            ctx["supply_box"] = True
-        if current_price <= recent_low * 1.005:
-            ctx["demand_box"] = True
-
-        if stop_hunt_info.get("active_count", 0) > 0:
-            ctx["stop_hunt_zone"] = True
-
-        for z_type, level in liquidity_zones:
-            diff_pct = abs(current_price - level) / current_price
-            if diff_pct < 0.002:
-                ctx["liquidity_sweep"] = True
-
-        return ctx
-
-    def analyze_market(self, df):
-        """تحليل السوق الشامل المتكامل"""
-        if len(df) < 20:
-            return self._empty_analysis()
-
-        try:
-            current_price = float(df['close'].iloc[-1])
-            signals = []
-            score_buy = 0
-            score_sell = 0
-            
-            # تحديث المحركات الأساسية
-            self.trend_analyzer.update(df)
-            trend_info = self.trend_analyzer.get_trend_info()
-            
-            # OrderFlow / Bookmap context
-            orderflow_ctx = {}
-            if self.orderflow_engine is not None:
-                orderflow_ctx = self.orderflow_engine.compute(current_price)
-                flow_side = orderflow_ctx.get("flow_side", "NEUTRAL")
-                
-                if flow_side == "BUY":
-                    score_buy += 1.5
-                    signals.append("🌊 OrderFlow BUY Pressure")
-                elif flow_side == "SELL":
-                    score_sell += 1.5
-                    signals.append("🌊 OrderFlow SELL Pressure")
-                
-                wall_side = orderflow_ctx.get("wall_side")
-                if wall_side == "BUY":
-                    score_buy += 0.5
-                    signals.append("🧱 Buy Wall Support")
-                elif wall_side == "SELL":
-                    score_sell += 0.5
-                    signals.append("🧱 Sell Wall Resistance")
-            
-            # 1. الستوب هانت والسيولة
-            self.stop_hunt_detector.detect_swings(df)
-            stop_hunt_zones = self.stop_hunt_detector.detect_stop_hunt_zones(df)
-            active_zones = self.stop_hunt_detector.get_active_stop_hunt_zones(current_price, df)
-            active_count = len(active_zones)
-
-            # 2. تحليل Trap Mode مع ADX+ATR
-            trap_side = None
-            trap_quality = 0.0
-
-            for zone in active_zones:
-                trend_context = zone.get("trend_context", {})
-                
-                if zone["type"] == "buy_stop_hunt" and trend_context.get("valid_for_trap", False):
-                    allowed_side = trend_context.get("allowed_side")
-                    if allowed_side in ["BUY", None]:  # مسموح أو غير محدد
-                        trap_side = "BUY"
-                        trap_quality = max(trap_quality, zone["strength"] + trend_context.get("adx", 0)/50)
-                        signals.append(f"🧨 TRAP_BUY_ZONE @ {zone['level']:.6f} | ADX={trend_context.get('adx',0):.1f}")
-                
-                if zone["type"] == "sell_stop_hunt" and trend_context.get("valid_for_trap", False):
-                    allowed_side = trend_context.get("allowed_side")
-                    if allowed_side in ["SELL", None]:
-                        trap_side = "SELL"
-                        trap_quality = max(trap_quality, zone["strength"] + trend_context.get("adx", 0)/50)
-                        signals.append(f"🧨 TRAP_SELL_ZONE @ {zone['level']:.6f} | ADX={trend_context.get('adx',0):.1f}")
-
-            # 3. الاتجاه والزخم
-            if trend_info["direction"] == "up":
-                score_buy += 1.0
-                signals.append("📈 Uptrend")
-            elif trend_info["direction"] == "down":
-                score_sell += 1.0
-                signals.append("📉 Downtrend")
-                
-            if trend_info["is_strong"]:
-                if trend_info["direction"] == "up":
-                    score_buy += 2.0
-                    signals.append("💪 Strong Uptrend")
-                else:
-                    score_sell += 2.0
-                    signals.append("💪 Strong Downtrend")
-                    
-            if trend_info["momentum"] > 0.5:
-                score_buy += 1.0
-                signals.append("🚀 Positive Momentum")
-            elif trend_info["momentum"] < -0.5:
-                score_sell += 1.0
-                signals.append("💥 Negative Momentum")
-
-            # 4. Edge Algo Setup
-            edge_side = None
-            if score_buy > score_sell:
-                edge_side = "BUY"
-            elif score_sell > score_buy:
-                edge_side = "SELL"
-
-            # بناء سياق SMC
-            smc_ctx = self.build_context(
-                df, current_price, 
-                {"active_count": active_count},
-                {},
-                self.stop_hunt_detector.detect_liquidity_zones(current_price)
-            )
-
-            edge_setup = None
-            if edge_side:
-                edge_setup = self.edge_algo.compute_setup(df, edge_side, trend_info, smc_ctx)
-                if edge_setup.get("valid"):
-                    signals.append(
-                        f"🧠 EdgeAlgo {edge_setup['grade'].upper()} | "
-                        f"RR1={edge_setup['rr1']:.2f} RR2={edge_setup['rr2']:.2f} RR3={edge_setup['rr3']:.2f}"
-                    )
-                    if edge_setup["grade"] == "strong":
-                        if edge_side == "BUY":
-                            score_buy += 2.0
-                        else:
-                            score_sell += 2.0
-                    elif edge_setup["grade"] == "mid":
-                        if edge_side == "BUY":
-                            score_buy += 1.0
-                        else:
-                            score_sell += 1.0
-
-            # 5. Golden Zones
-            golden = self.golden_engine.compute(df)
-            if golden["valid"]:
-                if golden["type"] == "golden_bottom":
-                    score_buy += 2
-                    signals.append("🟢 Golden Bottom Zone")
-                elif golden["type"] == "golden_top":
-                    score_sell += 2
-                    signals.append("🔴 Golden Top Zone")
-
-            # 6. التنبؤ بالستوب هانت
-            predicted_sh = self.sh_predictor.predict(df)
-            if predicted_sh.get("up_target"):
-                signals.append(f"🎯 Predicted Stop-Hunt UP @ {predicted_sh['up_target']:.6f}")
-                # تنبؤ بضرب استوبات فوق ثم هبوط
-                score_sell += 1.5
-
-            if predicted_sh.get("down_target"):
-                signals.append(f"🎯 Predicted Stop-Hunt DOWN @ {predicted_sh['down_target']:.6f}")
-                # تنبؤ بضرب استوبات تحت ثم صعود
-                score_buy += 1.5
-
-            # الثقة النهائية
-            total_score = score_buy + score_sell
-            confidence = min(1.0, total_score / 20.0)
-            
-            return {
-                "score_buy": round(score_buy, 2),
-                "score_sell": round(score_sell, 2),
-                "confidence": round(confidence, 2),
-                "signals": signals,
-                "trend": trend_info,
-                "stop_hunt_zones": active_count,
-                "smc_ctx": smc_ctx,
-                "edge_setup": edge_setup,
-                "edge_rr": edge_setup["rr1"] if edge_setup and edge_setup.get("valid") else 1.0,
-                "stop_hunt_trap_side": trap_side,
-                "stop_hunt_trap_quality": trap_quality,
-                "golden_zone": golden,
-                "predicted_stop_hunt": predicted_sh,
-                "volume_analysis": {
-                    "delta": 0,
-                    "spike": False,
-                    "abs_bull": False,
-                    "abs_bear": False
-                },
-                "orderflow": orderflow_ctx
-            }
-            
-        except Exception as e:
-            log_e(f"❌ Ultra market analysis error: {e}")
-            return self._empty_analysis()
-
-    def should_enter_trade(self, df):
-        """تحديد ما إذا كان يجب الدخول في صفقة"""
-        analysis = self.analyze_market(df)
-
-        if analysis is None:
-            return None, "NO_ANALYSIS", analysis
-
-        trap_side = analysis.get("stop_hunt_trap_side")
-        trap_q = analysis.get("stop_hunt_trap_quality", 0.0)
-        predicted = analysis.get("predicted_stop_hunt", {})
-        smc_ctx = analysis.get("smc_ctx", {})
-        trend = analysis.get("trend", {})
-
-        # 1) TRAP OVERRIDE MODE – دخول قسري لو الفرصة خبيثة جدًا
-        if trap_side and trap_q >= 2.5:
-            log_w("🧨 TRAP OVERRIDE MODE ACTIVATED")
-
-            sweep = smc_ctx.get("liquidity_sweep", False)
-            stop_hunt = smc_ctx.get("stop_hunt_zone", False)
-
-            if sweep or stop_hunt:
-                entry_signal = trap_side.lower()
-                reason = (
-                    f"TRAP_OVERRIDE | StopHunt={trap_q:.1f} "
-                    f"| sweep={sweep} | stop_hunt={stop_hunt} | ADX={trend.get('adx',0):.1f}"
-                )
-                return entry_signal, reason, analysis
-
-        # 2) لو الثقة قليلة جرّب Trap Mode قبل الرفض
-        if analysis.get("confidence", 0.0) < self.min_confidence:
-            if trap_side and trap_q >= 3.0:
-                entry_signal = trap_side.lower()
-                reason = f"TRAP MODE {trap_side} | Stop-Hunt Exploit | Q={trap_q:.1f}"
-                return entry_signal, reason, analysis
-
-            return None, "Low confidence", analysis
-
-        # 3) توقع ضرب الاستوبات (Predictive Stop-Hunt)
-        trend_dir = trend.get("direction", "flat")
-
-        # لو في هدف ستوب هانت فوق والسوق ترنده هابط → بيع خبيث
-        if predicted.get("up_target") and trend_dir == "down":
-            if analysis.get("score_sell", 0) >= self.min_score - 3:
-                return "sell", "PREDICTIVE STOP-HUNT SELL", analysis
-
-        # لو في هدف ستوب هانت تحت والسوق ترنده صاعد → شراء خبيث
-        if predicted.get("down_target") and trend_dir == "up":
-            if analysis.get("score_buy", 0) >= self.min_score - 3:
-                return "buy", "PREDICTIVE STOP-HUNT BUY", analysis
-
-        # 4) Golden Zone Override
-        entry_signal = None
-        reason = ""
-        golden = analysis.get("golden_zone", {})
-
-        if golden.get("valid"):
-            if golden.get("type") == "golden_bottom" and analysis.get("score_buy", 0) >= self.min_score - 2:
-                entry_signal = "buy"
-                reason = (
-                    f"ULTRA BUY | Golden Override | "
-                    f"Score: {analysis['score_buy']} | Conf: {analysis['confidence']}"
-                )
-            elif golden.get("type") == "golden_top" and analysis.get("score_sell", 0) >= self.min_score - 2:
-                entry_signal = "sell"
-                reason = (
-                    f"ULTRA SELL | Golden Override | "
-                    f"Score: {analysis['score_sell']} | Conf: {analysis['confidence']}"
-                )
-
-        # 5) القرار العادي لو مفيش Override
-        if entry_signal is None:
-            if analysis.get("score_buy", 0) >= self.min_score and analysis["score_buy"] > analysis["score_sell"]:
-                entry_signal = "buy"
-                reason = (
-                    f"ULTRA BUY | Score: {analysis['score_buy']} "
-                    f"| Confidence: {analysis['confidence']}"
-                )
-            elif analysis.get("score_sell", 0) >= self.min_score and analysis["score_sell"] > analysis["score_buy"]:
-                entry_signal = "sell"
-                reason = (
-                    f"ULTRA SELL | Score: {analysis['score_sell']} "
-                    f"| Confidence: {analysis['confidence']}"
-                )
-            else:
-                reason = (
-                    f"No clear signal | Buy: {analysis.get('score_buy', 0)} "
-                    f"| Sell: {analysis.get('score_sell', 0)}"
-                )
-
-        return entry_signal, reason, analysis
-
-# ============================================
 #  SUPPORTING CLASSES
 # ============================================
 
@@ -2209,6 +2317,473 @@ class EdgeAlgoEngine:
         return setup
 
 # ============================================
+#  ULTRA COUNCIL AI - نظام التصويت الذكي المتكامل
+# ============================================
+
+class UltraCouncilAI:
+    """مجلس الإدارة الذكي المتكامل مع جميع المحركات + OrderFlow/Bookmap"""
+    
+    def __init__(self, exchange_manager: "ExchangeManager" = None):
+        # مرجع للبورصة لاستخدامه في OrderFlow
+        self.exchange_manager = exchange_manager
+        
+        # المحركات الأساسية
+        self.stop_hunt_detector = StopHuntDetector()
+        self.trend_analyzer = TrendAnalyzer()
+        
+        # OrderFlow / Bookmap Engine
+        self.orderflow_engine = OrderFlowEngine(exchange_manager) if exchange_manager else None
+        
+        # Ultra Market Structure Engine
+        self.ultra_ms = UltraMarketStructureEngine()
+
+        # المحركات المتقدمة
+        self.edge_algo = EdgeAlgoEngine()
+        self.smc_ctx_engine = self  # سأستخدم نفس الكلاس للسياق
+        self.golden_engine = GoldenZoneEngine()
+        self.sh_predictor = StopHuntPredictor()
+        
+        # معايير القرار
+        self.min_confidence = 0.6
+        self.min_score = 8
+
+    def _empty_analysis(self):
+        """تحليل فارغ عند الخطأ"""
+        return {
+            "score_buy": 0.0,
+            "score_sell": 0.0,
+            "confidence": 0.0,
+            "signals": [],
+            "trend": {
+                "direction": "flat",
+                "strength": 0.0,
+                "momentum": 0.0,
+                "rsi": 50.0,
+                "adx": 0.0,
+                "di_plus": 0.0,
+                "di_minus": 0.0,
+                "atr": 0.0,
+                "is_strong": False,
+            },
+            "stop_hunt_zones": 0,
+            "smc_ctx": {},
+            "edge_setup": None,
+            "stop_hunt_trap_side": None,
+            "stop_hunt_trap_quality": 0.0,
+            "golden_zone": {"type": None, "valid": False},
+            "predicted_stop_hunt": {},
+            "volume_analysis": {},
+            "rf": {
+                "filt": 0.0,
+                "hi_band": 0.0,
+                "lo_band": 0.0,
+                "dir": 0,
+                "buy_signal": False,
+                "sell_signal": False,
+            },
+            "vwap": 0.0,
+            "ultra_ms": {
+                "bias": "neutral",
+                "bos": None,
+                "choch": None,
+                "fvg": None,
+                "premium_discount": None,
+                "liq_grab": {"grab_up": False, "grab_down": False},
+            },
+            "orderflow": {
+                "buy_volume": 0.0,
+                "sell_volume": 0.0,
+                "delta": 0.0,
+                "cvd": 0.0,
+                "flow_side": "NEUTRAL",
+                "book_imbalance": 0.0,
+                "buy_wall": False,
+                "sell_wall": False,
+                "wall_side": None,
+                "wall_distance": None,
+            }
+        }
+
+    def build_context(self, df, current_price, stop_hunt_info, fvg_ctx, liquidity_zones):
+        """بناء سياق SMC مبسط"""
+        ctx = {
+            "supply_box": False,
+            "demand_box": False,
+            "liquidity_sweep": False,
+            "fake_break": False,
+            "stop_hunt_zone": False,
+        }
+
+        high = df["high"].astype(float)
+        low = df["low"].astype(float)
+        lookback = 20
+        recent_high = high.tail(lookback).max()
+        recent_low = low.tail(lookback).min()
+
+        if current_price >= recent_high * 0.995:
+            ctx["supply_box"] = True
+        if current_price <= recent_low * 1.005:
+            ctx["demand_box"] = True
+
+        if stop_hunt_info.get("active_count", 0) > 0:
+            ctx["stop_hunt_zone"] = True
+
+        for z_type, level in liquidity_zones:
+            diff_pct = abs(current_price - level) / current_price
+            if diff_pct < 0.002:
+                ctx["liquidity_sweep"] = True
+
+        return ctx
+
+    def analyze_market(self, df):
+        """تحليل السوق الشامل المتكامل"""
+        if len(df) < 20:
+            return self._empty_analysis()
+
+        try:
+            current_price = float(df['close'].iloc[-1])
+            signals = []
+            score_buy = 0
+            score_sell = 0
+            
+            # تحديث المحركات الأساسية
+            self.trend_analyzer.update(df)
+            trend_info = self.trend_analyzer.get_trend_info()
+            trend_dir = trend_info.get("direction", "flat")
+            
+            # ===== RF REAL + VWAP =====
+            rf_ctx = compute_range_filter(df, period=20, qty=3.5)
+            vwap_value = compute_vwap(df)
+            
+            # Ultra Market Structure context
+            ultra_ms_ctx = self.ultra_ms.analyze(df)
+            
+            # OrderFlow / Bookmap context
+            orderflow_ctx = {}
+            if self.orderflow_engine is not None:
+                orderflow_ctx = self.orderflow_engine.compute(current_price)
+                flow_side = orderflow_ctx.get("flow_side", "NEUTRAL")
+                
+                if flow_side == "BUY":
+                    score_buy += 1.5
+                    signals.append("🌊 OrderFlow BUY Pressure")
+                elif flow_side == "SELL":
+                    score_sell += 1.5
+                    signals.append("🌊 OrderFlow SELL Pressure")
+                
+                wall_side = orderflow_ctx.get("wall_side")
+                if wall_side == "BUY":
+                    score_buy += 0.5
+                    signals.append("🧱 Buy Wall Support")
+                elif wall_side == "SELL":
+                    score_sell += 0.5
+                    signals.append("🧱 Sell Wall Resistance")
+            
+            # ===== RF REAL CONTRIBUTION =====
+            if rf_ctx.get("buy_signal") and current_price > rf_ctx.get("filt", current_price):
+                score_buy += 1.5
+                signals.append("📗 RF BUY Signal")
+
+            if rf_ctx.get("sell_signal") and current_price < rf_ctx.get("filt", current_price):
+                score_sell += 1.5
+                signals.append("📕 RF SELL Signal")
+
+            # ===== VWAP CONTRIBUTION (FAIR VALUE AXIS) =====
+            if vwap_value:
+                dist = (current_price - vwap_value) / vwap_value  # انحراف عن الـ VWAP
+
+                # مع الترند وفي اتجاه الـ VWAP → تقوية القرار
+                if dist > 0 and trend_dir == "up":
+                    score_buy += 1.0
+                    signals.append("⚖️ Above VWAP in Uptrend")
+                elif dist < 0 and trend_dir == "down":
+                    score_sell += 1.0
+                    signals.append("⚖️ Below VWAP in Downtrend")
+
+                # لو انحراف كبير عن VWAP (> 1%) وضد الاتجاه → حذر
+                if abs(dist) > 0.01:
+                    if dist > 0 and score_buy < score_sell:
+                        # السعر فوق VWAP بس سكور البيع أعلى → خفّف البيع شوية
+                        score_sell *= 0.9
+                        signals.append("⚠️ SELL far above VWAP (risk)")
+                    elif dist < 0 and score_sell < score_buy:
+                        # السعر تحت VWAP بس سكور الشراء أعلى → خفّف الشراء شوية
+                        score_buy *= 0.9
+                        signals.append("⚠️ BUY far below VWAP (risk)")
+
+            # ===== ULTRA MARKET STRUCTURE CONTRIBUTION =====
+            ms_bias = ultra_ms_ctx.get("bias", "neutral")
+            ms_fvg = ultra_ms_ctx.get("fvg") or {}
+            ms_prem = ultra_ms_ctx.get("premium_discount") or {}
+            liq_ctx = ultra_ms_ctx.get("liq_grab") or {}
+
+            # Bias عام من BOS / CHoCH
+            if ms_bias == "bull":
+                score_buy += 2.0
+                signals.append("🏛 UltraMS Bull BOS")
+            elif ms_bias == "bear":
+                score_sell += 2.0
+                signals.append("🏛 UltraMS Bear BOS")
+
+            # FVG قريب
+            if ms_fvg:
+                if ms_fvg.get("bull_near"):
+                    score_buy += 1.5
+                    signals.append("🟩 Bull FVG Near")
+                if ms_fvg.get("bear_near"):
+                    score_sell += 1.5
+                    signals.append("🟥 Bear FVG Near")
+
+            # Premium / Discount zones
+            zone = ms_prem.get("zone", "mid")
+            if zone in ("discount", "ultra_discount") and ms_bias == "bull":
+                score_buy += 1.0
+                signals.append("💚 Discount + Bull Bias")
+            if zone in ("premium", "ultra_premium") and ms_bias == "bear":
+                score_sell += 1.0
+                signals.append("❤️ Premium + Bear Bias")
+
+            # Liquidity Grabs
+            if liq_ctx.get("grab_up"):
+                # كسرة وهمية فوق → تميل للهبوط
+                score_sell += 1.0
+                signals.append("💦 Liquidity Grab UP")
+            if liq_ctx.get("grab_down"):
+                score_buy += 1.0
+                signals.append("💦 Liquidity Grab DOWN")
+
+            # 1. الستوب هانت والسيولة
+            self.stop_hunt_detector.detect_swings(df)
+            stop_hunt_zones = self.stop_hunt_detector.detect_stop_hunt_zones(df)
+            active_zones = self.stop_hunt_detector.get_active_stop_hunt_zones(current_price, df)
+            active_count = len(active_zones)
+
+            # 2. تحليل Trap Mode مع ADX+ATR
+            trap_side = None
+            trap_quality = 0.0
+
+            for zone in active_zones:
+                trend_context = zone.get("trend_context", {})
+                
+                if zone["type"] == "buy_stop_hunt" and trend_context.get("valid_for_trap", False):
+                    allowed_side = trend_context.get("allowed_side")
+                    if allowed_side in ["BUY", None]:  # مسموح أو غير محدد
+                        trap_side = "BUY"
+                        trap_quality = max(trap_quality, zone["strength"] + trend_context.get("adx", 0)/50)
+                        signals.append(f"🧨 TRAP_BUY_ZONE @ {zone['level']:.6f} | ADX={trend_context.get('adx',0):.1f}")
+                
+                if zone["type"] == "sell_stop_hunt" and trend_context.get("valid_for_trap", False):
+                    allowed_side = trend_context.get("allowed_side")
+                    if allowed_side in ["SELL", None]:
+                        trap_side = "SELL"
+                        trap_quality = max(trap_quality, zone["strength"] + trend_context.get("adx", 0)/50)
+                        signals.append(f"🧨 TRAP_SELL_ZONE @ {zone['level']:.6f} | ADX={trend_context.get('adx',0):.1f}")
+
+            # 3. الاتجاه والزخم
+            if trend_info["direction"] == "up":
+                score_buy += 1.0
+                signals.append("📈 Uptrend")
+            elif trend_info["direction"] == "down":
+                score_sell += 1.0
+                signals.append("📉 Downtrend")
+                
+            if trend_info["is_strong"]:
+                if trend_info["direction"] == "up":
+                    score_buy += 2.0
+                    signals.append("💪 Strong Uptrend")
+                else:
+                    score_sell += 2.0
+                    signals.append("💪 Strong Downtrend")
+                    
+            if trend_info["momentum"] > 0.5:
+                score_buy += 1.0
+                signals.append("🚀 Positive Momentum")
+            elif trend_info["momentum"] < -0.5:
+                score_sell += 1.0
+                signals.append("💥 Negative Momentum")
+
+            # 4. Edge Algo Setup
+            edge_side = None
+            if score_buy > score_sell:
+                edge_side = "BUY"
+            elif score_sell > score_buy:
+                edge_side = "SELL"
+
+            # بناء سياق SMC
+            smc_ctx = self.build_context(
+                df, current_price, 
+                {"active_count": active_count},
+                {},
+                self.stop_hunt_detector.detect_liquidity_zones(current_price)
+            )
+
+            edge_setup = None
+            if edge_side:
+                edge_setup = self.edge_algo.compute_setup(df, edge_side, trend_info, smc_ctx)
+                if edge_setup.get("valid"):
+                    signals.append(
+                        f"🧠 EdgeAlgo {edge_setup['grade'].upper()} | "
+                        f"RR1={edge_setup['rr1']:.2f} RR2={edge_setup['rr2']:.2f} RR3={edge_setup['rr3']:.2f}"
+                    )
+                    if edge_setup["grade"] == "strong":
+                        if edge_side == "BUY":
+                            score_buy += 2.0
+                        else:
+                            score_sell += 2.0
+                    elif edge_setup["grade"] == "mid":
+                        if edge_side == "BUY":
+                            score_buy += 1.0
+                        else:
+                            score_sell += 1.0
+
+            # 5. Golden Zones
+            golden = self.golden_engine.compute(df)
+            if golden["valid"]:
+                if golden["type"] == "golden_bottom":
+                    score_buy += 2
+                    signals.append("🟢 Golden Bottom Zone")
+                elif golden["type"] == "golden_top":
+                    score_sell += 2
+                    signals.append("🔴 Golden Top Zone")
+
+            # 6. التنبؤ بالستوب هانت
+            predicted_sh = self.sh_predictor.predict(df)
+            if predicted_sh.get("up_target"):
+                signals.append(f"🎯 Predicted Stop-Hunt UP @ {predicted_sh['up_target']:.6f}")
+                # تنبؤ بضرب استوبات فوق ثم هبوط
+                score_sell += 1.5
+
+            if predicted_sh.get("down_target"):
+                signals.append(f"🎯 Predicted Stop-Hunt DOWN @ {predicted_sh['down_target']:.6f}")
+                # تنبؤ بضرب استوبات تحت ثم صعود
+                score_buy += 1.5
+
+            # الثقة النهائية
+            total_score = score_buy + score_sell
+            confidence = min(1.0, total_score / 20.0)
+            
+            return {
+                "score_buy": round(score_buy, 2),
+                "score_sell": round(score_sell, 2),
+                "confidence": round(confidence, 2),
+                "signals": signals,
+                "trend": trend_info,
+                "stop_hunt_zones": active_count,
+                "smc_ctx": smc_ctx,
+                "edge_setup": edge_setup,
+                "edge_rr": edge_setup["rr1"] if edge_setup and edge_setup.get("valid") else 1.0,
+                "stop_hunt_trap_side": trap_side,
+                "stop_hunt_trap_quality": trap_quality,
+                "golden_zone": golden,
+                "predicted_stop_hunt": predicted_sh,
+                "rf": rf_ctx,
+                "vwap": vwap_value,
+                "ultra_ms": ultra_ms_ctx,
+                "volume_analysis": {
+                    "delta": 0,
+                    "spike": False,
+                    "abs_bull": False,
+                    "abs_bear": False
+                },
+                "orderflow": orderflow_ctx
+            }
+            
+        except Exception as e:
+            log_e(f"❌ Ultra market analysis error: {e}")
+            return self._empty_analysis()
+
+    def should_enter_trade(self, df):
+        """تحديد ما إذا كان يجب الدخول في صفقة"""
+        analysis = self.analyze_market(df)
+
+        if analysis is None:
+            return None, "NO_ANALYSIS", analysis
+
+        trap_side = analysis.get("stop_hunt_trap_side")
+        trap_q = analysis.get("stop_hunt_trap_quality", 0.0)
+        predicted = analysis.get("predicted_stop_hunt", {})
+        smc_ctx = analysis.get("smc_ctx", {})
+        trend = analysis.get("trend", {})
+
+        # 1) TRAP OVERRIDE MODE – دخول قسري لو الفرصة خبيثة جدًا
+        if trap_side and trap_q >= 2.5:
+            log_w("🧨 TRAP OVERRIDE MODE ACTIVATED")
+
+            sweep = smc_ctx.get("liquidity_sweep", False)
+            stop_hunt = smc_ctx.get("stop_hunt_zone", False)
+
+            if sweep or stop_hunt:
+                entry_signal = trap_side.lower()
+                reason = (
+                    f"TRAP_OVERRIDE | StopHunt={trap_q:.1f} "
+                    f"| sweep={sweep} | stop_hunt={stop_hunt} | ADX={trend.get('adx',0):.1f}"
+                )
+                return entry_signal, reason, analysis
+
+        # 2) لو الثقة قليلة جرّب Trap Mode قبل الرفض
+        if analysis.get("confidence", 0.0) < self.min_confidence:
+            if trap_side and trap_q >= 3.0:
+                entry_signal = trap_side.lower()
+                reason = f"TRAP MODE {trap_side} | Stop-Hunt Exploit | Q={trap_q:.1f}"
+                return entry_signal, reason, analysis
+
+            return None, "Low confidence", analysis
+
+        # 3) توقع ضرب الاستوبات (Predictive Stop-Hunt)
+        trend_dir = trend.get("direction", "flat")
+
+        # لو في هدف ستوب هانت فوق والسوق ترنده هابط → بيع خبيث
+        if predicted.get("up_target") and trend_dir == "down":
+            if analysis.get("score_sell", 0) >= self.min_score - 3:
+                return "sell", "PREDICTIVE STOP-HUNT SELL", analysis
+
+        # لو في هدف ستوب هانت تحت والسوق ترنده صاعد → شراء خبيث
+        if predicted.get("down_target") and trend_dir == "up":
+            if analysis.get("score_buy", 0) >= self.min_score - 3:
+                return "buy", "PREDICTIVE STOP-HUNT BUY", analysis
+
+        # 4) Golden Zone Override
+        entry_signal = None
+        reason = ""
+        golden = analysis.get("golden_zone", {})
+
+        if golden.get("valid"):
+            if golden.get("type") == "golden_bottom" and analysis.get("score_buy", 0) >= self.min_score - 2:
+                entry_signal = "buy"
+                reason = (
+                    f"ULTRA BUY | Golden Override | "
+                    f"Score: {analysis['score_buy']} | Conf: {analysis['confidence']}"
+                )
+            elif golden.get("type") == "golden_top" and analysis.get("score_sell", 0) >= self.min_score - 2:
+                entry_signal = "sell"
+                reason = (
+                    f"ULTRA SELL | Golden Override | "
+                    f"Score: {analysis['score_sell']} | Conf: {analysis['confidence']}"
+                )
+
+        # 5) القرار العادي لو مفيش Override
+        if entry_signal is None:
+            if analysis.get("score_buy", 0) >= self.min_score and analysis["score_buy"] > analysis["score_sell"]:
+                entry_signal = "buy"
+                reason = (
+                    f"ULTRA BUY | Score: {analysis['score_buy']} "
+                    f"| Confidence: {analysis['confidence']}"
+                )
+            elif analysis.get("score_sell", 0) >= self.min_score and analysis["score_sell"] > analysis["score_buy"]:
+                entry_signal = "sell"
+                reason = (
+                    f"ULTRA SELL | Score: {analysis['score_sell']} "
+                    f"| Confidence: {analysis['confidence']}"
+                )
+            else:
+                reason = (
+                    f"No clear signal | Buy: {analysis.get('score_buy', 0)} "
+                    f"| Sell: {analysis.get('score_sell', 0)}"
+                )
+
+        return entry_signal, reason, analysis
+
+# ============================================
 #  ULTRA PRO AI BOT - الإصدار المتكامل النهائي
 # ============================================
 
@@ -2232,7 +2807,7 @@ class UltraProAIBot:
         log_g(f"🔹 Risk Allocation: {RISK_ALLOC*100}%")
         log_g(f"🔹 Mode: {'LIVE' if MODE_LIVE else 'PAPER'} {'(DRY RUN)' if DRY_RUN else ''}")
         log_g(f"🔹 Web Service: http://0.0.0.0:{PORT}")
-        log_g("🔹 FEATURES: RF Real + EdgeAlgo + SMC + Golden Zones + Trap Mode + Stop-Hunt Prediction + SMART PROFIT ENGINE + Web Service + ULTRA PANEL + ADX+ATR FILTER")
+        log_g("🔹 FEATURES: RF Real + EdgeAlgo + SMC + Golden Zones + Trap Mode + Stop-Hunt Prediction + SMART PROFIT ENGINE + Web Service + ULTRA PANEL + ADX+ATR FILTER + VWAP + Ultra Market Structure")
         
         balance_now = self.exchange.get_balance()
         log_equity_snapshot(balance_now, self.state["compound_pnl"])
