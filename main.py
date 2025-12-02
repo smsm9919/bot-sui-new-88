@@ -18,7 +18,6 @@ ULTRA PRO AI BOT - الإصدار المتكامل الذكي المحسن
 • WEB SERVICE - واجهة ويب للرصد والإدارة
 • ULTRA PANEL - نظام لوج محترف بالشكل المطلوب
 • ADX+ATR FILTER - فلتر ذكي لمنع الدخول في ترند مجنون
-• RSI Wilder's RMA + ADX Wilder's RMA - متطابق مع TradingView
 """
 
 import os
@@ -42,6 +41,76 @@ import signal
 from termcolor import colored
 
 Side = Literal["BUY", "SELL"]
+
+# =========================
+# INDICATORS ENGINE (BOT GAMED)
+# =========================
+
+RSI_LEN = 14
+ADX_LEN = 14
+ATR_LEN = 14
+
+def wilder_ema(s: pd.Series, n: int) -> pd.Series:
+    """Wilder EMA (RMA) نفس المستخدم في بوت جامد"""
+    return s.ewm(alpha=1/n, adjust=False).mean()
+
+def compute_indicators(df: pd.DataFrame) -> dict:
+    """
+    نفس compute_indicators في bot.gamed.py
+    يرجّع قيم RSI / ATR / ADX / DI+/DI- على آخر شمعة.
+    """
+    if len(df) < max(ATR_LEN, RSI_LEN, ADX_LEN) + 2:
+        return {
+            "rsi": 50.0,
+            "plus_di": 0.0,
+            "minus_di": 0.0,
+            "dx": 0.0,
+            "adx": 0.0,
+            "atr": 0.0,
+        }
+
+    c = df["close"].astype(float)
+    h = df["high"].astype(float)
+    l = df["low"].astype(float)
+
+    # True Range + ATR (Wilder)
+    tr = pd.concat([
+        (h - l).abs(),
+        (h - c.shift(1)).abs(),
+        (l - c.shift(1)).abs()
+    ], axis=1).max(axis=1)
+    atr = wilder_ema(tr, ATR_LEN)
+
+    # RSI (Wilder)
+    delta = c.diff()
+    up = delta.clip(lower=0.0)
+    dn = (-delta).clip(lower=0.0)
+    rs = wilder_ema(up, RSI_LEN) / wilder_ema(dn, RSI_LEN).replace(0, 1e-12)
+    rsi = 100 - (100 / (1 + rs))
+
+    # +DI / -DI / ADX (Wilder)
+    up_move = h.diff()
+    down_move = l.shift(1) - l
+
+    plus_dm = up_move.where((up_move > down_move) & (up_move > 0), 0.0)
+    minus_dm = down_move.where((down_move > up_move) & (down_move > 0), 0.0)
+
+    plus_di = 100 * (wilder_ema(plus_dm, ADX_LEN) / atr.replace(0, 1e-12))
+    minus_di = 100 * (wilder_ema(minus_dm, ADX_LEN) / atr.replace(0, 1e-12))
+
+    dx = (100 * (plus_di - minus_di).abs() /
+          (plus_di + minus_di).replace(0, 1e-12)).fillna(0.0)
+    adx = wilder_ema(dx, ADX_LEN)
+
+    i = len(df) - 1
+    return {
+        "rsi": float(rsi.iloc[i]),
+        "plus_di": float(plus_di.iloc[i]),
+        "minus_di": float(minus_di.iloc[i]),
+        "dx": float(dx.iloc[i]),
+        "adx": float(adx.iloc[i]),
+        "atr": float(atr.iloc[i]),
+    }
 
 # ============================================
 #  CONFIGURATION
@@ -225,21 +294,18 @@ def log_ultra_panel(analysis: dict, state: dict):
         f"Conf={a.get('confidence', 0):.2f}"
     )
 
-    # 3) Council summary (BUY/SELL hint) مع RSI + ADX Wilder
+    # 3) Council summary (BUY/SELL hint)
     hint_side = "NEUTRAL"
     if a.get("score_buy", 0) > a.get("score_sell", 0):
         hint_side = "BUY"
     elif a.get("score_sell", 0) > a.get("score_buy", 0):
         hint_side = "SELL"
     
-    # عرض RSI وADX Wilder معاً (متطابق مع TradingView)
     log_i(
         f"📌 DASH → hint-{hint_side} | "
         f"Council BUY({a.get('score_buy',0):.1f}) "
         f"SELL({a.get('score_sell',0):.1f}) | "
-        f"RSI={a.get('rsi',0):.1f} "
-        f"RSI_MA={a.get('rsi_ma',0):.1f} "
-        f"Zone={a.get('rsi_zone','?')} | "
+        f"RSI={trend.get('rsi', 0):.1f} | "
         f"ADX={trend.get('adx', 0):.1f} "
         f"DI+={trend.get('di_plus', 0):.1f} DI-={trend.get('di_minus', 0):.1f}"
     )
@@ -335,7 +401,6 @@ def log_banner():
     print(colored("  • Web Service + Health Metrics", "yellow"))
     print(colored("  • ULTRA PANEL - Professional Logging System", "yellow"))
     print(colored("  • ADX+ATR FILTER - Smart Trend Filter", "yellow"))
-    print(colored("  • RSI Wilder + ADX Wilder - متطابق مع TradingView", "yellow"))
 
     print("="*80)
     print(colored("🚀 INITIALIZING ULTRA PRO AI ENGINE...", "cyan", attrs=["bold"]))
@@ -579,11 +644,11 @@ class StateManager:
         self.save_state()
 
 # ============================================
-#  TREND ANALYSIS ENGINE WITH ADX WILDER + RSI
+#  TREND ANALYSIS ENGINE WITH ADX + ATR
 # ============================================
 
 class TrendAnalyzer:
-    """محرك تحليل الاتجاه مع ADX Wilder + RSI + ATR (متطابق مع TradingView)"""
+    """محرك تحليل الاتجاه مع ADX + ATR"""
     
     def __init__(self):
         self.fast_ma = deque(maxlen=20)
@@ -591,14 +656,14 @@ class TrendAnalyzer:
         self.trend = "flat"
         self.strength = 0.0
         self.momentum = 0.0
+
+        # مؤشرات من موتور BOT GAMED
+        self.rsi = 50.0
         self.adx = 0.0
         self.di_plus = 0.0
         self.di_minus = 0.0
         self.atr = 0.0
         self.atr_mult = 1.0
-        self.rsi = 50.0
-        self.rsi_ma = 50.0
-        self.rsi_zone = "neutral"
         
     def update(self, df):
         """تحديث تحليل الاتجاه"""
@@ -624,10 +689,8 @@ class TrendAnalyzer:
             recent = close_prices.tail(5).values
             self.momentum = (recent[-1] - recent[0]) / recent[0] * 100 if recent[0] != 0 else 0
             
-        # حساب ADX Wilder + RSI + ATR
-        self._calculate_adx_wilder(df)
-        self._calculate_rsi(df)
-        self._calculate_atr(df)
+        # حساب ADX + DI مع ATR
+        self._calculate_adx_atr(df)
             
         if delta > 0 and self.strength > 0.1:
             self.trend = "up"
@@ -636,114 +699,42 @@ class TrendAnalyzer:
         else:
             self.trend = "flat"
             
-    def _calculate_adx_wilder(self, df):
-        """حساب ADX باستخدام Wilder's RMA (متطابق مع TradingView)"""
+    def _calculate_adx_atr(self, df):
+        """حساب ADX / DI / ATR / RSI باستخدام موتور BOT GAMED"""
         try:
-            if len(df) < 14:
-                self.adx = 0.0
-                self.di_plus = 0.0
-                self.di_minus = 0.0
-                return
-                
-            high = pd.Series(df['high'], dtype=float)
-            low = pd.Series(df['low'], dtype=float)
-            close = pd.Series(df['close'], dtype=float)
-            
-            # حساب +DM و -DM
-            up_move = high.diff()
-            down_move = -low.diff()
-            
-            plus_dm = np.where((up_move > down_move) & (up_move > 0), up_move, 0.0)
-            minus_dm = np.where((down_move > up_move) & (down_move > 0), down_move, 0.0)
-            
-            # حساب True Range
-            tr1 = high - low
-            tr2 = (high - close.shift(1)).abs()
-            tr3 = (low - close.shift(1)).abs()
-            tr = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1)
-            
-            # دالة RMA (Wilder)
-            def rma(series, length):
-                return series.ewm(alpha=1/length, adjust=False).mean()
-            
-            length = 14
-            tr_rma = rma(tr, length)
-            plus_dm_rma = rma(pd.Series(plus_dm), length)
-            minus_dm_rma = rma(pd.Series(minus_dm), length)
-            
-            plus_di = 100 * (plus_dm_rma / tr_rma)
-            minus_di = 100 * (minus_dm_rma / tr_rma)
-            
-            dx = 100 * (plus_di - minus_di).abs() / (plus_di + minus_di)
-            adx = rma(dx, length)
-            
-            self.adx = float(adx.iloc[-1]) if not pd.isna(adx.iloc[-1]) else 0.0
-            self.di_plus = float(plus_di.iloc[-1]) if not pd.isna(plus_di.iloc[-1]) else 0.0
-            self.di_minus = float(minus_di.iloc[-1]) if not pd.isna(minus_di.iloc[-1]) else 0.0
-            
-        except Exception as e:
-            log_w(f"⚠️ ADX Wilder calculation error: {e}")
-            self.adx = 0.0
-            self.di_plus = 0.0
-            self.di_minus = 0.0
-    
-    def _calculate_rsi(self, df, period=14, ma_period=9):
-        """حساب RSI"""
-        try:
-            close = pd.Series(df['close'], dtype=float)
-            
-            delta = close.diff()
-            gain = np.where(delta > 0, delta, 0.0)
-            loss = np.where(delta < 0, -delta, 0.0)
-            
-            gain_ma = pd.Series(gain).rolling(period).mean()
-            loss_ma = pd.Series(loss).rolling(period).mean()
-            
-            rs = gain_ma / loss_ma.replace(0, np.nan)
-            rsi = 100 - (100 / (1 + rs))
-            
-            self.rsi = float(rsi.iloc[-1]) if not pd.isna(rsi.iloc[-1]) else 50.0
-            self.rsi_ma = float(rsi.rolling(ma_period).mean().iloc[-1]) if not pd.isna(rsi.rolling(ma_period).mean().iloc[-1]) else 50.0
-            
-            if self.rsi > 70:
-                self.rsi_zone = "overbought"
-            elif self.rsi < 30:
-                self.rsi_zone = "oversold"
-            else:
-                self.rsi_zone = "neutral"
-                
-        except Exception as e:
-            log_w(f"⚠️ RSI calculation error: {e}")
-            self.rsi = 50.0
-            self.rsi_ma = 50.0
-            self.rsi_zone = "neutral"
-    
-    def _calculate_atr(self, df, period=14):
-        """حساب ATR"""
-        try:
-            high = df['high'].astype(float)
-            low = df['low'].astype(float)
-            close = df['close'].astype(float)
-            
-            tr1 = high - low
-            tr2 = abs(high - close.shift(1))
-            tr3 = abs(low - close.shift(1))
-            
-            tr = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1)
-            atr = tr.rolling(period).mean()
-            
-            self.atr = float(atr.iloc[-1]) if not pd.isna(atr.iloc[-1]) else 0.0
-            
-            # حساب ATR Multiplier
+            ind = compute_indicators(df)
+
+            # قيم المؤشرات الموحدة
+            self.rsi      = ind["rsi"]
+            self.adx      = ind["adx"]
+            self.di_plus  = ind["plus_di"]
+            self.di_minus = ind["minus_di"]
+            self.atr      = ind["atr"]
+
+            # نحسب ATR_MULT بنفس منطقك القديم (نسبة ATR الحالي للمتوسط الأبعد)
+            high = df["high"].astype(float)
+            low  = df["low"].astype(float)
+            close = df["close"].astype(float)
+
+            tr = pd.concat([
+                (high - low).abs(),
+                (high - close.shift(1)).abs(),
+                (low  - close.shift(1)).abs()
+            ], axis=1).max(axis=1)
+
             if len(tr) >= 20:
                 atr_base = tr.rolling(window=20).mean().iloc[-1]
             else:
                 atr_base = self.atr
-                
-            self.atr_mult = self.atr / atr_base if atr_base > 0 else 1.0
-            
+
+            self.atr_mult = self.atr / atr_base if atr_base and atr_base > 0 else 1.0
+
         except Exception as e:
-            log_w(f"⚠️ ATR calculation error: {e}")
+            log_w(f"⚠️ ADX/ATR calculation error: {e}")
+            self.rsi = 50.0
+            self.adx = 0.0
+            self.di_plus = 0.0
+            self.di_minus = 0.0
             self.atr = 0.0
             self.atr_mult = 1.0
             
@@ -757,15 +748,13 @@ class TrendAnalyzer:
             "direction": self.trend,
             "strength": self.strength,
             "momentum": self.momentum,
+            "rsi": self.rsi,
             "adx": self.adx,
             "di_plus": self.di_plus,
             "di_minus": self.di_minus,
             "atr": self.atr,
             "atr_mult": self.atr_mult,
-            "is_strong": self.is_strong_trend(),
-            "rsi": self.rsi,
-            "rsi_ma": self.rsi_ma,
-            "rsi_zone": self.rsi_zone
+            "is_strong": self.is_strong_trend()
         }
     
     def analyze_stop_hunt_context(self, df, stop_hunt_zone):
@@ -1531,14 +1520,12 @@ class UltraCouncilAI:
                 "direction": "flat",
                 "strength": 0.0,
                 "momentum": 0.0,
+                "rsi": 50.0,
                 "adx": 0.0,
                 "di_plus": 0.0,
                 "di_minus": 0.0,
                 "atr": 0.0,
                 "is_strong": False,
-                "rsi": 50.0,
-                "rsi_ma": 50.0,
-                "rsi_zone": "neutral"
             },
             "stop_hunt_zones": 0,
             "smc_ctx": {},
@@ -1548,9 +1535,6 @@ class UltraCouncilAI:
             "golden_zone": {"type": None, "valid": False},
             "predicted_stop_hunt": {},
             "volume_analysis": {},
-            "rsi": 50.0,
-            "rsi_ma": 50.0,
-            "rsi_zone": "neutral"
         }
 
     def build_context(self, df, current_price, stop_hunt_info, fvg_ctx, liquidity_zones):
@@ -1585,7 +1569,7 @@ class UltraCouncilAI:
         return ctx
 
     def analyze_market(self, df):
-        """تحليل السوق الشامل المتكامل مع RSI + ADX Wilder"""
+        """تحليل السوق الشامل المتكامل"""
         if len(df) < 20:
             return self._empty_analysis()
 
@@ -1598,24 +1582,6 @@ class UltraCouncilAI:
             # تحديث المحركات الأساسية
             self.trend_analyzer.update(df)
             trend_info = self.trend_analyzer.get_trend_info()
-            
-            # استخراج قيم RSI من trend_info
-            rsi = trend_info.get("rsi", 50.0)
-            rsi_ma = trend_info.get("rsi_ma", 50.0)
-            rsi_zone = trend_info.get("rsi_zone", "neutral")
-            
-            # إضافة إشارات RSI
-            if rsi_zone == "overbought":
-                signals.append("⚠️ RSI Overbought")
-                score_sell += 1.0
-            elif rsi_zone == "oversold":
-                signals.append("⚠️ RSI Oversold")
-                score_buy += 1.0
-            
-            if rsi > 60:
-                signals.append(f"📈 RSI Bullish ({rsi:.1f})")
-            elif rsi < 40:
-                signals.append(f"📉 RSI Bearish ({rsi:.1f})")
             
             # 1. الستوب هانت والسيولة
             self.stop_hunt_detector.detect_swings(df)
@@ -1746,11 +1712,7 @@ class UltraCouncilAI:
                     "spike": False,
                     "abs_bull": False,
                     "abs_bear": False
-                },
-                # إضافة RSI إلى التحليل
-                "rsi": rsi,
-                "rsi_ma": rsi_ma,
-                "rsi_zone": rsi_zone
+                }
             }
             
         except Exception as e:
@@ -1769,8 +1731,6 @@ class UltraCouncilAI:
         predicted = analysis.get("predicted_stop_hunt", {})
         smc_ctx = analysis.get("smc_ctx", {})
         trend = analysis.get("trend", {})
-        rsi = analysis.get("rsi", 50.0)
-        rsi_zone = analysis.get("rsi_zone", "neutral")
 
         # 1) TRAP OVERRIDE MODE – دخول قسري لو الفرصة خبيثة جدًا
         if trap_side and trap_q >= 2.5:
@@ -1783,7 +1743,7 @@ class UltraCouncilAI:
                 entry_signal = trap_side.lower()
                 reason = (
                     f"TRAP_OVERRIDE | StopHunt={trap_q:.1f} "
-                    f"| sweep={sweep} | stop_hunt={stop_hunt} | ADX={trend.get('adx',0):.1f} | RSI={rsi:.1f}"
+                    f"| sweep={sweep} | stop_hunt={stop_hunt} | ADX={trend.get('adx',0):.1f}"
                 )
                 return entry_signal, reason, analysis
 
@@ -1791,7 +1751,7 @@ class UltraCouncilAI:
         if analysis.get("confidence", 0.0) < self.min_confidence:
             if trap_side and trap_q >= 3.0:
                 entry_signal = trap_side.lower()
-                reason = f"TRAP MODE {trap_side} | Stop-Hunt Exploit | Q={trap_q:.1f} | RSI={rsi:.1f}"
+                reason = f"TRAP MODE {trap_side} | Stop-Hunt Exploit | Q={trap_q:.1f}"
                 return entry_signal, reason, analysis
 
             return None, "Low confidence", analysis
@@ -1819,13 +1779,13 @@ class UltraCouncilAI:
                 entry_signal = "buy"
                 reason = (
                     f"ULTRA BUY | Golden Override | "
-                    f"Score: {analysis['score_buy']} | Conf: {analysis['confidence']} | RSI: {rsi:.1f}"
+                    f"Score: {analysis['score_buy']} | Conf: {analysis['confidence']}"
                 )
             elif golden.get("type") == "golden_top" and analysis.get("score_sell", 0) >= self.min_score - 2:
                 entry_signal = "sell"
                 reason = (
                     f"ULTRA SELL | Golden Override | "
-                    f"Score: {analysis['score_sell']} | Conf: {analysis['confidence']} | RSI: {rsi:.1f}"
+                    f"Score: {analysis['score_sell']} | Conf: {analysis['confidence']}"
                 )
 
         # 5) القرار العادي لو مفيش Override
@@ -1834,18 +1794,18 @@ class UltraCouncilAI:
                 entry_signal = "buy"
                 reason = (
                     f"ULTRA BUY | Score: {analysis['score_buy']} "
-                    f"| Confidence: {analysis['confidence']} | RSI: {rsi:.1f}"
+                    f"| Confidence: {analysis['confidence']}"
                 )
             elif analysis.get("score_sell", 0) >= self.min_score and analysis["score_sell"] > analysis["score_buy"]:
                 entry_signal = "sell"
                 reason = (
                     f"ULTRA SELL | Score: {analysis['score_sell']} "
-                    f"| Confidence: {analysis['confidence']} | RSI: {rsi:.1f}"
+                    f"| Confidence: {analysis['confidence']}"
                 )
             else:
                 reason = (
                     f"No clear signal | Buy: {analysis.get('score_buy', 0)} "
-                    f"| Sell: {analysis.get('score_sell', 0)} | RSI: {rsi:.1f}"
+                    f"| Sell: {analysis.get('score_sell', 0)}"
                 )
 
         return entry_signal, reason, analysis
@@ -2050,7 +2010,7 @@ class UltraProAIBot:
         log_g(f"🔹 Risk Allocation: {RISK_ALLOC*100}%")
         log_g(f"🔹 Mode: {'LIVE' if MODE_LIVE else 'PAPER'} {'(DRY RUN)' if DRY_RUN else ''}")
         log_g(f"🔹 Web Service: http://0.0.0.0:{PORT}")
-        log_g("🔹 FEATURES: RF Real + EdgeAlgo + SMC + Golden Zones + Trap Mode + Stop-Hunt Prediction + SMART PROFIT ENGINE + Web Service + ULTRA PANEL + ADX+ATR FILTER + RSI Wilder + ADX Wilder")
+        log_g("🔹 FEATURES: RF Real + EdgeAlgo + SMC + Golden Zones + Trap Mode + Stop-Hunt Prediction + SMART PROFIT ENGINE + Web Service + ULTRA PANEL + ADX+ATR FILTER")
         
         balance_now = self.exchange.get_balance()
         log_equity_snapshot(balance_now, self.state["compound_pnl"])
