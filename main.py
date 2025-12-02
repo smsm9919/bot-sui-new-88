@@ -42,6 +42,76 @@ from termcolor import colored
 
 Side = Literal["BUY", "SELL"]
 
+# =========================
+# INDICATORS ENGINE (BOT GAMED)
+# =========================
+
+RSI_LEN = 14
+ADX_LEN = 14
+ATR_LEN = 14
+
+def wilder_ema(s: pd.Series, n: int) -> pd.Series:
+    """Wilder EMA (RMA) نفس المستخدم في بوت جامد"""
+    return s.ewm(alpha=1/n, adjust=False).mean()
+
+def compute_indicators(df: pd.DataFrame) -> dict:
+    """
+    نفس compute_indicators في bot.gamed.py
+    يرجّع قيم RSI / ATR / ADX / DI+/DI- على آخر شمعة.
+    """
+    if len(df) < max(ATR_LEN, RSI_LEN, ADX_LEN) + 2:
+        return {
+            "rsi": 50.0,
+            "plus_di": 0.0,
+            "minus_di": 0.0,
+            "dx": 0.0,
+            "adx": 0.0,
+            "atr": 0.0,
+        }
+
+    c = df["close"].astype(float)
+    h = df["high"].astype(float)
+    l = df["low"].astype(float)
+
+    # True Range + ATR (Wilder)
+    tr = pd.concat([
+        (h - l).abs(),
+        (h - c.shift(1)).abs(),
+        (l - c.shift(1)).abs()
+    ], axis=1).max(axis=1)
+    atr = wilder_ema(tr, ATR_LEN)
+
+    # RSI (Wilder)
+    delta = c.diff()
+    up = delta.clip(lower=0.0)
+    dn = (-delta).clip(lower=0.0)
+    rs = wilder_ema(up, RSI_LEN) / wilder_ema(dn, RSI_LEN).replace(0, 1e-12)
+    rsi = 100 - (100 / (1 + rs))
+
+    # +DI / -DI / ADX (Wilder)
+    up_move = h.diff()
+    down_move = l.shift(1) - l
+
+    plus_dm = up_move.where((up_move > down_move) & (up_move > 0), 0.0)
+    minus_dm = down_move.where((down_move > up_move) & (down_move > 0), 0.0)
+
+    plus_di = 100 * (wilder_ema(plus_dm, ADX_LEN) / atr.replace(0, 1e-12))
+    minus_di = 100 * (wilder_ema(minus_dm, ADX_LEN) / atr.replace(0, 1e-12))
+
+    dx = (100 * (plus_di - minus_di).abs() /
+          (plus_di + minus_di).replace(0, 1e-12)).fillna(0.0)
+    adx = wilder_ema(dx, ADX_LEN)
+
+    i = len(df) - 1
+    return {
+        "rsi": float(rsi.iloc[i]),
+        "plus_di": float(plus_di.iloc[i]),
+        "minus_di": float(minus_di.iloc[i]),
+        "dx": float(dx.iloc[i]),
+        "adx": float(adx.iloc[i]),
+        "atr": float(atr.iloc[i]),
+    }
+
 # ============================================
 #  CONFIGURATION
 # ============================================
@@ -235,6 +305,7 @@ def log_ultra_panel(analysis: dict, state: dict):
         f"📌 DASH → hint-{hint_side} | "
         f"Council BUY({a.get('score_buy',0):.1f}) "
         f"SELL({a.get('score_sell',0):.1f}) | "
+        f"RSI={trend.get('rsi', 0):.1f} | "
         f"ADX={trend.get('adx', 0):.1f} "
         f"DI+={trend.get('di_plus', 0):.1f} DI-={trend.get('di_minus', 0):.1f}"
     )
@@ -585,6 +656,9 @@ class TrendAnalyzer:
         self.trend = "flat"
         self.strength = 0.0
         self.momentum = 0.0
+
+        # مؤشرات من موتور BOT GAMED
+        self.rsi = 50.0
         self.adx = 0.0
         self.di_plus = 0.0
         self.di_minus = 0.0
@@ -626,65 +700,38 @@ class TrendAnalyzer:
             self.trend = "flat"
             
     def _calculate_adx_atr(self, df):
-        """حساب ADX و DI و ATR"""
+        """حساب ADX / DI / ATR / RSI باستخدام موتور BOT GAMED"""
         try:
-            if len(df) < 14:
-                return
-                
-            # استخدم pandas Series مباشرة
-            high = df['high'].astype(float)
-            low = df['low'].astype(float)
-            close = df['close'].astype(float)
-            
-            # حساب +DM و -DM
-            plus_dm = high.diff()
-            minus_dm = low.diff() * -1  # تحويل سالب لتحسين الحساب
-            
-            # تصفية القيم
-            plus_dm = plus_dm.where((plus_dm > minus_dm) & (plus_dm > 0), 0)
-            minus_dm = minus_dm.where((minus_dm > plus_dm) & (minus_dm > 0), 0)
-            
-            # حساب True Range
-            tr1 = high - low
-            tr2 = abs(high - close.shift(1))
-            tr3 = abs(low - close.shift(1))
-            tr = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1)
-            
-            # حساب ATR (المتوسط المتحرك للـ TR)
-            atr = tr.rolling(window=14).mean()
-            self.atr = float(atr.iloc[-1]) if not pd.isna(atr.iloc[-1]) else 0.0
-            
-            # حساب ATR Multiplier
+            ind = compute_indicators(df)
+
+            # قيم المؤشرات الموحدة
+            self.rsi      = ind["rsi"]
+            self.adx      = ind["adx"]
+            self.di_plus  = ind["plus_di"]
+            self.di_minus = ind["minus_di"]
+            self.atr      = ind["atr"]
+
+            # نحسب ATR_MULT بنفس منطقك القديم (نسبة ATR الحالي للمتوسط الأبعد)
+            high = df["high"].astype(float)
+            low  = df["low"].astype(float)
+            close = df["close"].astype(float)
+
+            tr = pd.concat([
+                (high - low).abs(),
+                (high - close.shift(1)).abs(),
+                (low  - close.shift(1)).abs()
+            ], axis=1).max(axis=1)
+
             if len(tr) >= 20:
                 atr_base = tr.rolling(window=20).mean().iloc[-1]
             else:
                 atr_base = self.atr
-                
-            self.atr_mult = self.atr / atr_base if atr_base > 0 else 1.0
-            
-            # حساب DI+ و DI-
-            if self.atr > 0:
-                plus_di = 100 * (plus_dm.rolling(window=14).mean() / self.atr)
-                minus_di = 100 * (minus_dm.rolling(window=14).mean() / self.atr)
-            else:
-                plus_di = pd.Series([0] * len(df))
-                minus_di = pd.Series([0] * len(df))
-            
-            self.di_plus = float(plus_di.iloc[-1]) if not pd.isna(plus_di.iloc[-1]) else 0.0
-            self.di_minus = float(minus_di.iloc[-1]) if not pd.isna(minus_di.iloc[-1]) else 0.0
-            
-            # حساب DX ثم ADX
-            if self.di_plus + self.di_minus > 0:
-                dx = 100 * abs(self.di_plus - self.di_minus) / (self.di_plus + self.di_minus)
-                # إنشاء سلسلة DX لحساب المتوسط المتحرك
-                dx_series = pd.Series([dx] * len(df))
-                adx = dx_series.rolling(window=14).mean()
-                self.adx = float(adx.iloc[-1]) if not pd.isna(adx.iloc[-1]) else 0.0
-            else:
-                self.adx = 0.0
-            
+
+            self.atr_mult = self.atr / atr_base if atr_base and atr_base > 0 else 1.0
+
         except Exception as e:
             log_w(f"⚠️ ADX/ATR calculation error: {e}")
+            self.rsi = 50.0
             self.adx = 0.0
             self.di_plus = 0.0
             self.di_minus = 0.0
@@ -701,6 +748,7 @@ class TrendAnalyzer:
             "direction": self.trend,
             "strength": self.strength,
             "momentum": self.momentum,
+            "rsi": self.rsi,
             "adx": self.adx,
             "di_plus": self.di_plus,
             "di_minus": self.di_minus,
@@ -1472,6 +1520,7 @@ class UltraCouncilAI:
                 "direction": "flat",
                 "strength": 0.0,
                 "momentum": 0.0,
+                "rsi": 50.0,
                 "adx": 0.0,
                 "di_plus": 0.0,
                 "di_minus": 0.0,
