@@ -1540,7 +1540,15 @@ class TrendAnalyzer:
                     allowed_side = "SELL"
                 elif self.trend == "up":
                     allowed_side = "BUY"
-                valid_for_trap = stop_hunt_zone.get("type") == f"{allowed_side.lower()}_stop_hunt"
+
+                # ✅ حماية: لو مفيش اتجاه واضح ما نحاولش نستخدم allowed_side.lower()
+                if allowed_side:
+                    valid_for_trap = (
+                        stop_hunt_zone.get("type") == f"{allowed_side.lower()}_stop_hunt"
+                    )
+                else:
+                    valid_for_trap = False
+
                 reason = f"extreme_trend_{self.trend}_only"
                 
             elif trend_context == "strong":
@@ -3052,8 +3060,7 @@ class UltraProAIBot:
                 # Snapshot للرصيد كل دورة
                 log_equity_snapshot(balance, self.state.get("compound_pnl", 0.0))
 
-                # 🔄 مزامنة حالة البوت مع المركز الفعلي على المنصة
-                # (تحل مشكلة الريستارت أو الكراش أثناء وجود صفقة مفتوحة)
+                # 🔄 Auto-Recovery: ركب على الصفقة لو موجودة
                 self.position_manager.sync_with_exchange(df)
 
                 if not self.state["open"]:
