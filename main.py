@@ -505,6 +505,12 @@ class StateManager:
         """محاكاة دالة get الخاصة بالـ dict"""
         return self.state.get(key, default)
     
+    def setdefault(self, key, default=None):
+        """محاكاة دالة setdefault الخاصة بالـ dict"""
+        if key not in self.state:
+            self.state[key] = default
+        return self.state[key]
+    
     def load_state(self):
         """تحميل حالة البوت"""
         try:
