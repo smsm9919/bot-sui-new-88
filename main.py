@@ -631,42 +631,57 @@ class TrendAnalyzer:
             if len(df) < 14:
                 return
                 
+            # استخدم pandas Series مباشرة
             high = df['high'].astype(float)
             low = df['low'].astype(float)
             close = df['close'].astype(float)
             
             # حساب +DM و -DM
             plus_dm = high.diff()
-            minus_dm = -low.diff()
+            minus_dm = low.diff() * -1  # تحويل سالب لتحسين الحساب
             
-            plus_dm = np.where((plus_dm > minus_dm) & (plus_dm > 0), plus_dm, 0)
-            minus_dm = np.where((minus_dm > plus_dm) & (minus_dm > 0), minus_dm, 0)
+            # تصفية القيم
+            plus_dm = plus_dm.where((plus_dm > minus_dm) & (plus_dm > 0), 0)
+            minus_dm = minus_dm.where((minus_dm > plus_dm) & (minus_dm > 0), 0)
             
-            # حساب TR
+            # حساب True Range
             tr1 = high - low
             tr2 = abs(high - close.shift(1))
             tr3 = abs(low - close.shift(1))
-            tr = np.maximum(np.maximum(tr1, tr2), tr3)
+            tr = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1)
             
-            # حساب المتوسطات
-            atr = tr.rolling(14).mean()
+            # حساب ATR (المتوسط المتحرك للـ TR)
+            atr = tr.rolling(window=14).mean()
             self.atr = float(atr.iloc[-1]) if not pd.isna(atr.iloc[-1]) else 0.0
             
             # حساب ATR Multiplier
-            atr_base = tr.rolling(20).mean().iloc[-1] if len(tr) >= 20 else self.atr
+            if len(tr) >= 20:
+                atr_base = tr.rolling(window=20).mean().iloc[-1]
+            else:
+                atr_base = self.atr
+                
             self.atr_mult = self.atr / atr_base if atr_base > 0 else 1.0
             
-            # حساب DI
-            plus_di = 100 * (plus_dm.rolling(14).mean() / atr)
-            minus_di = 100 * (minus_dm.rolling(14).mean() / atr)
+            # حساب DI+ و DI-
+            if self.atr > 0:
+                plus_di = 100 * (plus_dm.rolling(window=14).mean() / self.atr)
+                minus_di = 100 * (minus_dm.rolling(window=14).mean() / self.atr)
+            else:
+                plus_di = pd.Series([0] * len(df))
+                minus_di = pd.Series([0] * len(df))
             
             self.di_plus = float(plus_di.iloc[-1]) if not pd.isna(plus_di.iloc[-1]) else 0.0
             self.di_minus = float(minus_di.iloc[-1]) if not pd.isna(minus_di.iloc[-1]) else 0.0
             
-            # حساب ADX
-            dx = 100 * abs(plus_di - minus_di) / (plus_di + minus_di)
-            adx = dx.rolling(14).mean()
-            self.adx = float(adx.iloc[-1]) if not pd.isna(adx.iloc[-1]) else 0.0
+            # حساب DX ثم ADX
+            if self.di_plus + self.di_minus > 0:
+                dx = 100 * abs(self.di_plus - self.di_minus) / (self.di_plus + self.di_minus)
+                # إنشاء سلسلة DX لحساب المتوسط المتحرك
+                dx_series = pd.Series([dx] * len(df))
+                adx = dx_series.rolling(window=14).mean()
+                self.adx = float(adx.iloc[-1]) if not pd.isna(adx.iloc[-1]) else 0.0
+            else:
+                self.adx = 0.0
             
         except Exception as e:
             log_w(f"⚠️ ADX/ATR calculation error: {e}")
@@ -813,31 +828,18 @@ class TrendAnalyzer:
             if len(df) < 14 + lookback:
                 return 0.0
             
-            high = df['high'].astype(float)
-            low = df['low'].astype(float)
-            close = df['close'].astype(float)
-            
-            # حساب ADX للـ lookback الأخيرة
-            adx_values = []
-            for i in range(lookback + 1):
-                idx = -1 - i
-                if abs(idx) > len(df):
-                    break
-                    
-                # حساب TR
-                tr1 = high.iloc[idx] - low.iloc[idx]
-                tr2 = abs(high.iloc[idx] - close.iloc[idx-1] if idx-1 >= 0 else 0)
-                tr3 = abs(low.iloc[idx] - close.iloc[idx-1] if idx-1 >= 0 else 0)
-                tr = max(tr1, tr2, tr3)
+            # حساب ADX مبسط للـ lookback الأخيرة
+            if lookback == 0:
+                return 0.0
                 
-                # حساب بسيط للـ ADX
-                if i == 0:
-                    adx_values.append(self.adx)
-                else:
-                    adx_values.append(self.adx * (1 - 0.1 * i))
+            # استخدام طريقة مبسطة لحساب ميل ADX
+            current_adx = self.adx
             
-            if len(adx_values) >= 2:
-                return adx_values[0] - adx_values[-1]
+            # حساب ADX مبسط للفترات السابقة
+            if len(df) >= 15:
+                # تقدير ADX السابق بناءً على الاتجاه الحالي
+                prev_adx = current_adx * 0.95  # تقدير بسيط
+                return current_adx - prev_adx
             return 0.0
             
         except:
