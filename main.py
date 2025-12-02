@@ -18,6 +18,7 @@ ULTRA PRO AI BOT - الإصدار المتكامل الذكي المحسن
 • WEB SERVICE - واجهة ويب للرصد والإدارة
 • ULTRA PANEL - نظام لوج محترف بالشكل المطلوب
 • ADX+ATR FILTER - فلتر ذكي لمنع الدخول في ترند مجنون
+• AUTO-RECOVERY SYSTEM - استعادة الصفقات بعد إعادة التشغيل
 """
 
 import os
@@ -742,7 +743,7 @@ LOG_LEVEL = "INFO"
 PORT = int(os.getenv("PORT", "5000"))
 
 # Bot Version
-BOT_VERSION = f"ULTRA PRO AI v12.0 - WEB SERVICE EDITION - {EXCHANGE_NAME.upper()}"
+BOT_VERSION = f"ULTRA PRO AI v12.0 - WEB SERVICE EDITION - {EXCHANGE_NAME.upper()} - AUTO-RECOVERY ENABLED"
 
 print(f"🚀 Booting: {BOT_VERSION}", flush=True)
 
@@ -1026,6 +1027,7 @@ def log_banner():
     print(colored("  • ADX+ATR FILTER - Smart Trend Filter", "yellow"))
     print(colored("  • VWAP Engine - Fair Value Axis", "yellow"))
     print(colored("  • Ultra Market Structure Engine", "yellow"))
+    print(colored("  • AUTO-RECOVERY SYSTEM - استعادة الصفقات بعد الإعادة", "yellow"))
 
     print("="*80)
     print(colored("🚀 INITIALIZING ULTRA PRO AI ENGINE...", "cyan", attrs=["bold"]))
@@ -1173,6 +1175,81 @@ class ExchangeManager:
             log_e(f"❌ Order execution failed: {e}")
             
         return False
+
+    def get_open_position(self):
+        """
+        قراءة المركز المفتوح فعليًا من البورصة للـ SYMBOL الحالي.
+        يرجّع:
+          {"side": "long"/"short", "qty": float, "entry_price": float}
+        أو None لو مفيش مركز.
+        """
+        if not MODE_LIVE or not self.initialized:
+            return None
+
+        try:
+            positions = []
+            if hasattr(self.exchange, "fetch_positions"):
+                # واجهة ccxt الموحدة لو مدعومة
+                positions = self.exchange.fetch_positions([SYMBOL])
+            elif hasattr(self.exchange, "fetchPositions"):
+                # بعض الإكسشينجات تستخدم camelCase
+                positions = self.exchange.fetchPositions([SYMBOL])
+            else:
+                return None
+
+            if not positions:
+                return None
+
+            for p in positions:
+                try:
+                    sym = p.get("symbol") or p.get("info", {}).get("symbol")
+                    if sym != SYMBOL:
+                        continue
+
+                    amt = p.get("contracts")
+                    if amt is None:
+                        amt = p.get("contractSize")
+                    if amt is None:
+                        amt = p.get("positionAmt")
+
+                    amt = float(amt or 0.0)
+                    if amt == 0:
+                        continue
+
+                    raw_side = (p.get("side") or "").lower()
+                    if raw_side in ("long", "buy"):
+                        side = "long"
+                    elif raw_side in ("short", "sell"):
+                        side = "short"
+                    else:
+                        side = "long" if amt > 0 else "short"
+
+                    entry = (
+                        p.get("entryPrice")
+                        or p.get("avgEntryPrice")
+                        or p.get("info", {}).get("entry_price")
+                        or p.get("info", {}).get("avgEntryPrice")
+                    )
+
+                    try:
+                        entry_price = float(entry) if entry is not None else float(self.get_current_price() or 0.0)
+                    except Exception:
+                        entry_price = float(self.get_current_price() or 0.0)
+
+                    return {
+                        "side": side,
+                        "qty": abs(amt),
+                        "entry_price": entry_price,
+                    }
+                except Exception:
+                    # لو بوضع غريب نعدّي للي بعده
+                    continue
+
+            return None
+
+        except Exception as e:
+            log_w(f"⚠️ Failed to fetch open position from exchange: {e}")
+            return None
 
 # ============================================
 #  STATE MANAGEMENT
@@ -1980,11 +2057,11 @@ class ProfitEngine:
         }
 
 # ============================================
-#  SMART POSITION MANAGER WITH PROFIT ENGINE
+#  SMART POSITION MANAGER WITH PROFIT ENGINE AND AUTO-RECOVERY
 # ============================================
 
 class SmartPositionManager:
-    """مدير المراكز الذكي المتكامل مع Profit Engine"""
+    """مدير المراكز الذكي المتكامل مع Profit Engine ونظام استعادة الصفقات"""
     
     def __init__(self, exchange_manager, state_manager):
         self.exchange = exchange_manager
@@ -2077,6 +2154,135 @@ class SmartPositionManager:
             return True
 
         return False
+    
+    def sync_with_exchange(self, df):
+        """
+        مزامنة حالة البوت مع المركز الفعلي على البورصة.
+        الهدف:
+          - لو في صفقة مفتوحة على المنصة والبوت فاكر مفيش → يركب عليها ويكمّل إدارتها.
+          - لو البوت فاكر في صفقة والمنصة مفيش → ينضّف الـ state.
+          - لو في صفقة والـ state مفتوح لكن ProfitEngine مش متهيّأ (بعد restart) → نعيد تهيئته.
+        """
+        if not MODE_LIVE:
+            # في الـ PAPER MODE مش محتاج نتعب نفسنا
+            return
+
+        pos = self.exchange.get_open_position()
+        state_open = bool(self.state["open"])
+
+        # ===== Case 1: مفيش مركز فعلي على المنصة =====
+        if not pos:
+            if state_open:
+                log_w("⚠️ State says position OPEN but exchange has NO position → resetting state.")
+                self.state.reset()
+            return
+
+        # من هنا: في مركز فعلي على المنصة
+        side = pos["side"]           # "long" / "short"
+        qty = float(pos["qty"])
+        entry_price = float(pos["entry_price"])
+
+        # ===== Helper: نحسب ATR باستخدام ProfitEngine نفسه =====
+        # نضبط entry_price / atr_entry مؤقتًا عشان حساب ATR يكون منطقي
+        self.profit_engine.entry_price = entry_price
+        self.profit_engine.atr_entry = entry_price * 0.01
+        atr_value = self.profit_engine.calculate_atr(df)
+
+        # تحليل بسيط كفاية لتشغيل ProfitEngine
+        recovered_analysis = {
+            "trend": {"atr": atr_value},
+            "confidence": 0.5,
+            "edge_setup": self.state.get("edge_setup"),
+            "golden_zone": {"type": None, "valid": False},
+            "stop_hunt_trap_side": None,
+            "stop_hunt_trap_quality": 0.0,
+            "signals": ["RECOVERED_FROM_EXCHANGE"],
+        }
+        trade_mode = "SCALP"
+
+        # ===== Case 2: المنصة فيها صفقة، والـ state مغلق =====
+        if not state_open:
+            self.state.update({
+                "open": True,
+                "side": side,
+                "entry": entry_price,
+                "qty": qty,
+                "pnl": 0.0,
+                "bars": 0,
+                "highest_profit_pct": 0.0,
+                "profit_targets_achieved": 0,
+                "opened_at": time.time(),
+                "last_signal": side,
+                "trade_type": self.state.get("trade_type", "recovered"),
+                "trade_profile": self.state.get("trade_profile", "SCALP_STRICT"),
+                "entry_price": entry_price,
+                "tp1_hit": False,
+                "tp2_hit": False,
+                "profit_engine_active": False,
+            })
+
+            self.profit_engine.init_trade(side, entry_price, atr_value, trade_mode, recovered_analysis)
+
+            log_g(
+                f"♻️ Re-attached to existing exchange position | "
+                f"side={side.upper()} | qty={qty:.4f} | entry={entry_price:.6f}"
+            )
+            return
+
+        # ===== Case 3: state مفتوح، لكن ProfitEngine مش Active (restart) =====
+        if self.state["open"] and not self.state.get("profit_engine_active", False):
+            # نتاكد إن بيانات الـ state منطقية
+            if not self.state.get("entry_price"):
+                self.state["entry_price"] = entry_price
+            if not self.state.get("qty"):
+                self.state["qty"] = qty
+            if not self.state.get("side"):
+                self.state["side"] = side
+
+            side_state = self.state["side"]
+            entry_state = float(self.state["entry_price"])
+
+            self.profit_engine.init_trade(side_state, entry_state, atr_value, trade_mode, recovered_analysis)
+            log_g(
+                f"♻️ Profit Engine re-initialized for existing position "
+                f"| side={side_state.upper()} | qty={self.state['qty']:.4f} | entry={entry_state:.6f}"
+            )
+            return
+
+        # ===== Case 4: state مفتوح والمنصة مفتوحة لكن في اختلاف (side/qty/entry) =====
+        mismatch = False
+        try:
+            state_side = (self.state.get("side") or "").lower()
+            state_qty = float(self.state.get("qty", 0.0))
+            state_entry = float(self.state.get("entry_price", entry_price))
+
+            if state_side not in ("long", "short"):
+                mismatch = True
+            if abs(state_qty - qty) > 1e-6:
+                mismatch = True
+        except Exception:
+            mismatch = True
+
+        if mismatch:
+            log_w(
+                "⚠️ State/Exchange position mismatch → resyncing.\n"
+                f"    state: side={self.state.get('side')} qty={self.state.get('qty')} entry={self.state.get('entry_price')}\n"
+                f"    exch : side={side} qty={qty} entry={entry_price}"
+            )
+
+            self.state.update({
+                "open": True,
+                "side": side,
+                "entry": entry_price,
+                "entry_price": entry_price,
+                "qty": qty,
+            })
+
+            self.profit_engine.init_trade(side, entry_price, atr_value, trade_mode, recovered_analysis)
+            log_g(
+                f"♻️ State re-synced to exchange position | "
+                f"side={side.upper()} | qty={qty:.4f} | entry={entry_price:.6f}"
+            )
     
     def manage_position(self, df):
         """إدارة المركز المفتوح مع Profit Engine"""
@@ -2784,7 +2990,7 @@ class UltraCouncilAI:
         return entry_signal, reason, analysis
 
 # ============================================
-#  ULTRA PRO AI BOT - الإصدار المتكامل النهائي
+#  ULTRA PRO AI BOT - الإصدار المتكامل النهائي مع نظام الاستعادة
 # ============================================
 
 class UltraProAIBot:
@@ -2807,7 +3013,7 @@ class UltraProAIBot:
         log_g(f"🔹 Risk Allocation: {RISK_ALLOC*100}%")
         log_g(f"🔹 Mode: {'LIVE' if MODE_LIVE else 'PAPER'} {'(DRY RUN)' if DRY_RUN else ''}")
         log_g(f"🔹 Web Service: http://0.0.0.0:{PORT}")
-        log_g("🔹 FEATURES: RF Real + EdgeAlgo + SMC + Golden Zones + Trap Mode + Stop-Hunt Prediction + SMART PROFIT ENGINE + Web Service + ULTRA PANEL + ADX+ATR FILTER + VWAP + Ultra Market Structure")
+        log_g("🔹 FEATURES: RF Real + EdgeAlgo + SMC + Golden Zones + Trap Mode + Stop-Hunt Prediction + SMART PROFIT ENGINE + Web Service + ULTRA PANEL + ADX+ATR FILTER + VWAP + Ultra Market Structure + AUTO-RECOVERY SYSTEM")
         
         balance_now = self.exchange.get_balance()
         log_equity_snapshot(balance_now, self.state["compound_pnl"])
@@ -2820,7 +3026,7 @@ class UltraProAIBot:
         log_i("🛑 Bot stopped by user")
     
     def trade_loop(self):
-        """حلقة التداول الرئيسية"""
+        """حلقة التداول الرئيسية مع نظام استعادة الصفقات"""
         consecutive_errors = 0
         max_errors = 5
 
@@ -2845,6 +3051,10 @@ class UltraProAIBot:
 
                 # Snapshot للرصيد كل دورة
                 log_equity_snapshot(balance, self.state.get("compound_pnl", 0.0))
+
+                # 🔄 مزامنة حالة البوت مع المركز الفعلي على المنصة
+                # (تحل مشكلة الريستارت أو الكراش أثناء وجود صفقة مفتوحة)
+                self.position_manager.sync_with_exchange(df)
 
                 if not self.state["open"]:
                     self._handle_trading_decision(df, current_price, balance)
