@@ -1535,13 +1535,15 @@ class TrendAnalyzer:
             allowed_side = None
             
             if trend_context == "extreme":
-                # ترند مجنون - فقط مع الاتجاه
+                # في الترند المجنون نسمح فقط بالـ Trap في اتجاه الترند
                 if self.trend == "down":
                     allowed_side = "SELL"
                 elif self.trend == "up":
                     allowed_side = "BUY"
+                else:
+                    allowed_side = None  # flat أو undefined
 
-                # ✅ حماية: لو مفيش اتجاه واضح ما نحاولش نستخدم allowed_side.lower()
+                # حماية من NoneType.lower()
                 if allowed_side:
                     valid_for_trap = (
                         stop_hunt_zone.get("type") == f"{allowed_side.lower()}_stop_hunt"
@@ -1550,7 +1552,7 @@ class TrendAnalyzer:
                     valid_for_trap = False
 
                 reason = f"extreme_trend_{self.trend}_only"
-                
+            
             elif trend_context == "strong":
                 # ترند قوي - الأفضل مع الاتجاه، لكن ممكن ضد الاتجاه بحذر
                 if self.trend == "down":
