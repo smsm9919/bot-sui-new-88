@@ -1325,9 +1325,26 @@ class StateManager:
         except Exception as e:
             log_w(f"⚠️ Failed to save state: {e}")
     
-    def update(self, **kwargs):
-        """تحديث حالة البوت"""
-        self.state.update(kwargs)
+    def update(self, *args, **kwargs):
+        """
+        تحديث حالة البوت (مثل dict.update):
+        - يمكن تمرير dict كمعامل أول
+        - أو تمرير كلمات مفتاحية
+        """
+        if args:
+            if len(args) > 1:
+                raise TypeError(f"update expected at most 1 argument, got {len(args)}")
+            other = args[0]
+            if isinstance(other, dict):
+                self.state.update(other)
+            else:
+                # إذا كان غير dict، نحاول تحويله إلى dict إذا أمكن
+                try:
+                    self.state.update(dict(other))
+                except (TypeError, ValueError):
+                    raise TypeError(f"cannot convert {type(other)} to dict")
+        if kwargs:
+            self.state.update(kwargs)
         self.save_state()
     
     def reset(self):
