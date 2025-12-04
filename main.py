@@ -718,6 +718,59 @@ class OrderFlowEngine:
             }
 
 # ============================================
+#  CVD DIVERGENCE ENGINE
+# ============================================
+
+def compute_cvd_from_ohlcv(df: pd.DataFrame) -> pd.Series:
+    """
+    CVD تقريبي من OHLCV:
+    - لو الشمعة خضراء → volume محسوب شراء
+    - لو حمرا → volume بيع
+    """
+    if df is None or len(df) == 0:
+        return pd.Series(dtype=float)
+
+    close = df["close"].astype(float)
+    open_ = df["open"].astype(float)
+    vol = df["volume"].astype(float)
+
+    buy_vol = vol.where(close > open_, 0.0)
+    sell_vol = vol.where(close < open_, 0.0)
+    delta = buy_vol - sell_vol
+    cvd = delta.cumsum()
+    return cvd
+
+
+def detect_cvd_divergence(df: pd.DataFrame, lookback: int = 5) -> Optional[str]:
+    """
+    يكشف عن:
+    - bearish divergence  → "bearish"
+    - bullish divergence  → "bullish"
+    - otherwise           → None
+    """
+    if df is None or len(df) < lookback + 2:
+        return None
+
+    df = df.copy()
+    df["cvd"] = compute_cvd_from_ohlcv(df)
+
+    last = len(df) - 1
+
+    # Higher High in price + Lower High in CVD → bearish
+    price_hh = float(df["high"].iloc[last]) > float(df["high"].iloc[last-lookback:last].max())
+    cvd_lh = float(df["cvd"].iloc[last]) < float(df["cvd"].iloc[last-lookback:last].max())
+
+    # Lower Low in price + Higher Low in CVD → bullish
+    price_ll = float(df["low"].iloc[last]) < float(df["low"].iloc[last-lookback:last].min())
+    cvd_hl = float(df["cvd"].iloc[last]) > float(df["cvd"].iloc[last-lookback:last].min())
+
+    if price_hh and cvd_lh:
+        return "bearish"
+    if price_ll and cvd_hl:
+        return "bullish"
+    return None
+
+# ============================================
 #  CONFIGURATION
 # ============================================
 
@@ -1291,7 +1344,12 @@ class StateManager:
             "balance": 0.0,
             "mode_live": MODE_LIVE,
             "profit_profile": "SCALP_STRICT",
-            "profit_engine_active": False
+            "profit_engine_active": False,
+            # حقول جديدة للكول داون ومتابعة آخر صفقة
+            "cooldown_bars": 0,
+            "last_close_reason": None,
+            "last_close_time": None,
+            "last_bar_time": None,
         }
         self.state_file = "bot_state.json"
         self.load_state()
@@ -1373,7 +1431,12 @@ class StateManager:
             "entry_price": None,
             "edge_setup": None,
             "profit_profile": "SCALP_STRICT",
-            "profit_engine_active": False
+            "profit_engine_active": False,
+            # حقول جديدة للكول داون ومتابعة آخر صفقة
+            "cooldown_bars": 0,
+            "last_close_reason": None,
+            "last_close_time": None,
+            "last_bar_time": None,
         })
         self.save_state()
     
@@ -1980,6 +2043,10 @@ class ProfitEngine:
                 if self.exchange.execute_order(close_side, qty, price):
                     self.state["open"] = False
                     self.state["profit_engine_active"] = False
+                    # تفعيل الكول داون
+                    self.state["cooldown_bars"] = 3
+                    self.state["last_close_reason"] = "HARD_SL"
+                    self.state["last_close_time"] = datetime.now().isoformat()
                     return True
                 return False
         
@@ -2067,6 +2134,10 @@ class ProfitEngine:
                     )
                     self.state["open"] = False
                     self.state["profit_engine_active"] = False
+                    # تفعيل الكول داون
+                    self.state["cooldown_bars"] = 3
+                    self.state["last_close_reason"] = "FULL_TP"
+                    self.state["last_close_time"] = datetime.now().isoformat()
                     return True
         
         return False
@@ -2316,6 +2387,20 @@ class SmartPositionManager:
         if not self.state["open"]:
             return
             
+        side = self.state["side"]
+        entry = self.state["entry"]
+        qty = self.state["qty"]
+        sl = self.state.get("sl")
+        tp1 = self.state.get("tp1")
+        tp2 = self.state.get("tp2")
+        tp3 = self.state.get("tp3")
+        profile = self.state.get("profit_profile", "SCALP_STRICT")
+
+        log_i(
+            f"🧩 TRADE MANAGEMENT | side={side} | qty={qty:.4f} | entry={entry} | "
+            f"SL={sl} | TP1={tp1} | TP2={tp2} | TP3={tp3} | profile={profile}"
+        )
+        
         # استخدام Profit Engine لإدارة الصفقة
         closed = self.profit_engine.on_tick(df)
         
@@ -2634,7 +2719,10 @@ class UltraCouncilAI:
                 "sell_wall": False,
                 "wall_side": None,
                 "wall_distance": None,
-            }
+            },
+            "cvd_divergence": {
+                "signal": None,
+            },
         }
 
     def build_context(self, df, current_price, stop_hunt_info, fvg_ctx, liquidity_zones):
@@ -2711,6 +2799,18 @@ class UltraCouncilAI:
                 elif wall_side == "SELL":
                     score_sell += 0.5
                     signals.append("🧱 Sell Wall Resistance")
+            
+            # ===== CVD DIVERGENCE =====
+            cvd_sig = detect_cvd_divergence(df)
+            analysis_result = self._empty_analysis()
+            analysis_result["cvd_divergence"]["signal"] = cvd_sig
+            
+            if cvd_sig == "bullish":
+                score_buy += 1.5
+                signals.append("📈 CVD BULLISH DIVERGENCE")
+            elif cvd_sig == "bearish":
+                score_sell += 1.5
+                signals.append("📉 CVD BEARISH DIVERGENCE")
             
             # ===== RF REAL CONTRIBUTION =====
             if rf_ctx.get("buy_signal") and current_price > rf_ctx.get("filt", current_price):
@@ -2918,7 +3018,8 @@ class UltraCouncilAI:
                     "abs_bull": False,
                     "abs_bear": False
                 },
-                "orderflow": orderflow_ctx
+                "orderflow": orderflow_ctx,
+                "cvd_divergence": analysis_result["cvd_divergence"]
             }
             
         except Exception as e:
@@ -2937,6 +3038,14 @@ class UltraCouncilAI:
         predicted = analysis.get("predicted_stop_hunt", {})
         smc_ctx = analysis.get("smc_ctx", {})
         trend = analysis.get("trend", {})
+        
+        # 🔥 CVD Divergence Filter
+        cvd_sig = analysis["cvd_divergence"]["signal"]
+        of = analysis["orderflow"]
+        flow_side = of.get("flow_side", "NEUTRAL")
+        vwap_price = analysis.get("vwap", 0.0)
+        rf_info = analysis["rf"]
+        current_price = float(df["close"].iloc[-1])
 
         # 1) TRAP OVERRIDE MODE – دخول قسري لو الفرصة خبيثة جدًا
         if trap_side and trap_q >= 2.5:
@@ -2968,12 +3077,40 @@ class UltraCouncilAI:
         # لو في هدف ستوب هانت فوق والسوق ترنده هابط → بيع خبيث
         if predicted.get("up_target") and trend_dir == "down":
             if analysis.get("score_sell", 0) >= self.min_score - 3:
-                return "sell", "PREDICTIVE STOP-HUNT SELL", analysis
+                # 🔫 SNIPER SELL FILTER مع CVD
+                sniper_ok = True
+                if cvd_sig != "bearish":
+                    sniper_ok = False
+                if not (rf_info.get("sell_signal") or rf_info.get("dir", 0) <= 0):
+                    sniper_ok = False
+                if vwap_price and current_price >= vwap_price:
+                    sniper_ok = False
+                if flow_side not in ("SELL", "STRONG_SELL"):
+                    sniper_ok = False
+                
+                if sniper_ok:
+                    return "sell", "SNIPER_SELL_CVD_DIVERGENCE", analysis
+                else:
+                    return None, "sell_rejected_sniper_filter", analysis
 
         # لو في هدف ستوب هانت تحت والسوق ترنده صاعد → شراء خبيث
         if predicted.get("down_target") and trend_dir == "up":
             if analysis.get("score_buy", 0) >= self.min_score - 3:
-                return "buy", "PREDICTIVE STOP-HUNT BUY", analysis
+                # 🔫 SNIPER BUY FILTER مع CVD
+                sniper_ok = True
+                if cvd_sig != "bullish":
+                    sniper_ok = False
+                if not (rf_info.get("buy_signal") or rf_info.get("dir", 0) >= 0):
+                    sniper_ok = False
+                if vwap_price and current_price <= vwap_price:
+                    sniper_ok = False
+                if flow_side not in ("BUY", "STRONG_BUY"):
+                    sniper_ok = False
+                
+                if sniper_ok:
+                    return "buy", "SNIPER_BUY_CVD_DIVERGENCE", analysis
+                else:
+                    return None, "buy_rejected_sniper_filter", analysis
 
         # 4) Golden Zone Override
         entry_signal = None
@@ -2982,32 +3119,85 @@ class UltraCouncilAI:
 
         if golden.get("valid"):
             if golden.get("type") == "golden_bottom" and analysis.get("score_buy", 0) >= self.min_score - 2:
-                entry_signal = "buy"
-                reason = (
-                    f"ULTRA BUY | Golden Override | "
-                    f"Score: {analysis['score_buy']} | Conf: {analysis['confidence']}"
-                )
+                # 🔫 SNIPER BUY FILTER مع CVD للـ Golden Zone
+                sniper_ok = True
+                if cvd_sig != "bullish":
+                    sniper_ok = False
+                if not (rf_info.get("buy_signal") or rf_info.get("dir", 0) >= 0):
+                    sniper_ok = False
+                if vwap_price and current_price <= vwap_price:
+                    sniper_ok = False
+                if flow_side not in ("BUY", "STRONG_BUY"):
+                    sniper_ok = False
+                
+                if sniper_ok:
+                    entry_signal = "buy"
+                    reason = (
+                        f"ULTRA BUY | Golden Override | "
+                        f"Score: {analysis['score_buy']} | Conf: {analysis['confidence']}"
+                    )
             elif golden.get("type") == "golden_top" and analysis.get("score_sell", 0) >= self.min_score - 2:
-                entry_signal = "sell"
-                reason = (
-                    f"ULTRA SELL | Golden Override | "
-                    f"Score: {analysis['score_sell']} | Conf: {analysis['confidence']}"
-                )
+                # 🔫 SNIPER SELL FILTER مع CVD للـ Golden Zone
+                sniper_ok = True
+                if cvd_sig != "bearish":
+                    sniper_ok = False
+                if not (rf_info.get("sell_signal") or rf_info.get("dir", 0) <= 0):
+                    sniper_ok = False
+                if vwap_price and current_price >= vwap_price:
+                    sniper_ok = False
+                if flow_side not in ("SELL", "STRONG_SELL"):
+                    sniper_ok = False
+                
+                if sniper_ok:
+                    entry_signal = "sell"
+                    reason = (
+                        f"ULTRA SELL | Golden Override | "
+                        f"Score: {analysis['score_sell']} | Conf: {analysis['confidence']}"
+                    )
 
-        # 5) القرار العادي لو مفيش Override
+        # 5) القرار العادي مع CVD Filter
         if entry_signal is None:
             if analysis.get("score_buy", 0) >= self.min_score and analysis["score_buy"] > analysis["score_sell"]:
-                entry_signal = "buy"
-                reason = (
-                    f"ULTRA BUY | Score: {analysis['score_buy']} "
-                    f"| Confidence: {analysis['confidence']}"
-                )
+                # 🔫 SNIPER BUY FILTER
+                sniper_ok = True
+                if cvd_sig != "bullish":
+                    sniper_ok = False
+                if not (rf_info.get("buy_signal") or rf_info.get("dir", 0) >= 0):
+                    sniper_ok = False
+                if vwap_price and current_price <= vwap_price:
+                    sniper_ok = False
+                if flow_side not in ("BUY", "STRONG_BUY"):
+                    sniper_ok = False
+                
+                if sniper_ok:
+                    entry_signal = "buy"
+                    reason = (
+                        f"ULTRA BUY | Score: {analysis['score_buy']} "
+                        f"| Confidence: {analysis['confidence']}"
+                    )
+                else:
+                    return None, "buy_rejected_sniper_filter", analysis
+                    
             elif analysis.get("score_sell", 0) >= self.min_score and analysis["score_sell"] > analysis["score_buy"]:
-                entry_signal = "sell"
-                reason = (
-                    f"ULTRA SELL | Score: {analysis['score_sell']} "
-                    f"| Confidence: {analysis['confidence']}"
-                )
+                # 🔫 SNIPER SELL FILTER
+                sniper_ok = True
+                if cvd_sig != "bearish":
+                    sniper_ok = False
+                if not (rf_info.get("sell_signal") or rf_info.get("dir", 0) <= 0):
+                    sniper_ok = False
+                if vwap_price and current_price >= vwap_price:
+                    sniper_ok = False
+                if flow_side not in ("SELL", "STRONG_SELL"):
+                    sniper_ok = False
+                
+                if sniper_ok:
+                    entry_signal = "sell"
+                    reason = (
+                        f"ULTRA SELL | Score: {analysis['score_sell']} "
+                        f"| Confidence: {analysis['confidence']}"
+                    )
+                else:
+                    return None, "sell_rejected_sniper_filter", analysis
             else:
                 reason = (
                     f"No clear signal | Buy: {analysis.get('score_buy', 0)} "
@@ -3108,6 +3298,22 @@ class UltraProAIBot:
     def _handle_trading_decision(self, df, current_price, balance):
         """معالجة قرار التداول المتكامل"""
         if balance <= 10:
+            return
+
+        # ⛔ فلتر كول داون بعد آخر صفقة
+        cd = int(self.state.get("cooldown_bars", 0) or 0)
+        if cd > 0:
+            # نقلّل العداد كل شمعة جديدة فقط
+            last_bar_time = self.state.get("last_bar_time")
+            current_bar_time = str(df.index[-1]) if hasattr(df, "index") else None
+            if current_bar_time and current_bar_time != last_bar_time:
+                self.state["cooldown_bars"] = max(cd - 1, 0)
+                self.state["last_bar_time"] = current_bar_time
+
+            log_i(
+                f"⏸ COOLDOWN ACTIVE | bars_left={self.state['cooldown_bars']} | "
+                f"last_close={self.state.get('last_close_reason')}"
+            )
             return
             
         # تحليل السوق عبر مجلس الإدارة المتكامل
@@ -3210,6 +3416,8 @@ def create_app(bot_instance):
             "trade_profile": status["position"].get("trade_profile", "N/A"),
             "profit_profile": status["position"].get("profit_profile", "N/A"),
             "profit_engine_active": status["position"].get("profit_engine_active", False),
+            "cooldown_bars": status["position"].get("cooldown_bars", 0),
+            "last_close_reason": status["position"].get("last_close_reason", None),
             "version": status["version"],
             "timestamp": datetime.now().isoformat()
         })
