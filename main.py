@@ -826,8 +826,9 @@ PROFIT_PROFILES = {
         "tp_fracs":     [0.3, 0.3, 0.4],
         "hard_sl_rr":   -0.8,
         "be_after_tp":  True,         # بعد TP1
-        "trail_start_rr": 1.5,        # تريل بدري شوية
-        "trail_atr_mult": 1.5,        # تريل أوسع لركوب الترند
+        # Trail بعد TP2 تقريبًا (TP2 ≈ 2R)
+        "trail_start_rr": 2.0,
+        "trail_atr_mult": 1.5,
     },
     "TRAP_TREND": {
         # Stop-Hunt مع الترند: ناخد ربح محترم بس مش نطمع قوي
@@ -1523,7 +1524,7 @@ class TrendAnalyzer:
             tr = pd.concat([
                 (high - low).abs(),
                 (high - close.shift(1)).abs(),
-                (low  - close.shift(1)).abs()
+                (l - close.shift(1)).abs()
             ], axis=1).max(axis=1)
 
             if len(tr) >= 20:
@@ -1947,7 +1948,13 @@ class ProfitEngine:
         self.sl_price = None
         self.trail_active = False
         self.trail_price = None
-    
+
+        # سياق إضافي لـ Hold-TP
+        self.confidence = 0.0          # من مجلس الإدارة (0 → 1)
+        self.trend_adx = 0.0           # ADX وقت الدخول
+        self.base_tp_rr = []           # الـ R الأصلية للـ TP
+        self.hold_tp_factor = 1.0      # مضاعِف TP3 في FULL_TREND
+
     def init_trade(self, side, entry_price, atr_value, trade_mode, analysis):
         """تهيئة الصفقة مع تحديد الـ Profile المناسب"""
         self.side = side  # "long" / "short"
@@ -1957,7 +1964,29 @@ class ProfitEngine:
         # اختيار الـ Profile المناسب
         self.profile_name = select_profit_profile(trade_mode, analysis)
         self.profile_cfg = PROFIT_PROFILES[self.profile_name]
-        
+
+        # قراءة الثقة + ADX من التحليل
+        self.confidence = float(analysis.get("confidence", 0.0))
+        trend_ctx = analysis.get("trend", {}) or {}
+        self.trend_adx = float(trend_ctx.get("adx", 0.0))
+
+        # حفظ R الأصلية للـ TP
+        self.base_tp_rr = list(self.profile_cfg.get("tp_levels_rr", []))
+        self.hold_tp_factor = 1.0
+
+        # منطق Hold-TP الذكي:
+        # في FULL_TREND فقط نرفع TP3 لو:
+        # - الثقة عالية
+        # - ADX قوي (ترند مجنون)
+        if self.profile_name == "FULL_TREND" and self.base_tp_rr:
+            conf = self.confidence          # 0 → 1
+            adx = self.trend_adx            # قيمة ADX الحقيقية
+
+            if conf >= 0.75 and adx >= 28:
+                self.hold_tp_factor = 1.20  # Boost محترم
+            if conf >= 0.90 and adx >= 35:
+                self.hold_tp_factor = 1.40  # ترند مجنون → نركب زيادة
+
         direction = 1 if side == "long" else -1
         
         # 1) ستوب مبدئي (قائم على R)
@@ -1968,11 +1997,16 @@ class ProfitEngine:
         else:
             self.sl_price = self.entry_price + sl_dist
         
-        # 2) حساب مستويات TP بالسعر
+        # 2) حساب مستويات TP بالسعر مع Hold-TP على TP3 في FULL_TREND
         self.tp_levels = []
         self.tp_hit = set()
-        for i, (rr, frac) in enumerate(zip(self.profile_cfg["tp_levels_rr"],
-                                           self.profile_cfg["tp_fracs"])):
+
+        rr_levels = list(self.base_tp_rr)
+        if self.profile_name == "FULL_TREND" and len(rr_levels) >= 3 and self.hold_tp_factor > 1.0:
+            # رفع TP3 فقط
+            rr_levels[-1] = rr_levels[-1] * self.hold_tp_factor
+
+        for i, (rr, frac) in enumerate(zip(rr_levels, self.profile_cfg["tp_fracs"])):
             dist = rr * self.atr_entry
             price = self.entry_price + direction * dist
             label = f"TP{i+1}_{self.profile_name}"
@@ -1984,13 +2018,24 @@ class ProfitEngine:
         # تحديث state
         self.state["profit_profile"] = self.profile_name
         self.state["profit_engine_active"] = True
+        self.state["hold_tp_active"] = bool(self.hold_tp_factor > 1.0)
+        self.state["hold_tp_factor"] = self.hold_tp_factor
+        self.state["analysis_confidence"] = self.confidence
+        self.state["analysis_adx"] = self.trend_adx
         
+        # لوج الخطة + وضع Hold-TP
         log_i(
             f"🎯 PROFIT PLAN [{self.profile_name}] | "
             f"side={side} | entry={self.entry_price:.6f} | "
             f"ATR={self.atr_entry:.6f} | SL={self.sl_price:.6f} | "
             f"TPs={[(round(p,6), f'{f*100:.0f}%') for p,f,_ in self.tp_levels]}"
         )
+
+        if self.profile_name == "FULL_TREND":
+            log_i(
+                f"📊 HOLD-TP MODE | conf={self.confidence:.2f} | ADX={self.trend_adx:.1f} | "
+                f"factor={self.hold_tp_factor:.2f} (TP3 boosted في الترند القوي)"
+            )
     
     def calculate_atr(self, df, period=14):
         """حساب ATR من الـ DataFrame"""
@@ -2051,37 +2096,52 @@ class ProfitEngine:
                 return False
         
         # ===== 2) تنفيذ TP الجزئية =====
+        # 3) فحص مستويات TP مع لوج احترافي (R + profile + trail)
         for idx, (tp_price, frac, label) in enumerate(self.tp_levels):
             if idx in self.tp_hit:
                 continue
-            
-            hit = (direction == 1 and price >= tp_price) or \
-                  (direction == -1 and price <= tp_price)
-            
+
+            hit = False
+            if side == "long" and price >= tp_price:
+                hit = True
+            elif side == "short" and price <= tp_price:
+                hit = True
+
             if hit:
                 close_qty = qty * frac
+
+                # هل هذا الـ TP سيشغّل الـ Trail؟
+                will_trail_now = (
+                    (not self.trail_active)
+                    and bool(self.profile_cfg.get("trail_start_rr"))
+                    and R_now >= float(self.profile_cfg.get("trail_start_rr", 0.0))
+                )
+
                 close_side = "sell" if side == "long" else "buy"
-                
                 if self.exchange.execute_order(close_side, close_qty, price):
                     self.tp_hit.add(idx)
                     self.state["qty"] -= close_qty
                     qty = self.state["qty"]
-                    
+
                     # حساب الربح المحقق
                     if side == "long":
                         realized_pnl = (price - self.entry_price) * close_qty
                     else:
                         realized_pnl = (self.entry_price - price) * close_qty
-                    
+
                     # تحديث الربح التراكمي
                     self.state["compound_pnl"] = self.state.get("compound_pnl", 0.0) + realized_pnl
-                    
+
+                    profile = self.profile_name or self.state.get("profit_profile", "N/A")
+                    closed_pct = frac * 100.0
+                    trail_tag = " | trail ON" if will_trail_now else ""
+
                     log_g(
-                        f"✅ {label} HIT | price={price:.6f} | "
-                        f"closed={close_qty:.4f} | remain={qty:.4f} | "
-                        f"R≈{R_now:.2f} | PnL={realized_pnl:.3f} USDT"
+                        f"✅ TP{idx+1} HIT ({profile}) | closed={closed_pct:.0f}% "
+                        f"| R≈{R_now:.2f} | qty={close_qty:.4f} | remain={qty:.4f} "
+                        f"| PnL={realized_pnl:.3f} USDT{trail_tag}"
                     )
-                    
+
                     # بعد أول TP → Breakeven لو مفعّل
                     if self.profile_cfg["be_after_tp"] and len(self.tp_hit) == 1:
                         if side == "long":
@@ -2663,7 +2723,8 @@ class UltraCouncilAI:
         
         # معايير القرار
         self.min_confidence = 0.6
-        self.min_score = 8
+        # تخفيض الحد الأدنى للسكور من 8 → 7 لزيادة عدد الفرص القوية بدون تخريب الفلاتر الأخرى
+        self.min_score = 7
 
     def _empty_analysis(self):
         """تحليل فارغ عند الخطأ"""
