@@ -1524,7 +1524,7 @@ class TrendAnalyzer:
             tr = pd.concat([
                 (high - low).abs(),
                 (high - close.shift(1)).abs(),
-                (l - close.shift(1)).abs()
+                (low - close.shift(1)).abs()  # ✅ إصلاح: استبدال 'l' بـ 'low'
             ], axis=1).max(axis=1)
 
             if len(tr) >= 20:
@@ -3107,6 +3107,7 @@ class UltraCouncilAI:
         vwap_price = analysis.get("vwap", 0.0)
         rf_info = analysis["rf"]
         current_price = float(df["close"].iloc[-1])
+        confidence = analysis.get("confidence", 0.0)
 
         # 1) TRAP OVERRIDE MODE – دخول قسري لو الفرصة خبيثة جدًا
         if trap_side and trap_q >= 2.5:
@@ -3173,48 +3174,54 @@ class UltraCouncilAI:
                 else:
                     return None, "buy_rejected_sniper_filter", analysis
 
-        # 4) Golden Zone Override
+        # 4) Golden Zone Override — SNIPER مستقل شوية عن باقي الفلاتر
         entry_signal = None
         reason = ""
         golden = analysis.get("golden_zone", {})
 
         if golden.get("valid"):
-            if golden.get("type") == "golden_bottom" and analysis.get("score_buy", 0) >= self.min_score - 2:
-                # 🔫 SNIPER BUY FILTER مع CVD للـ Golden Zone
-                sniper_ok = True
-                if cvd_sig != "bullish":
-                    sniper_ok = False
-                if not (rf_info.get("buy_signal") or rf_info.get("dir", 0) >= 0):
-                    sniper_ok = False
-                if vwap_price and current_price <= vwap_price:
-                    sniper_ok = False
-                if flow_side not in ("BUY", "STRONG_BUY"):
-                    sniper_ok = False
-                
-                if sniper_ok:
+            zone_type  = golden.get("type")
+            score_buy  = float(analysis.get("score_buy", 0) or 0.0)
+            score_sell = float(analysis.get("score_sell", 0) or 0.0)
+
+            # رَخّاوة درجة واحدة: نسمح بالذهبية حتى لو أقل من min_score بشوية
+            min_golden_score = max(self.min_score - 3, 5)
+
+            # فلتر RF / Flow / VWAP / CVD لكن بشكل أخف
+            rf_dir    = rf_info.get("dir", 0)
+            buy_sig   = rf_info.get("buy_signal", False)
+            sell_sig  = rf_info.get("sell_signal", False)
+            vwap_ok_up   = (not vwap_price) or (current_price >= vwap_price * 0.995)
+            vwap_ok_down = (not vwap_price) or (current_price <= vwap_price * 1.005)
+
+            # ===== GOLDEN BOTTOM SNIPER =====
+            if zone_type == "golden_bottom" and score_buy >= min_golden_score:
+                rf_ok   = (rf_dir >= 0) or buy_sig       # RF معانا أو على الأقل مش عكسي
+                flow_ok = flow_side not in ("SELL", "STRONG_SELL")
+                cvd_ok  = (cvd_sig != "bearish")        # ممنوع divergence بيعي قوي
+
+                if rf_ok and flow_ok and vwap_ok_up and cvd_ok:
                     entry_signal = "buy"
                     reason = (
-                        f"ULTRA BUY | Golden Override | "
-                        f"Score: {analysis['score_buy']} | Conf: {analysis['confidence']}"
+                        f"GOLDEN BOTTOM SNIPER | "
+                        f"Score={score_buy:.1f} | Conf={confidence:.1f}"
                     )
-            elif golden.get("type") == "golden_top" and analysis.get("score_sell", 0) >= self.min_score - 2:
-                # 🔫 SNIPER SELL FILTER مع CVD للـ Golden Zone
-                sniper_ok = True
-                if cvd_sig != "bearish":
-                    sniper_ok = False
-                if not (rf_info.get("sell_signal") or rf_info.get("dir", 0) <= 0):
-                    sniper_ok = False
-                if vwap_price and current_price >= vwap_price:
-                    sniper_ok = False
-                if flow_side not in ("SELL", "STRONG_SELL"):
-                    sniper_ok = False
-                
-                if sniper_ok:
+
+            # ===== GOLDEN TOP SNIPER =====
+            elif zone_type == "golden_top" and score_sell >= min_golden_score:
+                rf_ok   = (rf_dir <= 0) or sell_sig
+                flow_ok = flow_side not in ("BUY", "STRONG_BUY")
+                cvd_ok  = (cvd_sig != "bullish")
+
+                if rf_ok and flow_ok and vwap_ok_down and cvd_ok:
                     entry_signal = "sell"
                     reason = (
-                        f"ULTRA SELL | Golden Override | "
-                        f"Score: {analysis['score_sell']} | Conf: {analysis['confidence']}"
+                        f"GOLDEN TOP SNIPER | "
+                        f"Score={score_sell:.1f} | Conf={confidence:.1f}"
                     )
+
+        if entry_signal:
+            return entry_signal, reason, analysis
 
         # 5) القرار العادي مع CVD Filter
         if entry_signal is None:
