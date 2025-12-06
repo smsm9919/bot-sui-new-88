@@ -19,6 +19,7 @@ ULTRA PRO AI BOT - الإصدار المتكامل الذكي المحسن
 • ULTRA PANEL - نظام لوج محترف بالشكل المطلوب
 • ADX+ATR FILTER - فلتر ذكي لمنع الدخول في ترند مجنون
 • AUTO-RECOVERY SYSTEM - استعادة الصفقات بعد إعادة التشغيل
+• EMA HOLD ENGINE - نظام ركوب الترند الذكي مع Hold-TP
 """
 
 import os
@@ -275,6 +276,104 @@ def compute_vwap(df: pd.DataFrame) -> float:
     df["vwap"] = vwap
 
     return float(vwap.iloc[-1])
+
+# =========================
+# EMA TREND / HOLD ENGINE
+# =========================
+
+def compute_ema_trend(df, fast_len=20, slow_len=50, stair_window=20):
+    """
+    قراءة قوة الاتجاه من EMA + سلوك السعر حولها (درج الترند).
+    ترجع:
+      dir: "up" / "down" / "neutral"
+      strength: "strong" / "mid" / "weak"
+      stair_state: "holding" / "broken"
+    """
+    if len(df) < slow_len + 5:
+        return {
+            "ema_fast": None,
+            "ema_slow": None,
+            "dir": "neutral",
+            "strength": "weak",
+            "stair_state": "broken",
+            "score": 0.0,
+        }
+
+    closes = df["close"].astype(float)
+    lows   = df["low"].astype(float)
+    highs  = df["high"].astype(float)
+
+    ema_fast_series = closes.ewm(span=fast_len, adjust=False).mean()
+    ema_slow_series = closes.ewm(span=slow_len, adjust=False).mean()
+
+    ema_fast = float(ema_fast_series.iloc[-1])
+    ema_slow = float(ema_slow_series.iloc[-1])
+    price    = float(closes.iloc[-1])
+
+    # اتجاه EMA
+    if ema_fast > ema_slow * 1.0005:
+        ema_dir = "up"
+    elif ema_fast < ema_slow * 0.9995:
+        ema_dir = "down"
+    else:
+        ema_dir = "neutral"
+
+    # درج الترند: هل التصحيحات تحترم EMA السريعة / البطيئة؟
+    w = min(stair_window, len(df) - 1)
+    recent_lows  = lows.iloc[-w:]
+    recent_highs = highs.iloc[-w:]
+
+    stair_state = "holding"
+    # لو السعر كسر أسفل EMA البطيئة بوضوح أكثر من مرة → كسر درج
+    if ema_dir == "up":
+        if (recent_lows < ema_slow * 0.997).sum() >= 2:
+            stair_state = "broken"
+    elif ema_dir == "down":
+        if (recent_highs > ema_slow * 1.003).sum() >= 2:
+            stair_state = "broken"
+    else:
+        stair_state = "broken"
+
+    # سكورنغ بسيط لقوة الاتجاه
+    score = 0.0
+
+    # علاقة السعر بالـ EMA
+    if ema_dir == "up":
+        if price > ema_fast: score += 1.0
+        if price > ema_slow: score += 1.0
+    elif ema_dir == "down":
+        if price < ema_fast: score += 1.0
+        if price < ema_slow: score += 1.0
+
+    # احترام الدرَج
+    if stair_state == "holding":
+        score += 0.5
+    else:
+        score -= 0.5
+
+    # فرق EMA
+    spread = abs(ema_fast - ema_slow) / max(ema_slow, 1e-9) * 10000  # بالنِّقاط
+    if spread >= 8:
+        score += 0.5
+    if spread >= 15:
+        score += 0.5
+
+    # تحويل score إلى strength نصي
+    if score >= 2.0:
+        strength = "strong"
+    elif score >= 0.8:
+        strength = "mid"
+    else:
+        strength = "weak"
+
+    return {
+        "ema_fast": ema_fast,
+        "ema_slow": ema_slow,
+        "dir": ema_dir,
+        "strength": strength,      # strong / mid / weak
+        "stair_state": stair_state,
+        "score": float(score),
+    }
 
 # =========================
 # ULTRA MARKET STRUCTURE ENGINE
@@ -646,8 +745,8 @@ class OrderFlowEngine:
         near_buy_vol = 0.0
         near_sell_vol = 0.0
         max_buy_level = None
-        max_sell_level = None
         max_buy_vol = 0.0
+        max_sell_level = None
         max_sell_vol = 0.0
 
         for price, vol in bids:
@@ -841,30 +940,141 @@ PROFIT_PROFILES = {
     },
 }
 
+# ============================================
+#  TREND POWER BUCKET HELPER
+# ============================================
+
+def _trend_power_bucket(analysis):
+    """
+    تصنيف قوة الترند:
+      weak  → رجّح سكالب
+      mid   → 2TP
+      strong→ 3TP / ترند كامل
+    يعتمد على:
+      - ADX + DI
+      - Trend strength الداخلي (لو موجود)
+      - EMA Trend / Stair Hold
+      - Confidence
+    """
+    trend = (analysis.get("trend") or {})
+    adx = float(trend.get("adx", 0.0))
+    strength_num = float(trend.get("strength", 0.0))
+    di_plus = float(trend.get("di_plus", 0.0))
+    di_minus = float(trend.get("di_minus", 0.0))
+    conf = float(analysis.get("confidence", 0.0))
+
+    ema = (analysis.get("ema_trend") or {})
+    ema_dir = ema.get("dir", "neutral")
+    ema_strength = ema.get("strength", "weak")
+    stair_state = ema.get("stair_state", "broken")
+
+    di_spread = abs(di_plus - di_minus)
+
+    score = 0.0
+
+    # ADX + DI
+    if adx >= 18:
+        score += 1.0
+    if adx >= 25:
+        score += 1.0
+    if di_spread >= 10:
+        score += 0.5
+    if di_spread >= 18:
+        score += 0.5
+
+    # Strength العددي من TrendAnalyzer (لو موجود)
+    if strength_num >= 6:
+        score += 1.0
+    if strength_num >= 8:
+        score += 0.5
+
+    # ثقة المجلس ترفع/تنزل شوية
+    if conf >= 6:
+        score += 0.5
+    if conf >= 8:
+        score += 0.5
+
+    # EMA Trend + Stair
+    if ema_dir in ("up", "down"):
+        score += 0.5
+    if ema_strength == "strong":
+        score += 1.0
+    elif ema_strength == "mid":
+        score += 0.5
+
+    if stair_state == "holding":
+        score += 0.5
+    elif stair_state == "broken":
+        score -= 0.5
+
+    if score >= 3.0:
+        return "strong"
+    if score >= 1.5:
+        return "mid"
+    return "weak"
+
+
 def select_profit_profile(trade_mode, analysis):
-    """اختيار الـ Profile المناسب بناءً على تحليل السوق"""
+    """
+    اختيار الـ Profile المناسب بناءً على:
+      - Edge RR + tp_profile (لو موجود)
+      - Golden Zone / Trap
+      - قوة الترند (ADX + DI + strength)
+      - Confidence
+    """
     rr = float(analysis.get("edge_rr", 1.0))
-    if analysis.get("edge_setup") and analysis["edge_setup"].get("valid"):
-        rr = float(analysis["edge_setup"].get("rr1", 1.0))
-    
+    edge = analysis.get("edge_setup") or {}
+    if edge.get("valid"):
+        rr = float(edge.get("rr1", rr))
+
     adx = float(analysis.get("trend", {}).get("adx", 0.0))
     conf = float(analysis.get("confidence", 0.0))
     stop_q = float(analysis.get("stop_hunt_trap_quality", 0.0))
     golden = analysis.get("golden_zone", {}).get("type")
+    trend_bucket = _trend_power_bucket(analysis)
 
-    # 1) صفقات Trap مع ترند + Stop-Hunt قوي
-    if trade_mode == "TRAP" and stop_q >= 3.0:
+    # 0) Edge Algo tp_profile لو موجود → أولوية
+    edge_tp = None
+    if edge.get("valid"):
+        edge_tp = edge.get("tp_profile")
+
+    # 1) TRAP قوي → TRAP_TREND
+    if trade_mode == "TRAP" and stop_q >= 3.0 and adx >= 20:
         return "TRAP_TREND"
 
-    # 2) Golden / Trend قوي / RR عالي ⇒ ترند كامل
-    if golden in ("golden_bottom", "golden_top") or adx >= 28 or rr >= 2.0 or conf >= 7.0:
+    # 2) Golden Zone مؤكدة مع ترند محترم → FULL_TREND
+    if golden in ("golden_bottom", "golden_top") and (adx >= 20 or conf >= 6.0):
         return "FULL_TREND"
 
-    # 3) صفقات عادية RR متوسط
+    # 3) Edge Algo يقترح خطة TP جاهزة
+    if edge_tp == "TREND_3TP":
+        return "FULL_TREND"
+    if edge_tp == "MID_2TP":
+        return "MID_TREND"
+    if edge_tp == "SCALP_STRICT":
+        # نخليه أضعف حالة، هنستخدمه لما كل حاجة تكون متوسطة/ضعيفة
+        base_profile = "SCALP_STRICT"
+    else:
+        base_profile = None
+
+    # 4) ترند قوي + RR محترم → FULL_TREND (3TP + Trail)
+    if trend_bucket == "strong" and (rr >= 1.5 or adx >= 28 or conf >= 7.0):
+        return "FULL_TREND"
+
+    # 5) ترند متوسط / سوق نص ترند → MID_TREND (2TP)
+    if trend_bucket == "mid" and (rr >= 1.2 or adx >= 20 or conf >= 5.0):
+        return "MID_TREND"
+
+    # 6) لو Edge قال سكالب صريح → SCALP_STRICT
+    if base_profile == "SCALP_STRICT":
+        return "SCALP_STRICT"
+
+    # 7) fallback:
+    #    - RR كويس بس الترند مش قوي جدًا → MID_TREND
+    #    - الباقي → SCALP_STRICT (حماية)
     if rr >= 1.3 and (18 <= adx <= 28 or conf >= 5.0):
         return "MID_TREND"
 
-    # 4) الباقي ⇒ SCALP_STRICT
     return "SCALP_STRICT"
 
 # ============================================
@@ -1034,12 +1244,24 @@ def log_ultra_panel(analysis: dict, state: dict):
 
     # 10) SMC addons / FVG / Golden
     golden = a.get("golden_zone", {})
+    ema_trend = a.get("ema_trend", {})
+    profile = state.get("profit_profile", "N/A")
+    trend_bucket = _trend_power_bucket(a)
+    
     log_i(
         f"🧠 ENHANCED SMC ADDONS | "
         f"FVG_real={fvg_ctx.get('real',False) if fvg_ctx else False} | "
         f"Golden={golden.get('type', 'None')} "
         f"| Trap={a.get('stop_hunt_trap_side', 'None')} "
         f"Q={a.get('stop_hunt_trap_quality',0):.1f}"
+    )
+    
+    # 11) PROFIT PROFILE + EMA TREND INFO
+    log_i(
+        f"📊 PROFIT_PROFILE={profile} | "
+        f"trend={trend_bucket} | rr={a.get('edge_rr', 0):.1f} | "
+        f"adx={adx:.1f} | conf={a.get('confidence', 0):.1f} | "
+        f"EMA={ema_trend.get('dir', 'neutral')}/{ema_trend.get('strength', 'weak')}"
     )
 
 # ============================================
@@ -1082,6 +1304,7 @@ def log_banner():
     print(colored("  • VWAP Engine - Fair Value Axis", "yellow"))
     print(colored("  • Ultra Market Structure Engine", "yellow"))
     print(colored("  • AUTO-RECOVERY SYSTEM - استعادة الصفقات بعد الإعادة", "yellow"))
+    print(colored("  • EMA HOLD ENGINE - نظام ركوب الترند الذكي مع Hold-TP", "yellow"))
 
     print("="*80)
     print(colored("🚀 INITIALIZING ULTRA PRO AI ENGINE...", "cyan", attrs=["bold"]))
@@ -1524,7 +1747,7 @@ class TrendAnalyzer:
             tr = pd.concat([
                 (high - low).abs(),
                 (high - close.shift(1)).abs(),
-                (low - close.shift(1)).abs()  # ✅ إصلاح: استبدال 'l' بـ 'low'
+                (low - close.shift(1)).abs()
             ], axis=1).max(axis=1)
 
             if len(tr) >= 20:
@@ -1926,11 +2149,11 @@ class StopHuntDetector:
         return active_zones
 
 # ============================================
-#  PROFIT ENGINE - نظام جني الأرباح الذكي
+#  PROFIT ENGINE - نظام جني الأرباح الذكي مع Hold-TP
 # ============================================
 
 class ProfitEngine:
-    """محرك جني الأرباح والوقف المتحرك الذكي"""
+    """محرك جني الأرباح والوقف المتحرك الذكي مع Hold-TP"""
     
     def __init__(self, exchange, state):
         self.exchange = exchange
@@ -1948,94 +2171,120 @@ class ProfitEngine:
         self.sl_price = None
         self.trail_active = False
         self.trail_price = None
-
-        # سياق إضافي لـ Hold-TP
-        self.confidence = 0.0          # من مجلس الإدارة (0 → 1)
-        self.trend_adx = 0.0           # ADX وقت الدخول
-        self.base_tp_rr = []           # الـ R الأصلية للـ TP
-        self.hold_tp_factor = 1.0      # مضاعِف TP3 في FULL_TREND
-
+    
     def init_trade(self, side, entry_price, atr_value, trade_mode, analysis):
-        """تهيئة الصفقة مع تحديد الـ Profile المناسب"""
+        """تهيئة الصفقة مع تحديد الـ Profile المناسب + Boost ذكي للـ TP"""
         self.side = side  # "long" / "short"
         self.entry_price = float(entry_price)
         self.atr_entry = float(atr_value)
         
-        # اختيار الـ Profile المناسب
+        # 1) اختيار الـ Profile الأساسي
         self.profile_name = select_profit_profile(trade_mode, analysis)
         self.profile_cfg = PROFIT_PROFILES[self.profile_name]
-
-        # قراءة الثقة + ADX من التحليل
-        self.confidence = float(analysis.get("confidence", 0.0))
-        trend_ctx = analysis.get("trend", {}) or {}
-        self.trend_adx = float(trend_ctx.get("adx", 0.0))
-
-        # حفظ R الأصلية للـ TP
-        self.base_tp_rr = list(self.profile_cfg.get("tp_levels_rr", []))
-        self.hold_tp_factor = 1.0
-
-        # منطق Hold-TP الذكي:
-        # في FULL_TREND فقط نرفع TP3 لو:
-        # - الثقة عالية
-        # - ADX قوي (ترند مجنون)
-        if self.profile_name == "FULL_TREND" and self.base_tp_rr:
-            conf = self.confidence          # 0 → 1
-            adx = self.trend_adx            # قيمة ADX الحقيقية
-
-            if conf >= 0.75 and adx >= 28:
-                self.hold_tp_factor = 1.20  # Boost محترم
-            if conf >= 0.90 and adx >= 35:
-                self.hold_tp_factor = 1.40  # ترند مجنون → نركب زيادة
-
-        direction = 1 if side == "long" else -1
         
-        # 1) ستوب مبدئي (قائم على R)
+        direction = 1 if side == "long" else -1
+
+        # 2) ستوب مبدئي (قائم على R)
         hard_sl_rr = self.profile_cfg["hard_sl_rr"]
         sl_dist = abs(hard_sl_rr) * self.atr_entry
         if side == "long":
             self.sl_price = self.entry_price - sl_dist
         else:
             self.sl_price = self.entry_price + sl_dist
-        
-        # 2) حساب مستويات TP بالسعر مع Hold-TP على TP3 في FULL_TREND
+
+        # 3) حساب Boost للـ TP (Hold-TP في الترند المجنون)
+        trend = (analysis.get("trend") or {})
+        adx = float(trend.get("adx", 0.0))
+        conf = float(analysis.get("confidence", 0.0))
+        edge = analysis.get("edge_setup") or {}
+        edge_rr = float(analysis.get("edge_rr", 1.0))
+        if edge.get("valid"):
+            edge_rr = float(edge.get("rr1", edge_rr))
+
+        ema = (analysis.get("ema_trend") or {})
+        ema_dir = ema.get("dir", "neutral")
+        ema_strength = ema.get("strength", "weak")
+
+        base_rrs = list(self.profile_cfg["tp_levels_rr"])
+        boost_mult = 1.0
+
+        # نفس اتجاه EMA؟
+        same_dir_ema = (
+            (ema_dir == "up" and side == "long") or
+            (ema_dir == "down" and side == "short")
+        )
+
+        if self.profile_name in ("FULL_TREND", "TRAP_TREND"):
+            # ترند مجنون → نسيب الصفقة تشم نفس أطول (Hold-TP)
+            if adx >= 32 and conf >= 7.5 and same_dir_ema and ema_strength == "strong":
+                boost_mult = 1.40
+            elif adx >= 28 and conf >= 6.5 and same_dir_ema:
+                boost_mult = 1.30
+            elif adx >= 24 and conf >= 6.0:
+                boost_mult = 1.15
+        elif self.profile_name == "MID_TREND":
+            if adx >= 24 and conf >= 6.0:
+                boost_mult = 1.15
+            elif adx >= 20 and conf >= 5.0:
+                boost_mult = 1.05
+        elif self.profile_name == "SCALP_STRICT":
+            # سكالب ضعيف → نقرب الهدف لحماية الربح
+            if conf < 4.0 or adx < 15:
+                boost_mult = 0.85
+
+        # Edge RR عالي جدًا → نسمح بزيادة بسيطة
+        if edge_rr >= 2.0 and self.profile_name in ("FULL_TREND", "TRAP_TREND"):
+            boost_mult = max(boost_mult, 1.20)
+
+        boosted_rrs = []
+        for i, rr in enumerate(base_rrs):
+            rr_boosted = rr * boost_mult
+            # ما ننزلش TP1 عن 0.6R أبداً
+            if i == 0:
+                rr_boosted = max(0.6, rr_boosted)
+            boosted_rrs.append(rr_boosted)
+
+        # 4) حساب مستويات TP بالسعر (بعد الـ Boost)
         self.tp_levels = []
         self.tp_hit = set()
-
-        rr_levels = list(self.base_tp_rr)
-        if self.profile_name == "FULL_TREND" and len(rr_levels) >= 3 and self.hold_tp_factor > 1.0:
-            # رفع TP3 فقط
-            rr_levels[-1] = rr_levels[-1] * self.hold_tp_factor
-
-        for i, (rr, frac) in enumerate(zip(rr_levels, self.profile_cfg["tp_fracs"])):
+        for i, (rr, frac) in enumerate(zip(boosted_rrs, self.profile_cfg["tp_fracs"])):
             dist = rr * self.atr_entry
             price = self.entry_price + direction * dist
             label = f"TP{i+1}_{self.profile_name}"
             self.tp_levels.append((price, frac, label))
         
+        # 5) Trail config زي ما هو (التحريك فعليًا في on_tick)
         self.trail_active = False
         self.trail_price = None
         
         # تحديث state
         self.state["profit_profile"] = self.profile_name
         self.state["profit_engine_active"] = True
-        self.state["hold_tp_active"] = bool(self.hold_tp_factor > 1.0)
-        self.state["hold_tp_factor"] = self.hold_tp_factor
-        self.state["analysis_confidence"] = self.confidence
-        self.state["analysis_adx"] = self.trend_adx
         
-        # لوج الخطة + وضع Hold-TP
+        # Log خطة جني الأرباح بعد الـ Boost
+        try:
+            tp_preview = [(round(p, 6), f"{f*100:.0f}%") for p, f, _ in self.tp_levels]
+        except Exception:
+            tp_preview = []
+
+        boost_note = ""
+        if abs(boost_mult - 1.0) > 0.01:
+            boost_note = f" | TP_boost×{boost_mult:.2f}"
+
         log_i(
             f"🎯 PROFIT PLAN [{self.profile_name}] | "
             f"side={side} | entry={self.entry_price:.6f} | "
             f"ATR={self.atr_entry:.6f} | SL={self.sl_price:.6f} | "
-            f"TPs={[(round(p,6), f'{f*100:.0f}%') for p,f,_ in self.tp_levels]}"
+            f"TPs={tp_preview}{boost_note}"
         )
 
-        if self.profile_name == "FULL_TREND":
-            log_i(
-                f"📊 HOLD-TP MODE | conf={self.confidence:.2f} | ADX={self.trend_adx:.1f} | "
-                f"factor={self.hold_tp_factor:.2f} (TP3 boosted في الترند القوي)"
-            )
+        # لوج إضافي يوضح سبب التصنيف
+        trend_bucket = _trend_power_bucket(analysis)
+        log_i(
+            f"📊 PROFILE_SELECTION | trend={trend_bucket} | "
+            f"adx={adx:.1f} | conf={conf:.1f} | ema={ema_dir}/{ema_strength} | "
+            f"edge_rr={edge_rr:.1f}"
+        )
     
     def calculate_atr(self, df, period=14):
         """حساب ATR من الـ DataFrame"""
@@ -2784,6 +3033,12 @@ class UltraCouncilAI:
             "cvd_divergence": {
                 "signal": None,
             },
+            "ema_trend": {
+                "dir": "neutral",
+                "strength": "weak",
+                "stair_state": "broken",
+                "score": 0.0,
+            },
         }
 
     def build_context(self, df, current_price, stop_hunt_info, fvg_ctx, liquidity_zones):
@@ -2839,6 +3094,9 @@ class UltraCouncilAI:
             
             # Ultra Market Structure context
             ultra_ms_ctx = self.ultra_ms.analyze(df)
+            
+            # EMA Trend / Hold Engine
+            ema_trend = compute_ema_trend(df)
             
             # OrderFlow / Bookmap context
             orderflow_ctx = {}
@@ -2945,6 +3203,22 @@ class UltraCouncilAI:
             if liq_ctx.get("grab_down"):
                 score_buy += 1.0
                 signals.append("💦 Liquidity Grab DOWN")
+
+            # ===== EMA TREND CONTRIBUTION =====
+            if ema_trend["dir"] == "up":
+                score_buy += 1.0
+                signals.append(f"📈 EMA Uptrend ({ema_trend['strength']})")
+            elif ema_trend["dir"] == "down":
+                score_sell += 1.0
+                signals.append(f"📉 EMA Downtrend ({ema_trend['strength']})")
+            
+            if ema_trend["stair_state"] == "holding":
+                if ema_trend["dir"] == "up":
+                    score_buy += 0.5
+                    signals.append("🧱 EMA Stair Holding (Bullish)")
+                elif ema_trend["dir"] == "down":
+                    score_sell += 0.5
+                    signals.append("🧱 EMA Stair Holding (Bearish)")
 
             # 1. الستوب هانت والسيولة
             self.stop_hunt_detector.detect_swings(df)
@@ -3080,7 +3354,8 @@ class UltraCouncilAI:
                     "abs_bear": False
                 },
                 "orderflow": orderflow_ctx,
-                "cvd_divergence": analysis_result["cvd_divergence"]
+                "cvd_divergence": analysis_result["cvd_divergence"],
+                "ema_trend": ema_trend,
             }
             
         except Exception as e:
@@ -3298,7 +3573,7 @@ class UltraProAIBot:
         log_g(f"🔹 Risk Allocation: {RISK_ALLOC*100}%")
         log_g(f"🔹 Mode: {'LIVE' if MODE_LIVE else 'PAPER'} {'(DRY RUN)' if DRY_RUN else ''}")
         log_g(f"🔹 Web Service: http://0.0.0.0:{PORT}")
-        log_g("🔹 FEATURES: RF Real + EdgeAlgo + SMC + Golden Zones + Trap Mode + Stop-Hunt Prediction + SMART PROFIT ENGINE + Web Service + ULTRA PANEL + ADX+ATR FILTER + VWAP + Ultra Market Structure + AUTO-RECOVERY SYSTEM")
+        log_g("🔹 FEATURES: RF Real + EdgeAlgo + SMC + Golden Zones + Trap Mode + Stop-Hunt Prediction + SMART PROFIT ENGINE + Web Service + ULTRA PANEL + ADX+ATR FILTER + VWAP + Ultra Market Structure + AUTO-RECOVERY SYSTEM + EMA HOLD ENGINE")
         
         balance_now = self.exchange.get_balance()
         log_equity_snapshot(balance_now, self.state["compound_pnl"])
