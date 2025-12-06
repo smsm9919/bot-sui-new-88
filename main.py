@@ -4,7 +4,7 @@ ULTRA PRO AI BOT - الإصدار المتكامل الذكي المحسن
 • نظام كشف وتصنيف مناطق ضرب الستوبات (Stop Hunt Zones)
 • تمييز FVG الحقيقي من الوهمي + كشف مصائد السيولة  
 • مجلس الإدارة الفائق الذكي مع 20 استراتيجية متقدمة
-• نظام ركوب الترند الذكي المحترف + RF الحقيقي
+• نظام ركود الترند الذكي المحترف + RF الحقيقي
 • إدارة صفقات ذكية متكيفة مع قوة الترند + Edge Algo
 • Multi-Exchange Support: BingX & Bybit
 • SMART PROFIT AI - نظام جني الأرباح الذكي المتقدم
@@ -1241,6 +1241,7 @@ def log_ultra_panel(analysis: dict, state: dict):
 
     # قيم افتراضية عشان ما يضربش لو حاجة ناقصة
     trend     = a.get("trend", {})
+    adx = trend.get("adx", 0.0)  # تعريف المتغير adx هنا
     smc_ctx   = a.get("smc_ctx", {})
     fvg_ctx   = a.get("fvg_analysis", {})
     edge      = a.get("edge_setup", {})
@@ -1303,7 +1304,7 @@ def log_ultra_panel(analysis: dict, state: dict):
         f"Council BUY({a.get('score_buy',0):.1f}) "
         f"SELL({a.get('score_sell',0):.1f}) | "
         f"RSI={trend.get('rsi', 0):.1f} | "
-        f"ADX={trend.get('adx', 0):.1f} "
+        f"ADX={adx:.1f} "
         f"DI+={trend.get('di_plus', 0):.1f} DI-={trend.get('di_minus', 0):.1f}"
     )
 
@@ -1338,7 +1339,7 @@ def log_ultra_panel(analysis: dict, state: dict):
         f"🎯 SNAP | {votes_side} | "
         f"votes={max(a.get('score_buy',0), a.get('score_sell',0)):.0f}/{votes_total:.0f} "
         f"score={a.get('confidence',0):.1f} | "
-        f"ADX={trend.get('adx',0):.1f} "
+        f"ADX={adx:.1f} "
         f"DI={trend.get('di_plus',0)-trend.get('di_minus',0):.1f}"
     )
 
