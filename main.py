@@ -20,6 +20,7 @@ ULTRA PRO AI BOT - الإصدار المتكامل الذكي المحسن
 • ADX+ATR FILTER - فلتر ذكي لمنع الدخول في ترند مجنون
 • AUTO-RECOVERY SYSTEM - استعادة الصفقات بعد إعادة التشغيل
 • EMA HOLD ENGINE - نظام ركوب الترند الذكي مع Hold-TP
+• EMA CROSS CLASSIFIER - نظام تصنيف تقاطع EMA القوي/الضعيف
 """
 
 import os
@@ -374,6 +375,87 @@ def compute_ema_trend(df, fast_len=20, slow_len=50, stair_window=20):
         "stair_state": stair_state,
         "score": float(score),
     }
+
+# ================= EMA CROSS CLASSIFIER =================
+
+def classify_ema_crossover(df: pd.DataFrame, fast: int = 20, slow: int = 50, lookback: int = 4) -> dict:
+    """
+    تصنيف تقاطع EMA إلى:
+      - strong_bull / weak_bull
+      - strong_bear / weak_bear
+      - none
+    يعتمد على:
+      1) وجود تقاطع حقيقي بين EMA السريع والبطيء
+      2) زاوية الحركة (سرعة تحرك EMA السريع مقابل البطيء)
+      3) موضع السعر بالنسبة للمتوسطين بعد التقاطع
+    """
+    try:
+        if len(df) < slow + lookback + 2:
+            return {
+                "label": "none",
+                "side": None,
+                "strength": None,
+                "fast": None,
+                "slow": None,
+            }
+
+        closes = df["close"].astype(float)
+        ema_fast = closes.ewm(span=fast, adjust=False).mean()
+        ema_slow = closes.ewm(span=slow, adjust=False).mean()
+
+        f_prev, f_now = float(ema_fast.iloc[-2]), float(ema_fast.iloc[-1])
+        s_prev, s_now = float(ema_slow.iloc[-2]), float(ema_slow.iloc[-1])
+
+        crossed_up = (f_prev <= s_prev) and (f_now > s_now)
+        crossed_down = (f_prev >= s_prev) and (f_now < s_now)
+
+        if not (crossed_up or crossed_down):
+            return {
+                "label": "none",
+                "side": None,
+                "strength": None,
+                "fast": f_now,
+                "slow": s_now,
+            }
+
+        side = "bull" if crossed_up else "bear"
+
+        # زاوية الحركة: EMA السريع لازم يتحرك أسرع من البطيء
+        f_old = float(ema_fast.iloc[-1 - lookback])
+        s_old = float(ema_slow.iloc[-1 - lookback])
+        fast_slope = abs(f_now - f_old)
+        slow_slope = abs(s_now - s_old)
+        slope_ratio = fast_slope / (slow_slope + 1e-9)
+
+        price = float(closes.iloc[-1])
+
+        # موضع السعر بعد التقاطع
+        if side == "bull":
+            price_ok = (price > f_now) and (price > s_now)
+        else:
+            price_ok = (price < f_now) and (price < s_now)
+
+        is_strong = (slope_ratio >= 1.3) and price_ok
+
+        strength = "strong" if is_strong else "weak"
+        label = f"{strength}_{side}"
+
+        return {
+            "label": label,
+            "side": side,          # bull / bear
+            "strength": strength,  # strong / weak
+            "fast": f_now,
+            "slow": s_now,
+        }
+    except Exception:
+        # في حالة أي خطأ نرجع none آمنة
+        return {
+            "label": "none",
+            "side": None,
+            "strength": None,
+            "fast": None,
+            "slow": None,
+        }
 
 # =========================
 # ULTRA MARKET STRUCTURE ENGINE
@@ -954,6 +1036,7 @@ def _trend_power_bucket(analysis):
       - ADX + DI
       - Trend strength الداخلي (لو موجود)
       - EMA Trend / Stair Hold
+      - EMA Cross القوي
       - Confidence
     """
     trend = (analysis.get("trend") or {})
@@ -967,6 +1050,11 @@ def _trend_power_bucket(analysis):
     ema_dir = ema.get("dir", "neutral")
     ema_strength = ema.get("strength", "weak")
     stair_state = ema.get("stair_state", "broken")
+    
+    # معلومات التقاطع الجديدة
+    ema_cross = analysis.get("ema_cross", {})
+    ema_cross_label = ema_cross.get("label", "none")
+    ema_cross_strength = ema_cross.get("strength")
 
     di_spread = abs(di_plus - di_minus)
 
@@ -1006,6 +1094,12 @@ def _trend_power_bucket(analysis):
         score += 0.5
     elif stair_state == "broken":
         score -= 0.5
+        
+    # إضافة نقاط إضافية لتقاطع EMA القوي
+    if ema_cross_strength == "strong":
+        score += 1.5
+    elif ema_cross_strength == "weak":
+        score += 0.5
 
     if score >= 3.0:
         return "strong"
@@ -1020,6 +1114,7 @@ def select_profit_profile(trade_mode, analysis):
       - Edge RR + tp_profile (لو موجود)
       - Golden Zone / Trap
       - قوة الترند (ADX + DI + strength)
+      - EMA Cross القوي
       - Confidence
     """
     rr = float(analysis.get("edge_rr", 1.0))
@@ -1032,6 +1127,11 @@ def select_profit_profile(trade_mode, analysis):
     stop_q = float(analysis.get("stop_hunt_trap_quality", 0.0))
     golden = analysis.get("golden_zone", {}).get("type")
     trend_bucket = _trend_power_bucket(analysis)
+    
+    # معلومات التقاطع الجديدة
+    ema_cross = analysis.get("ema_cross", {})
+    ema_cross_label = ema_cross.get("label", "none")
+    ema_cross_strength = ema_cross.get("strength")
 
     # 0) Edge Algo tp_profile لو موجود → أولوية
     edge_tp = None
@@ -1057,19 +1157,28 @@ def select_profit_profile(trade_mode, analysis):
     else:
         base_profile = None
 
-    # 4) ترند قوي + RR محترم → FULL_TREND (3TP + Trail)
+    # 4) تقاطع EMA قوي → FULL_TREND أو MID_TREND بناءً على قوة التقاطع
+    if ema_cross_strength == "strong":
+        if "bull" in ema_cross_label and rr >= 1.5:
+            return "FULL_TREND"
+        elif "bear" in ema_cross_label and rr >= 1.5:
+            return "FULL_TREND"
+        elif rr >= 1.2:
+            return "MID_TREND"
+
+    # 5) ترند قوي + RR محترم → FULL_TREND (3TP + Trail)
     if trend_bucket == "strong" and (rr >= 1.5 or adx >= 28 or conf >= 7.0):
         return "FULL_TREND"
 
-    # 5) ترند متوسط / سوق نص ترند → MID_TREND (2TP)
+    # 6) ترند متوسط / سوق نص ترند → MID_TREND (2TP)
     if trend_bucket == "mid" and (rr >= 1.2 or adx >= 20 or conf >= 5.0):
         return "MID_TREND"
 
-    # 6) لو Edge قال سكالب صريح → SCALP_STRICT
+    # 7) لو Edge قال سكالب صريح → SCALP_STRICT
     if base_profile == "SCALP_STRICT":
         return "SCALP_STRICT"
 
-    # 7) fallback:
+    # 8) fallback:
     #    - RR كويس بس الترند مش قوي جدًا → MID_TREND
     #    - الباقي → SCALP_STRICT (حماية)
     if rr >= 1.3 and (18 <= adx <= 28 or conf >= 5.0):
@@ -1263,6 +1372,14 @@ def log_ultra_panel(analysis: dict, state: dict):
         f"adx={adx:.1f} | conf={a.get('confidence', 0):.1f} | "
         f"EMA={ema_trend.get('dir', 'neutral')}/{ema_trend.get('strength', 'weak')}"
     )
+    
+    # 12) EMA CROSS INFO
+    ema_cross = a.get("ema_cross", {})
+    log_i(
+        f"📊 EMA CROSS: {ema_cross.get('label', 'none')} | "
+        f"side={ema_cross.get('side', 'none')} | "
+        f"strength={ema_cross.get('strength', 'none')}"
+    )
 
 # ============================================
 #  BOOT BANNER SYSTEM
@@ -1305,6 +1422,7 @@ def log_banner():
     print(colored("  • Ultra Market Structure Engine", "yellow"))
     print(colored("  • AUTO-RECOVERY SYSTEM - استعادة الصفقات بعد الإعادة", "yellow"))
     print(colored("  • EMA HOLD ENGINE - نظام ركوب الترند الذكي مع Hold-TP", "yellow"))
+    print(colored("  • EMA CROSS CLASSIFIER - Strong/Weak Crossover Detection", "yellow"))
 
     print("="*80)
     print(colored("🚀 INITIALIZING ULTRA PRO AI ENGINE...", "cyan", attrs=["bold"]))
@@ -3039,6 +3157,13 @@ class UltraCouncilAI:
                 "stair_state": "broken",
                 "score": 0.0,
             },
+            "ema_cross": {
+                "label": "none",
+                "side": None,
+                "strength": None,
+                "fast": None,
+                "slow": None,
+            },
         }
 
     def build_context(self, df, current_price, stop_hunt_info, fvg_ctx, liquidity_zones):
@@ -3270,6 +3395,36 @@ class UltraCouncilAI:
                 score_sell += 1.0
                 signals.append("💥 Negative Momentum")
 
+            # ===== EMA CROSS CONTRIBUTION (STRONG vs WEAK) =====
+            ema_cross = classify_ema_crossover(df)
+
+            if ema_cross["label"] != "none":
+                side = ema_cross["side"]
+                strength = ema_cross["strength"]
+
+                if side == "bull":
+                    if strength == "strong":
+                        score_buy += 1.5
+                        signals.append("📈 EMA Strong Bullish Cross")
+                    else:
+                        score_buy += 0.5
+                        signals.append("📈 EMA Weak Bullish Cross")
+                elif side == "bear":
+                    if strength == "strong":
+                        score_sell += 1.5
+                        signals.append("📉 EMA Strong Bearish Cross")
+                    else:
+                        score_sell += 0.5
+                        signals.append("📉 EMA Weak Bearish Cross")
+            else:
+                ema_cross = {
+                    "label": "none",
+                    "side": None,
+                    "strength": None,
+                    "fast": None,
+                    "slow": None,
+                }
+
             # 4. Edge Algo Setup
             edge_side = None
             if score_buy > score_sell:
@@ -3356,6 +3511,7 @@ class UltraCouncilAI:
                 "orderflow": orderflow_ctx,
                 "cvd_divergence": analysis_result["cvd_divergence"],
                 "ema_trend": ema_trend,
+                "ema_cross": ema_cross,
             }
             
         except Exception as e:
@@ -3573,7 +3729,7 @@ class UltraProAIBot:
         log_g(f"🔹 Risk Allocation: {RISK_ALLOC*100}%")
         log_g(f"🔹 Mode: {'LIVE' if MODE_LIVE else 'PAPER'} {'(DRY RUN)' if DRY_RUN else ''}")
         log_g(f"🔹 Web Service: http://0.0.0.0:{PORT}")
-        log_g("🔹 FEATURES: RF Real + EdgeAlgo + SMC + Golden Zones + Trap Mode + Stop-Hunt Prediction + SMART PROFIT ENGINE + Web Service + ULTRA PANEL + ADX+ATR FILTER + VWAP + Ultra Market Structure + AUTO-RECOVERY SYSTEM + EMA HOLD ENGINE")
+        log_g("🔹 FEATURES: RF Real + EdgeAlgo + SMC + Golden Zones + Trap Mode + Stop-Hunt Prediction + SMART PROFIT ENGINE + Web Service + ULTRA PANEL + ADX+ATR FILTER + VWAP + Ultra Market Structure + AUTO-RECOVERY SYSTEM + EMA HOLD ENGINE + EMA CROSS CLASSIFIER")
         
         balance_now = self.exchange.get_balance()
         log_equity_snapshot(balance_now, self.state["compound_pnl"])
