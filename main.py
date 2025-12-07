@@ -587,7 +587,15 @@ def evaluate_box_quality(df, box_ctx, vwap_price=None):
     in_box_mask = (df["low"].astype(float) >= box.low) & (df["high"].astype(float) <= box.high)
     box_vol = vol_arr[in_box_mask.values].sum() if in_box_mask.any() else 0.0
     vol_ma = df["volume"].rolling(30).mean().iloc[-1]
-    vol_ratio = (box_vol / (vol_ma * max(in_box_mask.sum(), 1))) if vol_ma else 1.0
+    
+    # حساب vol_ratio بأمان
+    if vol_ma:
+        vol_ratio = (box_vol / (vol_ma * max(in_box_mask.sum(), 1)))
+        vol_ratio_display = round(float(vol_ratio), 2)
+    else:
+        vol_ratio = 1.0
+        vol_ratio_display = 1.0
+    
     vol_score = 0.0
     if vol_ratio > 1.2:
         vol_score = 2.0
@@ -617,11 +625,11 @@ def evaluate_box_quality(df, box_ctx, vwap_price=None):
         tier = "weak"
 
     return {
-        "score": round(float(total),2),
+        "score": round(float(total), 2),
         "tier": tier,
         "height_bps": height_bps,
-        "vol_ratio": round(float(vol_ratio),2) if vol_ma else None,
-        "why": f"h={height_bps:.1f}bps touches={box.touches} vol_ratio={vol_ratio:.2f if vol_ma else 1.0}"
+        "vol_ratio": vol_ratio_display,
+        "why": f"h={height_bps:.1f}bps touches={box.touches} vol_ratio={vol_ratio_display}"
     }
 
 
@@ -4436,7 +4444,7 @@ def trade_loop_enhanced_with_smart_patch():
                     
                     # اكتشاف الانضغاط (الضغط قبل الاختراق)
                     range_5 = df['high'].astype(float).tail(5).max() - df['low'].astype(float).tail(5).min()
-                    range_10 = df['high'].astype(float).tail(10).max() - df['low'].astype(float).tail(10).min()
+                    range_10 = df['high'].ast(float).tail(10).max() - df['low'].astype(float).tail(10).min()
                     compression_ratio = range_5 / range_10 if range_10 > 0 else 1.0
                     is_compressed = compression_ratio < 0.5
                     
@@ -5019,7 +5027,8 @@ def pretty_snapshot(bal, info, ind, spread_bps, reason=None, df=None):
         print(colored(f"   {bal_line}", "yellow"))
         if STATE["open"]:
             lamp='🟩 LONG' if STATE['side']=='long' else '🟥 SHORT'
-            print(f"   {lamp}  Entry={fmt(STATE['entry'])}  Qty={fmt(STATE['qty'],4)}  Bars={STATE['bars']}  Trail={fmt(STATE['trail'])}  BE={fmt(STATE['breakeven'])}")
+            print(f"   {lamp}  Entry={fmt(STATE['entry'])}  Qty={fmt(STATE['qty'],4)}")
+print(f"   {lamp}  Entry={fmt(STATE['entry'])}  Qty={fmt(STATE['qty'],4)}  Bars={STATE['bars']}  Trail={fmt(STATE['trail'])}  BE={fmt(STATE['breakeven'])}")
             print(f"   🎯 TP_done={STATE['profit_targets_achieved']}  HP={fmt(STATE['highest_profit_pct'],2)}%")
             print(f"   🎯 MODE={STATE.get('mode', 'trend')}  TP_PROFILE={STATE.get('tp_profile', 'none')}  SIGNAL_STRENGTH={STATE.get('signal_strength', 'none')}")
             profit_profile = STATE.get("profit_profile", {})
