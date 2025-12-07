@@ -21,6 +21,8 @@ ULTRA PRO AI BOT - الإصدار المتكامل الذكي المحسن
 • AUTO-RECOVERY SYSTEM - استعادة الصفقات بعد إعادة التشغيل
 • EMA HOLD ENGINE - نظام ركوب الترند الذكي مع Hold-TP
 • EMA CROSS CLASSIFIER - نظام تصنيف تقاطع EMA القوي/الضعيف
+• TREND BIRTH ENGINE - نظام كشف ولادة الترند مع دخول OB/FVG
+• SMART COOLDOWN SYSTEM - نظام كول داون 30 دقيقة مع استثناء الترند القوي
 """
 
 import os
@@ -33,7 +35,7 @@ import json
 import pandas as pd
 import numpy as np
 import ccxt
-from datetime import datetime
+from datetime import datetime, timedelta
 from decimal import Decimal, ROUND_DOWN
 from collections import deque
 from typing import Literal, Dict, Any, Optional, Tuple
@@ -44,6 +46,189 @@ import signal
 from termcolor import colored
 
 Side = Literal["BUY", "SELL"]
+
+# =========================
+# SMART COOLDOWN SYSTEM FUNCTIONS
+# =========================
+
+def is_strong_trend_opportunity(signal: str, analysis: dict) -> bool:
+    """
+    استثناء للكول داون:
+    يسمح فقط لو:
+      - إشارة BUY مع ترند صاعد قوي
+      - إشارة SELL مع ترند هابط قوي
+      - ثقة عالية + Score قوي
+    """
+    if signal not in ("buy", "sell"):
+        return False
+
+    trend = analysis.get("trend", {}) or {}
+    direction = trend.get("direction")   # "up" / "down" / None
+    is_strong = trend.get("is_strong", False)
+    adx = trend.get("adx", 0.0)
+
+    # لازم يكون ترند قوي (ADX > 25 أو is_strong = True)
+    if not is_strong and adx < 25:
+        return False
+
+    # لازم الدخول يكون مع الترند مش عكسه
+    if signal == "buy" and direction != "up":
+        return False
+    if signal == "sell" and direction != "down":
+        return False
+
+    # ثقة مجلس الإدارة
+    confidence = float(analysis.get("confidence", 0.0))
+    score_buy = float(analysis.get("score_buy", 0.0))
+    score_sell = float(analysis.get("score_sell", 0.0))
+    signal_score = max(score_buy, score_sell)
+
+    # عتبات الاستثناء
+    if confidence < 0.85:
+        return False
+    if signal_score < 8.5:
+        return False
+
+    # شرط RR محترم
+    expected_rr = float(analysis.get("edge_rr", 2.0))
+    if expected_rr < 1.8:
+        return False
+
+    # شرط EMA Cross قوي
+    ema_cross = analysis.get("ema_cross", {})
+    if ema_cross.get("strength") != "strong":
+        return False
+
+    # شرط Golden Zone يعطي أولوية إضافية
+    golden_zone = analysis.get("golden_zone", {})
+    if golden_zone.get("valid"):
+        return True
+
+    return True
+
+def is_cooldown_active(state: dict):
+    """
+    يرجّع:
+      active (bool), minutes_left (float)
+    """
+    cd_until_str = state.get("cooldown_until")
+    if not cd_until_str:
+        return False, 0.0
+
+    try:
+        cd_until = datetime.fromisoformat(cd_until_str)
+    except Exception:
+        state["cooldown_until"] = None
+        return False, 0.0
+
+    now = datetime.utcnow()
+    if now >= cd_until:
+        state["cooldown_until"] = None
+        return False, 0.0
+
+    mins_left = (cd_until - now).total_seconds() / 60.0
+    return True, mins_left
+
+# =========================
+# TREND BIRTH ENGINE
+# =========================
+
+def trend_birth_engine(df, smc_ctx, rsi_ctx, ema_ctx, flow_ctx):
+    """
+    Trend Birth + OB/FVG confirmation
+    يعمل على:
+     1. Liquidity Sweep
+     2. Structure Shift (BOS / CHoCH)
+     3. Momentum Flip (RSI / Flow)
+     4. Retest ذكي على Order Block أو FVG
+    """
+    result = {
+        "active": False,
+        "side": None,
+        "confidence": 0.0,
+        "entry_zone": None,   # OB / FVG
+        "reasons": []
+    }
+
+    # ===== 1) Liquidity Sweep =====
+    liq_grab = smc_ctx.get("liq_grab", {})
+    sweep_up = liq_grab.get("grab_up", False)
+    sweep_down = liq_grab.get("grab_down", False)
+
+    # ===== 2) Structure Shift =====
+    bos = smc_ctx.get("bos")
+    choch = smc_ctx.get("choch")
+
+    # ===== 3) Momentum Flip =====
+    rsi_flip_up = rsi_ctx.get("trendZ") == "bull"
+    rsi_flip_down = rsi_ctx.get("trendZ") == "bear"
+    flow_side = flow_ctx.get("flow_side", "NEUTRAL")
+
+    # ===== 4) Order Block / FVG =====
+    ob = None
+    fvg = None
+    
+    # محاولة استخراج OB من smc_ctx
+    if smc_ctx.get("demand_box"):
+        recent_low = df["low"].astype(float).iloc[-20:].min()
+        ob = {"type": "bull", "zone": (recent_low * 0.995, recent_low * 1.005)}
+    elif smc_ctx.get("supply_box"):
+        recent_high = df["high"].astype(float).iloc[-20:].max()
+        ob = {"type": "bear", "zone": (recent_high * 0.995, recent_high * 1.005)}
+    
+    # محاولة استخراج FVG من smc_ctx
+    fvg_ctx = smc_ctx.get("fvg", {})
+    if fvg_ctx:
+        bull_fvg = fvg_ctx.get("bull")
+        bear_fvg = fvg_ctx.get("bear")
+        if bull_fvg:
+            fvg = {"type": "bull", "zone": (bull_fvg.get("lower", 0), bull_fvg.get("upper", 0))}
+        elif bear_fvg:
+            fvg = {"type": "bear", "zone": (bear_fvg.get("lower", 0), bear_fvg.get("upper", 0))}
+
+    price = float(df["close"].iloc[-1])
+
+    # ========= BUY =========
+    if sweep_down and (bos == "up" or choch == "up") and rsi_flip_up:
+        if flow_side in ("BUY", "STRONG_BUY"):
+            if ob and ob["type"] == "bull" and ob["zone"][0] <= price <= ob["zone"][1]:
+                result.update({
+                    "active": True,
+                    "side": "BUY",
+                    "confidence": 0.85,
+                    "entry_zone": "OB",
+                    "reasons": ["liquidity_sweep", "structure_shift", "momentum_flip", "order_block"]
+                })
+            elif fvg and fvg["type"] == "bull" and fvg["zone"][0] <= price <= fvg["zone"][1]:
+                result.update({
+                    "active": True,
+                    "side": "BUY",
+                    "confidence": 0.80,
+                    "entry_zone": "FVG",
+                    "reasons": ["liquidity_sweep", "structure_shift", "momentum_flip", "fvg"]
+                })
+
+    # ========= SELL =========
+    if sweep_up and (bos == "down" or choch == "down") and rsi_flip_down:
+        if flow_side in ("SELL", "STRONG_SELL"):
+            if ob and ob["type"] == "bear" and ob["zone"][0] <= price <= ob["zone"][1]:
+                result.update({
+                    "active": True,
+                    "side": "SELL",
+                    "confidence": 0.85,
+                    "entry_zone": "OB",
+                    "reasons": ["liquidity_sweep", "structure_shift", "momentum_flip", "order_block"]
+                })
+            elif fvg and fvg["type"] == "bear" and fvg["zone"][0] <= price <= fvg["zone"][1]:
+                result.update({
+                    "active": True,
+                    "side": "SELL",
+                    "confidence": 0.80,
+                    "entry_zone": "FVG",
+                    "reasons": ["liquidity_sweep", "structure_shift", "momentum_flip", "fvg"]
+                })
+
+    return result
 
 # =========================
 # INDICATORS ENGINE (BOT GAMED)
@@ -252,7 +437,6 @@ def compute_range_filter(df: pd.DataFrame, period: int = 20, qty: float = 3.5) -
         "sell_signal": bool(sell_series.iloc[-1]),
     }
 
-
 # =========================
 # VWAP ENGINE (SESSION VWAP)
 # =========================
@@ -261,7 +445,6 @@ def compute_vwap(df: pd.DataFrame) -> float:
     """
     VWAP الكلاسيكي:
     sum(price * volume) / sum(volume) من بداية البيانات حتى آخر شمعة.
-    (لو حابب نخليه Daily جلسة منفصلة نعدّل لاحقاً بتجميع حسب اليوم.)
     """
     if "close" not in df.columns or "volume" not in df.columns or len(df) == 0:
         return 0.0
@@ -384,10 +567,6 @@ def classify_ema_crossover(df: pd.DataFrame, fast: int = 20, slow: int = 50, loo
       - strong_bull / weak_bull
       - strong_bear / weak_bear
       - none
-    يعتمد على:
-      1) وجود تقاطع حقيقي بين EMA السريع والبطيء
-      2) زاوية الحركة (سرعة تحرك EMA السريع مقابل البطيء)
-      3) موضع السعر بالنسبة للمتوسطين بعد التقاطع
     """
     try:
         if len(df) < slow + lookback + 2:
@@ -448,7 +627,6 @@ def classify_ema_crossover(df: pd.DataFrame, fast: int = 20, slow: int = 50, loo
             "slow": s_now,
         }
     except Exception:
-        # في حالة أي خطأ نرجع none آمنة
         return {
             "label": "none",
             "side": None,
@@ -546,9 +724,7 @@ class UltraMarketStructureEngine:
         if close.iloc[-1] < last_low and close.iloc[-2] >= last_low:
             bos = "down"
 
-        # CHoCH = BOS عكس الاتجاه السابق البسيط (آخر ناتج)
-        # هنا نعمله بسيط: لو قبلها كنا بنعمل قمم أو قيعان عكسية
-        # نقدر نطوره لاحقاً، حالياً بنعيد نفس bos كـ choch لو قريب
+        # CHoCH = BOS عكس الاتجاه السابق البسيط
         if bos is not None:
             choch = bos
 
@@ -557,10 +733,6 @@ class UltraMarketStructureEngine:
     def _detect_fvg(self, df: pd.DataFrame, max_lookback: int = 40):
         """
         كشف أقرب FVG بسيط خلال آخر max_lookback شمعة.
-        تعريف كلاسيكي:
-        - Bullish FVG: low[i] > high[i-2]
-        - Bearish FVG: high[i] < low[i-2]
-        مع فلتر حجم gap بالـ ATR.
         """
         if len(df) < 5:
             return None
@@ -617,7 +789,6 @@ class UltraMarketStructureEngine:
         }
 
         if bull_fvg is not None:
-            # قريب لو السعر داخل أو على مسافة ATR من الفجوة
             mid = 0.5 * (bull_fvg["upper"] + bull_fvg["lower"])
             if abs(current_price - mid) <= atr_val:
                 fvg_ctx["bull_near"] = True
@@ -632,7 +803,6 @@ class UltraMarketStructureEngine:
     def _premium_discount(self, df: pd.DataFrame):
         """
         Premium / Discount بناءً على SMA200 + انحراف قياسي.
-        مستوحى من مفهوم Bollinger على 200 SMA.
         """
         c = df["close"].astype(float)
         if len(c) < 210:
@@ -785,11 +955,6 @@ class OrderFlowEngine:
                     sell_vol += amount
                     cvd -= amount
                 else:
-                    # لو side مش موجود، نحاول نستنتج
-                    # بعض البورصات ما ترجعش side
-                    price = float(t.get("price", 0.0))
-                    # هنا ممكن لاحقًا نضيف مقارنة بسعر الـ mid
-                    # حالياً بنسيبه محايد
                     pass
             except Exception:
                 continue
@@ -823,7 +988,6 @@ class OrderFlowEngine:
                 "wall_distance": None,
             }
 
-        # نركز على 1% حول السعر الحالي
         near_buy_vol = 0.0
         near_sell_vol = 0.0
         max_buy_level = None
@@ -921,7 +1085,6 @@ def compute_cvd_from_ohlcv(df: pd.DataFrame) -> pd.Series:
     cvd = delta.cumsum()
     return cvd
 
-
 def detect_cvd_divergence(df: pd.DataFrame, lookback: int = 5) -> Optional[str]:
     """
     يكشف عن:
@@ -977,7 +1140,7 @@ LOG_LEVEL = "INFO"
 PORT = int(os.getenv("PORT", "5000"))
 
 # Bot Version
-BOT_VERSION = f"ULTRA PRO AI v12.0 - WEB SERVICE EDITION - {EXCHANGE_NAME.upper()} - AUTO-RECOVERY ENABLED"
+BOT_VERSION = f"ULTRA PRO AI v13.0 - TREND BIRTH EDITION - {EXCHANGE_NAME.upper()} - AUTO-RECOVERY + SMART COOLDOWN ENABLED"
 
 print(f"🚀 Booting: {BOT_VERSION}", flush=True)
 
@@ -987,32 +1150,30 @@ print(f"🚀 Booting: {BOT_VERSION}", flush=True)
 
 PROFIT_PROFILES = {
     "SCALP_STRICT": {
-        "tp_levels_rr": [1.0],        # TP واحد عند 1R
-        "tp_fracs":     [1.0],        # يقفل كل الكمية
-        "hard_sl_rr":   -0.6,         # ستوب ثابت -0.6R
-        "be_after_tp":  True,         # مفيش معنى هنا لكن نخليه True
-        "trail_start_rr": None,       # بدون تريل
+        "tp_levels_rr": [1.0],
+        "tp_fracs":     [1.0],
+        "hard_sl_rr":   -0.6,
+        "be_after_tp":  True,
+        "trail_start_rr": None,
         "trail_atr_mult": None,
     },
     "MID_TREND": {
-        "tp_levels_rr": [1.0, 2.0],   # TP1=1R, TP2=2R
-        "tp_fracs":     [0.6, 0.4],   # 60% ثم 40%
+        "tp_levels_rr": [1.0, 2.0],
+        "tp_fracs":     [0.6, 0.4],
         "hard_sl_rr":   -0.7,
-        "be_after_tp":  True,         # بعد TP1 انقل BE
-        "trail_start_rr": 1.8,        # فعّل تريل بعد ما تعدي 1.8R
-        "trail_atr_mult": 1.0,        # تريل ATR خفيف
+        "be_after_tp":  True,
+        "trail_start_rr": 1.8,
+        "trail_atr_mult": 1.0,
     },
     "FULL_TREND": {
         "tp_levels_rr": [0.8, 1.8, 3.0],
         "tp_fracs":     [0.3, 0.3, 0.4],
         "hard_sl_rr":   -0.8,
-        "be_after_tp":  True,         # بعد TP1
-        # Trail بعد TP2 تقريبًا (TP2 ≈ 2R)
+        "be_after_tp":  True,
         "trail_start_rr": 2.0,
         "trail_atr_mult": 1.5,
     },
     "TRAP_TREND": {
-        # Stop-Hunt مع الترند: ناخد ربح محترم بس مش نطمع قوي
         "tp_levels_rr": [1.2, 2.0],
         "tp_fracs":     [0.7, 0.3],
         "hard_sl_rr":   -0.7,
@@ -1032,12 +1193,6 @@ def _trend_power_bucket(analysis):
       weak  → رجّح سكالب
       mid   → 2TP
       strong→ 3TP / ترند كامل
-    يعتمد على:
-      - ADX + DI
-      - Trend strength الداخلي (لو موجود)
-      - EMA Trend / Stair Hold
-      - EMA Cross القوي
-      - Confidence
     """
     trend = (analysis.get("trend") or {})
     adx = float(trend.get("adx", 0.0))
@@ -1051,7 +1206,6 @@ def _trend_power_bucket(analysis):
     ema_strength = ema.get("strength", "weak")
     stair_state = ema.get("stair_state", "broken")
     
-    # معلومات التقاطع الجديدة
     ema_cross = analysis.get("ema_cross", {})
     ema_cross_label = ema_cross.get("label", "none")
     ema_cross_strength = ema_cross.get("strength")
@@ -1070,19 +1224,16 @@ def _trend_power_bucket(analysis):
     if di_spread >= 18:
         score += 0.5
 
-    # Strength العددي من TrendAnalyzer (لو موجود)
     if strength_num >= 6:
         score += 1.0
     if strength_num >= 8:
         score += 0.5
 
-    # ثقة المجلس ترفع/تنزل شوية
     if conf >= 6:
         score += 0.5
     if conf >= 8:
         score += 0.5
 
-    # EMA Trend + Stair
     if ema_dir in ("up", "down"):
         score += 0.5
     if ema_strength == "strong":
@@ -1095,7 +1246,6 @@ def _trend_power_bucket(analysis):
     elif stair_state == "broken":
         score -= 0.5
         
-    # إضافة نقاط إضافية لتقاطع EMA القوي
     if ema_cross_strength == "strong":
         score += 1.5
     elif ema_cross_strength == "weak":
@@ -1107,15 +1257,9 @@ def _trend_power_bucket(analysis):
         return "mid"
     return "weak"
 
-
 def select_profit_profile(trade_mode, analysis):
     """
-    اختيار الـ Profile المناسب بناءً على:
-      - Edge RR + tp_profile (لو موجود)
-      - Golden Zone / Trap
-      - قوة الترند (ADX + DI + strength)
-      - EMA Cross القوي
-      - Confidence
+    اختيار الـ Profile المناسب
     """
     rr = float(analysis.get("edge_rr", 1.0))
     edge = analysis.get("edge_setup") or {}
@@ -1128,12 +1272,14 @@ def select_profit_profile(trade_mode, analysis):
     golden = analysis.get("golden_zone", {}).get("type")
     trend_bucket = _trend_power_bucket(analysis)
     
-    # معلومات التقاطع الجديدة
     ema_cross = analysis.get("ema_cross", {})
     ema_cross_label = ema_cross.get("label", "none")
     ema_cross_strength = ema_cross.get("strength")
 
-    # 0) Edge Algo tp_profile لو موجود → أولوية
+    # Trend Birth Override: استخدم FULL_TREND دائماً
+    if analysis.get("trend_birth", {}).get("active"):
+        return "FULL_TREND"
+
     edge_tp = None
     if edge.get("valid"):
         edge_tp = edge.get("tp_profile")
@@ -1152,7 +1298,6 @@ def select_profit_profile(trade_mode, analysis):
     if edge_tp == "MID_2TP":
         return "MID_TREND"
     if edge_tp == "SCALP_STRICT":
-        # نخليه أضعف حالة، هنستخدمه لما كل حاجة تكون متوسطة/ضعيفة
         base_profile = "SCALP_STRICT"
     else:
         base_profile = None
@@ -1166,11 +1311,11 @@ def select_profit_profile(trade_mode, analysis):
         elif rr >= 1.2:
             return "MID_TREND"
 
-    # 5) ترند قوي + RR محترم → FULL_TREND (3TP + Trail)
+    # 5) ترند قوي + RR محترم → FULL_TREND
     if trend_bucket == "strong" and (rr >= 1.5 or adx >= 28 or conf >= 7.0):
         return "FULL_TREND"
 
-    # 6) ترند متوسط / سوق نص ترند → MID_TREND (2TP)
+    # 6) ترند متوسط → MID_TREND
     if trend_bucket == "mid" and (rr >= 1.2 or adx >= 20 or conf >= 5.0):
         return "MID_TREND"
 
@@ -1178,9 +1323,7 @@ def select_profit_profile(trade_mode, analysis):
     if base_profile == "SCALP_STRICT":
         return "SCALP_STRICT"
 
-    # 8) fallback:
-    #    - RR كويس بس الترند مش قوي جدًا → MID_TREND
-    #    - الباقي → SCALP_STRICT (حماية)
+    # 8) fallback
     if rr >= 1.3 and (18 <= adx <= 28 or conf >= 5.0):
         return "MID_TREND"
 
@@ -1233,20 +1376,16 @@ def log_equity_snapshot(balance_usdt: float, compound_pnl: float):
 
 def log_ultra_panel(analysis: dict, state: dict):
     """
-    يطبع بلوك لوج كامل في كل تيك: Bookmap / Flow / Council / Strategy / SMC / SNAP / Footprint...
-    analysis: dict راجع من مجلس الإدارة
-    state:   حالة البوت (رصيد، compound_pnl، وضع الصفقة...)
+    يطبع بلوك لوج كامل في كل تيك
     """
     a = analysis or {}
 
-    # قيم افتراضية عشان ما يضربش لو حاجة ناقصة
     trend     = a.get("trend", {})
-    adx = trend.get("adx", 0.0)  # تعريف المتغير adx هنا
+    adx = trend.get("adx", 0.0)
     smc_ctx   = a.get("smc_ctx", {})
     fvg_ctx   = a.get("fvg_analysis", {})
     edge      = a.get("edge_setup", {})
     rf_ctx    = a.get("rf", {})
-    stop_hunt = a.get("predicted_stop_hunt", {})
     of_ctx    = a.get("orderflow", {}) or {}
     ultra_ms  = a.get("ultra_ms", {}) or {}
     ms_bias   = ultra_ms.get("bias", "neutral")
@@ -1256,7 +1395,7 @@ def log_ultra_panel(analysis: dict, state: dict):
     compound_pnl   = state.get("compound_pnl", 0.0)
     mode           = "LIVE" if MODE_LIVE else "PAPER"
 
-    # 1) Bookmap / OrderBook Imbalance حقيقي
+    # 1) Bookmap / OrderBook Imbalance
     log_i(
         f"📊 Bookmap: "
         f"Imb={of_ctx.get('book_imbalance', 0.0):.2f} | "
@@ -1264,7 +1403,7 @@ def log_ultra_panel(analysis: dict, state: dict):
         f"SellWall[{of_ctx.get('sell_wall', False)}]"
     )
 
-    # 2) Flow (Delta / CVD حقيقي)
+    # 2) Flow (Delta / CVD)
     flow_side = of_ctx.get("flow_side", "NEUTRAL")
     delta_val = of_ctx.get("delta", 0.0)
     cvd_val   = of_ctx.get("cvd", 0.0)
@@ -1292,7 +1431,7 @@ def log_ultra_panel(analysis: dict, state: dict):
         f"bear_near={ (ultra_ms.get('fvg') or {}).get('bear_near', False) }"
     )
 
-    # 5) Council summary (BUY/SELL hint)
+    # 5) Council summary
     hint_side = "NEUTRAL"
     if a.get("score_buy", 0) > a.get("score_sell", 0):
         hint_side = "BUY"
@@ -1331,7 +1470,7 @@ def log_ultra_panel(analysis: dict, state: dict):
         f"({a.get('confidence',0):.1f})"
     )
 
-    # 8) SNAP votes (Panel التصويت)
+    # 8) SNAP votes
     votes_total = a.get("score_buy", 0) + a.get("score_sell", 0)
     votes_side = "?" if votes_total == 0 else ("BUY" if a.get("score_buy", 0) > a.get("score_sell", 0) else "SELL")
     
@@ -1382,6 +1521,15 @@ def log_ultra_panel(analysis: dict, state: dict):
         f"strength={ema_cross.get('strength', 'none')}"
     )
 
+    # 13) TREND BIRTH INFO
+    trend_birth = a.get("trend_birth", {})
+    if trend_birth.get("active"):
+        log_i(
+            f"🔥 TREND BIRTH: {trend_birth['side']} @ {trend_birth['entry_zone']} | "
+            f"conf={trend_birth['confidence']:.2f} | "
+            f"reasons={', '.join(trend_birth['reasons'])}"
+        )
+
 # ============================================
 #  BOOT BANNER SYSTEM
 # ============================================
@@ -1424,6 +1572,8 @@ def log_banner():
     print(colored("  • AUTO-RECOVERY SYSTEM - استعادة الصفقات بعد الإعادة", "yellow"))
     print(colored("  • EMA HOLD ENGINE - نظام ركوب الترند الذكي مع Hold-TP", "yellow"))
     print(colored("  • EMA CROSS CLASSIFIER - Strong/Weak Crossover Detection", "yellow"))
+    print(colored("  • TREND BIRTH ENGINE - نظام كشف ولادة الترند مع دخول OB/FVG", "yellow", attrs=["bold"]))
+    print(colored("  • SMART COOLDOWN SYSTEM - 30 دقيقة مع استثناء الترند القوي", "yellow", attrs=["bold"]))
 
     print("="*80)
     print(colored("🚀 INITIALIZING ULTRA PRO AI ENGINE...", "cyan", attrs=["bold"]))
@@ -1500,7 +1650,7 @@ class ExchangeManager:
             return pd.DataFrame()
     
     def fetch_trades(self, limit: int = 200):
-        """جلب آخر الصفقات من البورصة لاستخدامها في OrderFlow / Footprint"""
+        """جلب آخر الصفقات من البورصة"""
         if not self.initialized:
             return []
         try:
@@ -1511,7 +1661,7 @@ class ExchangeManager:
             return []
 
     def fetch_orderbook(self, depth: int = 50):
-        """جلب الـ OrderBook لاستخدامه كـ Bookmap Lite"""
+        """جلب الـ OrderBook"""
         if not self.initialized:
             return {"bids": [], "asks": []}
         try:
@@ -1574,10 +1724,7 @@ class ExchangeManager:
 
     def get_open_position(self):
         """
-        قراءة المركز المفتوح فعليًا من البورصة للـ SYMBOL الحالي.
-        يرجّع:
-          {"side": "long"/"short", "qty": float, "entry_price": float}
-        أو None لو مفيش مركز.
+        قراءة المركز المفتوح فعليًا من البورصة.
         """
         if not MODE_LIVE or not self.initialized:
             return None
@@ -1585,10 +1732,8 @@ class ExchangeManager:
         try:
             positions = []
             if hasattr(self.exchange, "fetch_positions"):
-                # واجهة ccxt الموحدة لو مدعومة
                 positions = self.exchange.fetch_positions([SYMBOL])
             elif hasattr(self.exchange, "fetchPositions"):
-                # بعض الإكسشينجات تستخدم camelCase
                 positions = self.exchange.fetchPositions([SYMBOL])
             else:
                 return None
@@ -1638,7 +1783,6 @@ class ExchangeManager:
                         "entry_price": entry_price,
                     }
                 except Exception:
-                    # لو بوضع غريب نعدّي للي بعده
                     continue
 
             return None
@@ -1688,11 +1832,9 @@ class StateManager:
             "mode_live": MODE_LIVE,
             "profit_profile": "SCALP_STRICT",
             "profit_engine_active": False,
-            # حقول جديدة للكول داون ومتابعة آخر صفقة
-            "cooldown_bars": 0,
+            "cooldown_until": None,
             "last_close_reason": None,
             "last_close_time": None,
-            "last_bar_time": None,
         }
         self.state_file = "bot_state.json"
         self.load_state()
@@ -1728,9 +1870,7 @@ class StateManager:
     
     def update(self, *args, **kwargs):
         """
-        تحديث حالة البوت (مثل dict.update):
-        - يمكن تمرير dict كمعامل أول
-        - أو تمرير كلمات مفتاحية
+        تحديث حالة البوت
         """
         if args:
             if len(args) > 1:
@@ -1739,7 +1879,6 @@ class StateManager:
             if isinstance(other, dict):
                 self.state.update(other)
             else:
-                # إذا كان غير dict، نحاول تحويله إلى dict إذا أمكن
                 try:
                     self.state.update(dict(other))
                 except (TypeError, ValueError):
@@ -1775,11 +1914,9 @@ class StateManager:
             "edge_setup": None,
             "profit_profile": "SCALP_STRICT",
             "profit_engine_active": False,
-            # حقول جديدة للكول داون ومتابعة آخر صفقة
-            "cooldown_bars": 0,
+            "cooldown_until": None,
             "last_close_reason": None,
             "last_close_time": None,
-            "last_bar_time": None,
         })
         self.save_state()
     
@@ -1804,7 +1941,6 @@ class TrendAnalyzer:
         self.strength = 0.0
         self.momentum = 0.0
 
-        # مؤشرات من موتور BOT GAMED
         self.rsi = 50.0
         self.adx = 0.0
         self.di_plus = 0.0
@@ -1836,7 +1972,6 @@ class TrendAnalyzer:
             recent = close_prices.tail(5).values
             self.momentum = (recent[-1] - recent[0]) / recent[0] * 100 if recent[0] != 0 else 0
             
-        # حساب ADX + DI مع ATR
         self._calculate_adx_atr(df)
             
         if delta > 0 and self.strength > 0.1:
@@ -1847,18 +1982,16 @@ class TrendAnalyzer:
             self.trend = "flat"
             
     def _calculate_adx_atr(self, df):
-        """حساب ADX / DI / ATR / RSI باستخدام موتور BOT GAMED"""
+        """حساب ADX / DI / ATR / RSI"""
         try:
             ind = compute_indicators(df)
 
-            # قيم المؤشرات الموحدة
             self.rsi      = ind["rsi"]
             self.adx      = ind["adx"]
             self.di_plus  = ind["plus_di"]
             self.di_minus = ind["minus_di"]
             self.atr      = ind["atr"]
 
-            # نحسب ATR_MULT بنفس منطقك القديم (نسبة ATR الحالي للمتوسط الأبعد)
             high = df["high"].astype(float)
             low  = df["low"].astype(float)
             close = df["close"].astype(float)
@@ -1907,17 +2040,6 @@ class TrendAnalyzer:
     def analyze_stop_hunt_context(self, df, stop_hunt_zone):
         """
         تحليل سياق الستوب هانت باستخدام ADX و ATR
-        
-        Returns:
-            {
-                "trend_context": "flat"/"moderate"/"strong"/"extreme",
-                "adx_slope": float,
-                "atr_multiplier": float,
-                "wick_ratio": float,
-                "valid_for_trap": bool,
-                "reason": str,
-                "allowed_side": "BUY"/"SELL"/None
-            }
         """
         if len(df) < 20 or not stop_hunt_zone:
             return {"valid_for_trap": False, "reason": "insufficient_data"}
@@ -1925,13 +2047,9 @@ class TrendAnalyzer:
         try:
             current_price = float(df['close'].iloc[-1])
             
-            # تحليل ADX
             adx_slope = self._calculate_adx_slope(df)
-            
-            # تحليل ATR
             atr_mult = self.atr_mult
             
-            # تحليل الشمعة
             last_candle = df.iloc[-1]
             candle_high = float(last_candle['high'])
             candle_low = float(last_candle['low'])
@@ -1943,7 +2061,6 @@ class TrendAnalyzer:
             wick_size = candle_range - body_size
             wick_ratio = wick_size / candle_range if candle_range > 0 else 0
             
-            # تحديد سياق الترند
             trend_context = "flat"
             if self.adx < 20:
                 trend_context = "flat"
@@ -1954,19 +2071,16 @@ class TrendAnalyzer:
             else:
                 trend_context = "extreme"
             
-            # تحليل الجانب المسموح للـ Trap
             allowed_side = None
             
             if trend_context == "extreme":
-                # في الترند المجنون نسمح فقط بالـ Trap في اتجاه الترند
                 if self.trend == "down":
                     allowed_side = "SELL"
                 elif self.trend == "up":
                     allowed_side = "BUY"
                 else:
-                    allowed_side = None  # flat أو undefined
+                    allowed_side = None
 
-                # حماية من NoneType.lower()
                 if allowed_side:
                     valid_for_trap = (
                         stop_hunt_zone.get("type") == f"{allowed_side.lower()}_stop_hunt"
@@ -1977,13 +2091,12 @@ class TrendAnalyzer:
                 reason = f"extreme_trend_{self.trend}_only"
             
             elif trend_context == "strong":
-                # ترند قوي - الأفضل مع الاتجاه، لكن ممكن ضد الاتجاه بحذر
                 if self.trend == "down":
-                    allowed_side = "SELL"  # الأفضل
+                    allowed_side = "SELL"
                     valid_for_trap = True
                     reason = "strong_downtrend"
                 elif self.trend == "up":
-                    allowed_side = "BUY"   # الأفضل
+                    allowed_side = "BUY"
                     valid_for_trap = True
                     reason = "strong_uptrend"
                 else:
@@ -1991,18 +2104,15 @@ class TrendAnalyzer:
                     reason = "strong_range_trap"
                     
             elif trend_context == "moderate":
-                # ترند معقول - Trap مسموح في كلا الاتجاهين
                 valid_for_trap = atr_mult >= 1.3 and wick_ratio >= 0.6
                 allowed_side = "BUY" if stop_hunt_zone.get("type") == "buy_stop_hunt" else "SELL"
                 reason = "moderate_trend_trap"
                 
-            else:  # flat
-                # سوق فلات - Trap ضعيف
+            else:
                 valid_for_trap = atr_mult >= 1.5 and wick_ratio >= 0.7
                 allowed_side = "BUY" if stop_hunt_zone.get("type") == "buy_stop_hunt" else "SELL"
                 reason = "flat_market_trap"
             
-            # شروط إضافية للـ ATR
             if atr_mult < 1.2:
                 valid_for_trap = False
                 reason = "low_atr_multiplier"
@@ -2033,17 +2143,13 @@ class TrendAnalyzer:
             if len(df) < 14 + lookback:
                 return 0.0
             
-            # حساب ADX مبسط للـ lookback الأخيرة
             if lookback == 0:
                 return 0.0
                 
-            # استخدام طريقة مبسطة لحساب ميل ADX
             current_adx = self.adx
             
-            # حساب ADX مبسط للفترات السابقة
             if len(df) >= 15:
-                # تقدير ADX السابق بناءً على الاتجاه الحالي
-                prev_adx = current_adx * 0.95  # تقدير بسيط
+                prev_adx = current_adx * 0.95
                 return current_adx - prev_adx
             return 0.0
             
@@ -2118,7 +2224,6 @@ class StopHuntDetector:
                     "adx_context": self._analyze_candle_context(df, i, "buy")
                 }
                 
-                # تطبيق فلتر ADX+ATR
                 if self._validate_stop_hunt_with_adx_atr(zone, trend_info):
                     stop_hunt_zones.append(zone)
             
@@ -2164,13 +2269,11 @@ class StopHuntDetector:
             wick_size = candle_range - body_size
             wick_ratio = wick_size / candle_range if candle_range > 0 else 0
             
-            # حساب ATR للشمعة
             tr1 = candle_high - candle_low
             tr2 = abs(candle_high - float(prev_candle['close']))
             tr3 = abs(candle_low - float(prev_candle['close']))
             tr = max(tr1, tr2, tr3)
             
-            # حساب ATR الأساسي
             if len(df) >= 20:
                 atr_values = []
                 for j in range(max(0, index-19), index+1):
@@ -2187,12 +2290,11 @@ class StopHuntDetector:
             else:
                 atr_mult = 1.0
             
-            # تحليل الذيل
             if zone_type == "buy":
                 lower_wick = min(candle_close, candle_open) - candle_low
                 lower_wick_ratio = lower_wick / candle_range if candle_range > 0 else 0
                 has_long_lower_wick = lower_wick_ratio >= 0.6
-            else:  # sell
+            else:
                 upper_wick = candle_high - max(candle_close, candle_open)
                 upper_wick_ratio = upper_wick / candle_range if candle_range > 0 else 0
                 has_long_upper_wick = upper_wick_ratio >= 0.6
@@ -2223,26 +2325,21 @@ class StopHuntDetector:
             trend = trend_info.get("direction", "flat")
             zone_type = zone.get("type", "")
             
-            # قاعدة: ممنوع Trap عكسي في ترند مجنون
-            if adx > 50:  # ترند وحشي
-                # فقط Trap مع الاتجاه مسموح
+            if adx > 50:
                 if trend == "down" and zone_type == "sell_stop_hunt":
-                    return True  # SELL مع الترند الهابط
+                    return True
                 elif trend == "up" and zone_type == "buy_stop_hunt":
-                    return True  # BUY مع الترند الصاعد
+                    return True
                 else:
-                    return False  # Trap عكسي ممنوع
+                    return False
             
-            # شروط ATR
             if atr_mult < 1.2:
-                return False  # حركة ضعيفة
+                return False
             
             if atr_mult > 2.5 and adx > 35:
-                return False  # Breakout مستمر
+                return False
             
-            # شروط ADX
             if adx < 20:
-                # سوق فلات - يحتاج شروط أقوى
                 candle_context = zone.get("adx_context", {})
                 return candle_context.get("valid", False) and atr_mult >= 1.5
             
@@ -2250,14 +2347,13 @@ class StopHuntDetector:
             
         except Exception as e:
             log_w(f"⚠️ ADX/ATR validation error: {e}")
-            return True  # في حالة الخطأ، نرجع True عشان ما نخسر فرص
+            return True
     
     def get_active_stop_hunt_zones(self, current_price, df):
         """الحصول على مناطق الستوب هانت النشطة مع تحليل ADX"""
         active_zones = []
         for zone in self.recent_stop_hunts:
             if zone["type"] == "buy_stop_hunt" and current_price > zone["level"] * 0.995:
-                # تحليل ADX للـ Trap
                 trend_context = self.trend_analyzer.analyze_stop_hunt_context(df, zone)
                 zone["trend_context"] = trend_context
                 active_zones.append(zone)
@@ -2292,18 +2388,22 @@ class ProfitEngine:
         self.trail_price = None
     
     def init_trade(self, side, entry_price, atr_value, trade_mode, analysis):
-        """تهيئة الصفقة مع تحديد الـ Profile المناسب + Boost ذكي للـ TP"""
+        """تهيئة الصفقة مع تحديد الـ Profile المناسب"""
         self.side = side  # "long" / "short"
         self.entry_price = float(entry_price)
         self.atr_entry = float(atr_value)
         
-        # 1) اختيار الـ Profile الأساسي
-        self.profile_name = select_profit_profile(trade_mode, analysis)
+        # Trend Birth Override: استخدم FULL_TREND دائماً
+        if analysis.get("trend_birth", {}).get("active"):
+            self.profile_name = "FULL_TREND"
+            log_i(f"🔥 TREND BIRTH MODE: Using FULL_TREND profile with Hold-TP")
+        else:
+            self.profile_name = select_profit_profile(trade_mode, analysis)
+        
         self.profile_cfg = PROFIT_PROFILES[self.profile_name]
         
         direction = 1 if side == "long" else -1
 
-        # 2) ستوب مبدئي (قائم على R)
         hard_sl_rr = self.profile_cfg["hard_sl_rr"]
         sl_dist = abs(hard_sl_rr) * self.atr_entry
         if side == "long":
@@ -2311,7 +2411,6 @@ class ProfitEngine:
         else:
             self.sl_price = self.entry_price + sl_dist
 
-        # 3) حساب Boost للـ TP (Hold-TP في الترند المجنون)
         trend = (analysis.get("trend") or {})
         adx = float(trend.get("adx", 0.0))
         conf = float(analysis.get("confidence", 0.0))
@@ -2327,14 +2426,12 @@ class ProfitEngine:
         base_rrs = list(self.profile_cfg["tp_levels_rr"])
         boost_mult = 1.0
 
-        # نفس اتجاه EMA؟
         same_dir_ema = (
             (ema_dir == "up" and side == "long") or
             (ema_dir == "down" and side == "short")
         )
 
         if self.profile_name in ("FULL_TREND", "TRAP_TREND"):
-            # ترند مجنون → نسيب الصفقة تشم نفس أطول (Hold-TP)
             if adx >= 32 and conf >= 7.5 and same_dir_ema and ema_strength == "strong":
                 boost_mult = 1.40
             elif adx >= 28 and conf >= 6.5 and same_dir_ema:
@@ -2347,23 +2444,19 @@ class ProfitEngine:
             elif adx >= 20 and conf >= 5.0:
                 boost_mult = 1.05
         elif self.profile_name == "SCALP_STRICT":
-            # سكالب ضعيف → نقرب الهدف لحماية الربح
             if conf < 4.0 or adx < 15:
                 boost_mult = 0.85
 
-        # Edge RR عالي جدًا → نسمح بزيادة بسيطة
         if edge_rr >= 2.0 and self.profile_name in ("FULL_TREND", "TRAP_TREND"):
             boost_mult = max(boost_mult, 1.20)
 
         boosted_rrs = []
         for i, rr in enumerate(base_rrs):
             rr_boosted = rr * boost_mult
-            # ما ننزلش TP1 عن 0.6R أبداً
             if i == 0:
                 rr_boosted = max(0.6, rr_boosted)
             boosted_rrs.append(rr_boosted)
 
-        # 4) حساب مستويات TP بالسعر (بعد الـ Boost)
         self.tp_levels = []
         self.tp_hit = set()
         for i, (rr, frac) in enumerate(zip(boosted_rrs, self.profile_cfg["tp_fracs"])):
@@ -2372,15 +2465,12 @@ class ProfitEngine:
             label = f"TP{i+1}_{self.profile_name}"
             self.tp_levels.append((price, frac, label))
         
-        # 5) Trail config زي ما هو (التحريك فعليًا في on_tick)
         self.trail_active = False
         self.trail_price = None
         
-        # تحديث state
         self.state["profit_profile"] = self.profile_name
         self.state["profit_engine_active"] = True
         
-        # Log خطة جني الأرباح بعد الـ Boost
         try:
             tp_preview = [(round(p, 6), f"{f*100:.0f}%") for p, f, _ in self.tp_levels]
         except Exception:
@@ -2397,7 +2487,6 @@ class ProfitEngine:
             f"TPs={tp_preview}{boost_note}"
         )
 
-        # لوج إضافي يوضح سبب التصنيف
         trend_bucket = _trend_power_bucket(analysis)
         log_i(
             f"📊 PROFILE_SELECTION | trend={trend_bucket} | "
@@ -2437,11 +2526,10 @@ class ProfitEngine:
         qty = self.state["qty"]
         direction = 1 if side == "long" else -1
         
-        # حساب ATR الحالي و R
         atr_now = self.calculate_atr(df)
         R_now = (price - self.entry_price) * direction / max(atr_now, 1e-8)
         
-        # ===== 1) وقف خسارة ثابت / متحرك (تنفيذ لو اتضرب) =====
+        # ===== 1) وقف خسارة ثابت / متحرك =====
         if self.sl_price is not None:
             if (side == "long" and price <= self.sl_price) or \
                (side == "short" and price >= self.sl_price):
@@ -2451,20 +2539,14 @@ class ProfitEngine:
                     f"side={side} | qty={qty:.4f} | exit={price:.6f} | R={R_now:.2f}"
                 )
                 
-                # تنفيذ إغلاق كامل
                 close_side = "sell" if side == "long" else "buy"
                 if self.exchange.execute_order(close_side, qty, price):
                     self.state["open"] = False
                     self.state["profit_engine_active"] = False
-                    # تفعيل الكول داون
-                    self.state["cooldown_bars"] = 3
-                    self.state["last_close_reason"] = "HARD_SL"
-                    self.state["last_close_time"] = datetime.now().isoformat()
                     return True
                 return False
         
         # ===== 2) تنفيذ TP الجزئية =====
-        # 3) فحص مستويات TP مع لوج احترافي (R + profile + trail)
         for idx, (tp_price, frac, label) in enumerate(self.tp_levels):
             if idx in self.tp_hit:
                 continue
@@ -2478,7 +2560,6 @@ class ProfitEngine:
             if hit:
                 close_qty = qty * frac
 
-                # هل هذا الـ TP سيشغّل الـ Trail؟
                 will_trail_now = (
                     (not self.trail_active)
                     and bool(self.profile_cfg.get("trail_start_rr"))
@@ -2491,13 +2572,11 @@ class ProfitEngine:
                     self.state["qty"] -= close_qty
                     qty = self.state["qty"]
 
-                    # حساب الربح المحقق
                     if side == "long":
                         realized_pnl = (price - self.entry_price) * close_qty
                     else:
                         realized_pnl = (self.entry_price - price) * close_qty
 
-                    # تحديث الربح التراكمي
                     self.state["compound_pnl"] = self.state.get("compound_pnl", 0.0) + realized_pnl
 
                     profile = self.profile_name or self.state.get("profit_profile", "N/A")
@@ -2510,12 +2589,11 @@ class ProfitEngine:
                         f"| PnL={realized_pnl:.3f} USDT{trail_tag}"
                     )
 
-                    # بعد أول TP → Breakeven لو مفعّل
                     if self.profile_cfg["be_after_tp"] and len(self.tp_hit) == 1:
                         if side == "long":
-                            self.sl_price = self.entry_price * 1.0001  # +0.01%
+                            self.sl_price = self.entry_price * 1.0001
                         else:
-                            self.sl_price = self.entry_price * 0.9999  # -0.01%
+                            self.sl_price = self.entry_price * 0.9999
                         log_w(f"⚖ Breakeven set at {self.sl_price:.6f}")
         
         # ===== 3) تفعيل / تحديث التريل =====
@@ -2525,13 +2603,11 @@ class ProfitEngine:
         if start_rr and atr_mult and self.state["qty"] > 0:
             if (not self.trail_active) and R_now >= start_rr:
                 self.trail_active = True
-                # أول تريل
                 dist = atr_mult * atr_now
                 if side == "long":
                     self.trail_price = price - dist
                 else:
                     self.trail_price = price + dist
-                # خلي الستوب يساوي التريل
                 self.sl_price = self.trail_price
                 log_w(
                     f"🧷 TRAIL ACTIVATED | profile={self.profile_name} | "
@@ -2551,7 +2627,7 @@ class ProfitEngine:
                         self.trail_price = new_trail
                         self.sl_price = self.trail_price
         
-        # ===== 4) لو كل TPs اتنفذت ومفيش تريل إضافي ⇒ قفل صارم =====
+        # ===== 4) لو كل TPs اتنفذت ⇒ قفل صارم =====
         if len(self.tp_hit) == len(self.tp_levels) and not self.trail_active:
             if self.state["qty"] > 0:
                 close_side = "sell" if side == "long" else "buy"
@@ -2562,10 +2638,6 @@ class ProfitEngine:
                     )
                     self.state["open"] = False
                     self.state["profit_engine_active"] = False
-                    # تفعيل الكول داون
-                    self.state["cooldown_bars"] = 3
-                    self.state["last_close_reason"] = "FULL_TP"
-                    self.state["last_close_time"] = datetime.now().isoformat()
                     return True
         
         return False
@@ -2625,11 +2697,9 @@ class SmartPositionManager:
             log_w("⚠️ Invalid position size")
             return False
             
-        # ✅ فرق بين اتجاه الصفقة في المنصة وبين اتجاه المركز في المنطق
         exchange_side = "buy" if side.upper() == "BUY" else "sell"
         pos_side = "long" if exchange_side == "buy" else "short"
 
-        # تحديد نوع الصفقة (TRAP / GOLDEN / NORMAL)
         trade_type = "normal"
         trade_mode = "SCALP"
 
@@ -2643,9 +2713,12 @@ class SmartPositionManager:
             trade_type = "predictive"
             trade_mode = "PREDICTIVE"
 
-        # تنفيذ الأمر على المنصة بـ buy/sell
+        # Trend Birth Override
+        if analysis.get("trend_birth", {}).get("active"):
+            trade_type = "trend_birth"
+            trade_mode = "FULL_TREND"
+
         if self.exchange.execute_order(exchange_side, position_size, current_price):
-            # ✅ نخزن "long"/"short" في الـ state
             self.state.update({
                 "open": True,
                 "side": pos_side,
@@ -2671,7 +2744,6 @@ class SmartPositionManager:
                 f"Type: {trade_type.upper()}"
             )
 
-            # تهيئة Profit Engine بـ "long"/"short"
             atr_value = analysis.get("trend", {}).get("atr", current_price * 0.01)
             self.profit_engine.init_trade(pos_side, current_price, atr_value, trade_mode, analysis)
 
@@ -2684,37 +2756,27 @@ class SmartPositionManager:
     def sync_with_exchange(self, df):
         """
         مزامنة حالة البوت مع المركز الفعلي على البورصة.
-        الهدف:
-          - لو في صفقة مفتوحة على المنصة والبوت فاكر مفيش → يركب عليها ويكمّل إدارتها.
-          - لو البوت فاكر في صفقة والمنصة مفيش → ينضّف الـ state.
-          - لو في صفقة والـ state مفتوح لكن ProfitEngine مش متهيّأ (بعد restart) → نعيد تهيئته.
         """
         if not MODE_LIVE:
-            # في الـ PAPER MODE مش محتاج نتعب نفسنا
             return
 
         pos = self.exchange.get_open_position()
         state_open = bool(self.state["open"])
 
-        # ===== Case 1: مفيش مركز فعلي على المنصة =====
         if not pos:
             if state_open:
                 log_w("⚠️ State says position OPEN but exchange has NO position → resetting state.")
                 self.state.reset()
             return
 
-        # من هنا: في مركز فعلي على المنصة
-        side = pos["side"]           # "long" / "short"
+        side = pos["side"]
         qty = float(pos["qty"])
         entry_price = float(pos["entry_price"])
 
-        # ===== Helper: نحسب ATR باستخدام ProfitEngine نفسه =====
-        # نضبط entry_price / atr_entry مؤقتًا عشان حساب ATR يكون منطقي
         self.profit_engine.entry_price = entry_price
         self.profit_engine.atr_entry = entry_price * 0.01
         atr_value = self.profit_engine.calculate_atr(df)
 
-        # تحليل بسيط كفاية لتشغيل ProfitEngine
         recovered_analysis = {
             "trend": {"atr": atr_value},
             "confidence": 0.5,
@@ -2726,7 +2788,6 @@ class SmartPositionManager:
         }
         trade_mode = "SCALP"
 
-        # ===== Case 2: المنصة فيها صفقة، والـ state مغلق =====
         if not state_open:
             self.state.update({
                 "open": True,
@@ -2755,9 +2816,7 @@ class SmartPositionManager:
             )
             return
 
-        # ===== Case 3: state مفتوح، لكن ProfitEngine مش Active (restart) =====
         if self.state["open"] and not self.state.get("profit_engine_active", False):
-            # نتاكد إن بيانات الـ state منطقية
             if not self.state.get("entry_price"):
                 self.state["entry_price"] = entry_price
             if not self.state.get("qty"):
@@ -2775,7 +2834,6 @@ class SmartPositionManager:
             )
             return
 
-        # ===== Case 4: state مفتوح والمنصة مفتوحة لكن في اختلاف (side/qty/entry) =====
         mismatch = False
         try:
             state_side = (self.state.get("side") or "").lower()
@@ -2829,11 +2887,9 @@ class SmartPositionManager:
             f"SL={sl} | TP1={tp1} | TP2={tp2} | TP3={tp3} | profile={profile}"
         )
         
-        # استخدام Profit Engine لإدارة الصفقة
         closed = self.profit_engine.on_tick(df)
         
         if not closed:
-            # تحديث الربح/الخسارة
             current_price = self.exchange.get_current_price()
             if current_price:
                 entry_price = self.state["entry_price"]
@@ -2846,14 +2902,13 @@ class SmartPositionManager:
                     
                 self.state["pnl"] = pnl_pct
                 
-                # تحديث أعلى ربح
                 if pnl_pct > self.state["highest_profit_pct"]:
                     self.state["highest_profit_pct"] = pnl_pct
                 
                 self.state["bars"] += 1
     
     def close_position(self, reason=""):
-        """إغلاق المركز الحالي"""
+        """إغلاق المركز الحالي مع تفعيل الكول داون"""
         if not self.state["open"]:
             return False
             
@@ -2861,7 +2916,6 @@ class SmartPositionManager:
         current_price = self.exchange.get_current_price()
         
         if current_price and self.exchange.execute_order(side, self.state["qty"], current_price):
-            # حساب الربح النهائي
             entry_price = self.state["entry_price"]
             if self.state["side"] == "long":
                 realized_pnl = (current_price - entry_price) * self.state["qty"]
@@ -2879,6 +2933,12 @@ class SmartPositionManager:
 
             balance_after = self.exchange.get_balance()
             log_equity_snapshot(balance_after, self.state["compound_pnl"])
+
+            # تفعيل الكول داون لمدة 30 دقيقة
+            cooldown_until = datetime.utcnow() + timedelta(minutes=30)
+            self.state["cooldown_until"] = cooldown_until.isoformat()
+            self.state["last_close_reason"] = reason
+            self.state["last_close_time"] = datetime.now().isoformat()
 
             self.state.reset()
             return True
@@ -2969,10 +3029,7 @@ class EdgeAlgoEngine:
         smc_ctx: Dict[str, Any],
     ) -> Dict[str, Any]:
         """
-        يحاول يبني صفقة احترافية من:
-        - box / demand / supply
-        - stop واضح
-        - RR 1:1, 1:2, 1:3
+        يحاول يبني صفقة احترافية
         """
         if len(df) < 30:
             return {"valid": False, "reason": "not_enough_data"}
@@ -2986,7 +3043,6 @@ class EdgeAlgoEngine:
         recent_high = high.tail(lookback).max()
         recent_low = low.tail(lookback).min()
 
-        # Supply/Demand مبسطة
         if side == "BUY":
             entry = price
             sl = recent_low * 0.998
@@ -3070,28 +3126,21 @@ class UltraCouncilAI:
     """مجلس الإدارة الذكي المتكامل مع جميع المحركات + OrderFlow/Bookmap"""
     
     def __init__(self, exchange_manager: "ExchangeManager" = None):
-        # مرجع للبورصة لاستخدامه في OrderFlow
         self.exchange_manager = exchange_manager
         
-        # المحركات الأساسية
         self.stop_hunt_detector = StopHuntDetector()
         self.trend_analyzer = TrendAnalyzer()
         
-        # OrderFlow / Bookmap Engine
         self.orderflow_engine = OrderFlowEngine(exchange_manager) if exchange_manager else None
         
-        # Ultra Market Structure Engine
         self.ultra_ms = UltraMarketStructureEngine()
 
-        # المحركات المتقدمة
         self.edge_algo = EdgeAlgoEngine()
-        self.smc_ctx_engine = self  # سأستخدم نفس الكلاس للسياق
+        self.smc_ctx_engine = self
         self.golden_engine = GoldenZoneEngine()
         self.sh_predictor = StopHuntPredictor()
         
-        # معايير القرار
         self.min_confidence = 0.6
-        # تخفيض الحد الأدنى للسكور من 8 → 7 لزيادة عدد الفرص القوية بدون تخريب الفلاتر الأخرى
         self.min_score = 7
 
     def _empty_analysis(self):
@@ -3165,6 +3214,13 @@ class UltraCouncilAI:
                 "fast": None,
                 "slow": None,
             },
+            "trend_birth": {
+                "active": False,
+                "side": None,
+                "confidence": 0.0,
+                "entry_zone": None,
+                "reasons": []
+            },
         }
 
     def build_context(self, df, current_price, stop_hunt_info, fvg_ctx, liquidity_zones):
@@ -3199,7 +3255,7 @@ class UltraCouncilAI:
         return ctx
 
     def analyze_market(self, df):
-        """تحليل السوق الشامل المتكامل"""
+        """تحليل السوق الشامل المتكامل مع Trend Birth Engine"""
         if len(df) < 20:
             return self._empty_analysis()
 
@@ -3209,22 +3265,17 @@ class UltraCouncilAI:
             score_buy = 0
             score_sell = 0
             
-            # تحديث المحركات الأساسية
             self.trend_analyzer.update(df)
             trend_info = self.trend_analyzer.get_trend_info()
             trend_dir = trend_info.get("direction", "flat")
             
-            # ===== RF REAL + VWAP =====
             rf_ctx = compute_range_filter(df, period=20, qty=3.5)
             vwap_value = compute_vwap(df)
             
-            # Ultra Market Structure context
             ultra_ms_ctx = self.ultra_ms.analyze(df)
             
-            # EMA Trend / Hold Engine
             ema_trend = compute_ema_trend(df)
             
-            # OrderFlow / Bookmap context
             orderflow_ctx = {}
             if self.orderflow_engine is not None:
                 orderflow_ctx = self.orderflow_engine.compute(current_price)
@@ -3245,7 +3296,6 @@ class UltraCouncilAI:
                     score_sell += 0.5
                     signals.append("🧱 Sell Wall Resistance")
             
-            # ===== CVD DIVERGENCE =====
             cvd_sig = detect_cvd_divergence(df)
             analysis_result = self._empty_analysis()
             analysis_result["cvd_divergence"]["signal"] = cvd_sig
@@ -3257,6 +3307,46 @@ class UltraCouncilAI:
                 score_sell += 1.5
                 signals.append("📉 CVD BEARISH DIVERGENCE")
             
+            # ===== TREND BIRTH ENGINE =====
+            smc_ctx = self.build_context(
+                df, current_price, 
+                {"active_count": 0},
+                ultra_ms_ctx.get("fvg", {}),
+                self.stop_hunt_detector.detect_liquidity_zones(current_price)
+            )
+            
+            smc_ctx.update({
+                "liq_grab": ultra_ms_ctx.get("liq_grab", {}),
+                "bos": ultra_ms_ctx.get("bos"),
+                "choch": ultra_ms_ctx.get("choch"),
+                "fvg": ultra_ms_ctx.get("fvg", {})
+            })
+            
+            rsi_value = trend_info.get("rsi", 50)
+            rsi_ctx = {"trendZ": "bull" if rsi_value > 50 else "bear"}
+            
+            ema_cross = classify_ema_crossover(df)
+            
+            trend_birth = trend_birth_engine(
+                df,
+                smc_ctx=smc_ctx,
+                rsi_ctx=rsi_ctx,
+                ema_ctx=ema_cross,
+                flow_ctx=orderflow_ctx
+            )
+            
+            analysis_result["trend_birth"] = trend_birth
+
+            if trend_birth["active"]:
+                analysis_result["confidence"] = max(analysis_result.get("confidence", 0), trend_birth["confidence"])
+                if trend_birth["side"] == "BUY":
+                    score_buy += 3.0
+                else:
+                    score_sell += 3.0
+                signals.append(
+                    f"🔥 TREND BIRTH {trend_birth['side']} @ {trend_birth['entry_zone']}"
+                )
+            
             # ===== RF REAL CONTRIBUTION =====
             if rf_ctx.get("buy_signal") and current_price > rf_ctx.get("filt", current_price):
                 score_buy += 1.5
@@ -3266,11 +3356,10 @@ class UltraCouncilAI:
                 score_sell += 1.5
                 signals.append("📕 RF SELL Signal")
 
-            # ===== VWAP CONTRIBUTION (FAIR VALUE AXIS) =====
+            # ===== VWAP CONTRIBUTION =====
             if vwap_value:
-                dist = (current_price - vwap_value) / vwap_value  # انحراف عن الـ VWAP
+                dist = (current_price - vwap_value) / vwap_value
 
-                # مع الترند وفي اتجاه الـ VWAP → تقوية القرار
                 if dist > 0 and trend_dir == "up":
                     score_buy += 1.0
                     signals.append("⚖️ Above VWAP in Uptrend")
@@ -3278,14 +3367,11 @@ class UltraCouncilAI:
                     score_sell += 1.0
                     signals.append("⚖️ Below VWAP in Downtrend")
 
-                # لو انحراف كبير عن VWAP (> 1%) وضد الاتجاه → حذر
                 if abs(dist) > 0.01:
                     if dist > 0 and score_buy < score_sell:
-                        # السعر فوق VWAP بس سكور البيع أعلى → خفّف البيع شوية
                         score_sell *= 0.9
                         signals.append("⚠️ SELL far above VWAP (risk)")
                     elif dist < 0 and score_sell < score_buy:
-                        # السعر تحت VWAP بس سكور الشراء أعلى → خفّف الشراء شوية
                         score_buy *= 0.9
                         signals.append("⚠️ BUY far below VWAP (risk)")
 
@@ -3295,7 +3381,6 @@ class UltraCouncilAI:
             ms_prem = ultra_ms_ctx.get("premium_discount") or {}
             liq_ctx = ultra_ms_ctx.get("liq_grab") or {}
 
-            # Bias عام من BOS / CHoCH
             if ms_bias == "bull":
                 score_buy += 2.0
                 signals.append("🏛 UltraMS Bull BOS")
@@ -3303,7 +3388,6 @@ class UltraCouncilAI:
                 score_sell += 2.0
                 signals.append("🏛 UltraMS Bear BOS")
 
-            # FVG قريب
             if ms_fvg:
                 if ms_fvg.get("bull_near"):
                     score_buy += 1.5
@@ -3312,7 +3396,6 @@ class UltraCouncilAI:
                     score_sell += 1.5
                     signals.append("🟥 Bear FVG Near")
 
-            # Premium / Discount zones
             zone = ms_prem.get("zone", "mid")
             if zone in ("discount", "ultra_discount") and ms_bias == "bull":
                 score_buy += 1.0
@@ -3321,9 +3404,7 @@ class UltraCouncilAI:
                 score_sell += 1.0
                 signals.append("❤️ Premium + Bear Bias")
 
-            # Liquidity Grabs
             if liq_ctx.get("grab_up"):
-                # كسرة وهمية فوق → تميل للهبوط
                 score_sell += 1.0
                 signals.append("💦 Liquidity Grab UP")
             if liq_ctx.get("grab_down"):
@@ -3346,13 +3427,13 @@ class UltraCouncilAI:
                     score_sell += 0.5
                     signals.append("🧱 EMA Stair Holding (Bearish)")
 
-            # 1. الستوب هانت والسيولة
+            # الستوب هانت والسيولة
             self.stop_hunt_detector.detect_swings(df)
             stop_hunt_zones = self.stop_hunt_detector.detect_stop_hunt_zones(df)
             active_zones = self.stop_hunt_detector.get_active_stop_hunt_zones(current_price, df)
             active_count = len(active_zones)
 
-            # 2. تحليل Trap Mode مع ADX+ATR
+            # تحليل Trap Mode مع ADX+ATR
             trap_side = None
             trap_quality = 0.0
 
@@ -3361,7 +3442,7 @@ class UltraCouncilAI:
                 
                 if zone["type"] == "buy_stop_hunt" and trend_context.get("valid_for_trap", False):
                     allowed_side = trend_context.get("allowed_side")
-                    if allowed_side in ["BUY", None]:  # مسموح أو غير محدد
+                    if allowed_side in ["BUY", None]:
                         trap_side = "BUY"
                         trap_quality = max(trap_quality, zone["strength"] + trend_context.get("adx", 0)/50)
                         signals.append(f"🧨 TRAP_BUY_ZONE @ {zone['level']:.6f} | ADX={trend_context.get('adx',0):.1f}")
@@ -3373,7 +3454,7 @@ class UltraCouncilAI:
                         trap_quality = max(trap_quality, zone["strength"] + trend_context.get("adx", 0)/50)
                         signals.append(f"🧨 TRAP_SELL_ZONE @ {zone['level']:.6f} | ADX={trend_context.get('adx',0):.1f}")
 
-            # 3. الاتجاه والزخم
+            # الاتجاه والزخم
             if trend_info["direction"] == "up":
                 score_buy += 1.0
                 signals.append("📈 Uptrend")
@@ -3396,7 +3477,7 @@ class UltraCouncilAI:
                 score_sell += 1.0
                 signals.append("💥 Negative Momentum")
 
-            # ===== EMA CROSS CONTRIBUTION (STRONG vs WEAK) =====
+            # ===== EMA CROSS CONTRIBUTION =====
             ema_cross = classify_ema_crossover(df)
 
             if ema_cross["label"] != "none":
@@ -3426,14 +3507,13 @@ class UltraCouncilAI:
                     "slow": None,
                 }
 
-            # 4. Edge Algo Setup
+            # Edge Algo Setup
             edge_side = None
             if score_buy > score_sell:
                 edge_side = "BUY"
             elif score_sell > score_buy:
                 edge_side = "SELL"
 
-            # بناء سياق SMC
             smc_ctx = self.build_context(
                 df, current_price, 
                 {"active_count": active_count},
@@ -3460,7 +3540,7 @@ class UltraCouncilAI:
                         else:
                             score_sell += 1.0
 
-            # 5. Golden Zones
+            # Golden Zones
             golden = self.golden_engine.compute(df)
             if golden["valid"]:
                 if golden["type"] == "golden_bottom":
@@ -3470,16 +3550,14 @@ class UltraCouncilAI:
                     score_sell += 2
                     signals.append("🔴 Golden Top Zone")
 
-            # 6. التنبؤ بالستوب هانت
+            # التنبؤ بالستوب هانت
             predicted_sh = self.sh_predictor.predict(df)
             if predicted_sh.get("up_target"):
                 signals.append(f"🎯 Predicted Stop-Hunt UP @ {predicted_sh['up_target']:.6f}")
-                # تنبؤ بضرب استوبات فوق ثم هبوط
                 score_sell += 1.5
 
             if predicted_sh.get("down_target"):
                 signals.append(f"🎯 Predicted Stop-Hunt DOWN @ {predicted_sh['down_target']:.6f}")
-                # تنبؤ بضرب استوبات تحت ثم صعود
                 score_buy += 1.5
 
             # الثقة النهائية
@@ -3513,6 +3591,7 @@ class UltraCouncilAI:
                 "cvd_divergence": analysis_result["cvd_divergence"],
                 "ema_trend": ema_trend,
                 "ema_cross": ema_cross,
+                "trend_birth": trend_birth,
             }
             
         except Exception as e:
@@ -3520,11 +3599,18 @@ class UltraCouncilAI:
             return self._empty_analysis()
 
     def should_enter_trade(self, df):
-        """تحديد ما إذا كان يجب الدخول في صفقة"""
+        """تحديد ما إذا كان يجب الدخول في صفقة مع أولوية Trend Birth"""
         analysis = self.analyze_market(df)
 
         if analysis is None:
             return None, "NO_ANALYSIS", analysis
+
+        # 🔥 TREND BIRTH OVERRIDE - أولوية قصوى
+        tb = analysis.get("trend_birth", {})
+        if tb.get("active") and tb.get("confidence", 0) >= 0.80:
+            entry_signal = "buy" if tb["side"] == "BUY" else "sell"
+            reason = f"TREND_BIRTH_{tb['side']}_{tb['entry_zone']}"
+            return entry_signal, reason, analysis
 
         trap_side = analysis.get("stop_hunt_trap_side")
         trap_q = analysis.get("stop_hunt_trap_quality", 0.0)
@@ -3532,7 +3618,6 @@ class UltraCouncilAI:
         smc_ctx = analysis.get("smc_ctx", {})
         trend = analysis.get("trend", {})
         
-        # 🔥 CVD Divergence Filter
         cvd_sig = analysis["cvd_divergence"]["signal"]
         of = analysis["orderflow"]
         flow_side = of.get("flow_side", "NEUTRAL")
@@ -3541,7 +3626,7 @@ class UltraCouncilAI:
         current_price = float(df["close"].iloc[-1])
         confidence = analysis.get("confidence", 0.0)
 
-        # 1) TRAP OVERRIDE MODE – دخول قسري لو الفرصة خبيثة جدًا
+        # 1) TRAP OVERRIDE MODE
         if trap_side and trap_q >= 2.5:
             log_w("🧨 TRAP OVERRIDE MODE ACTIVATED")
 
@@ -3565,13 +3650,11 @@ class UltraCouncilAI:
 
             return None, "Low confidence", analysis
 
-        # 3) توقع ضرب الاستوبات (Predictive Stop-Hunt)
+        # 3) توقع ضرب الاستوبات
         trend_dir = trend.get("direction", "flat")
 
-        # لو في هدف ستوب هانت فوق والسوق ترنده هابط → بيع خبيث
         if predicted.get("up_target") and trend_dir == "down":
             if analysis.get("score_sell", 0) >= self.min_score - 3:
-                # 🔫 SNIPER SELL FILTER مع CVD
                 sniper_ok = True
                 if cvd_sig != "bearish":
                     sniper_ok = False
@@ -3587,10 +3670,8 @@ class UltraCouncilAI:
                 else:
                     return None, "sell_rejected_sniper_filter", analysis
 
-        # لو في هدف ستوب هانت تحت والسوق ترنده صاعد → شراء خبيث
         if predicted.get("down_target") and trend_dir == "up":
             if analysis.get("score_buy", 0) >= self.min_score - 3:
-                # 🔫 SNIPER BUY FILTER مع CVD
                 sniper_ok = True
                 if cvd_sig != "bullish":
                     sniper_ok = False
@@ -3606,7 +3687,7 @@ class UltraCouncilAI:
                 else:
                     return None, "buy_rejected_sniper_filter", analysis
 
-        # 4) Golden Zone Override — SNIPER مستقل شوية عن باقي الفلاتر
+        # 4) Golden Zone Override
         entry_signal = None
         reason = ""
         golden = analysis.get("golden_zone", {})
@@ -3616,21 +3697,18 @@ class UltraCouncilAI:
             score_buy  = float(analysis.get("score_buy", 0) or 0.0)
             score_sell = float(analysis.get("score_sell", 0) or 0.0)
 
-            # رَخّاوة درجة واحدة: نسمح بالذهبية حتى لو أقل من min_score بشوية
             min_golden_score = max(self.min_score - 3, 5)
 
-            # فلتر RF / Flow / VWAP / CVD لكن بشكل أخف
             rf_dir    = rf_info.get("dir", 0)
             buy_sig   = rf_info.get("buy_signal", False)
             sell_sig  = rf_info.get("sell_signal", False)
             vwap_ok_up   = (not vwap_price) or (current_price >= vwap_price * 0.995)
             vwap_ok_down = (not vwap_price) or (current_price <= vwap_price * 1.005)
 
-            # ===== GOLDEN BOTTOM SNIPER =====
             if zone_type == "golden_bottom" and score_buy >= min_golden_score:
-                rf_ok   = (rf_dir >= 0) or buy_sig       # RF معانا أو على الأقل مش عكسي
+                rf_ok   = (rf_dir >= 0) or buy_sig
                 flow_ok = flow_side not in ("SELL", "STRONG_SELL")
-                cvd_ok  = (cvd_sig != "bearish")        # ممنوع divergence بيعي قوي
+                cvd_ok  = (cvd_sig != "bearish")
 
                 if rf_ok and flow_ok and vwap_ok_up and cvd_ok:
                     entry_signal = "buy"
@@ -3639,7 +3717,6 @@ class UltraCouncilAI:
                         f"Score={score_buy:.1f} | Conf={confidence:.1f}"
                     )
 
-            # ===== GOLDEN TOP SNIPER =====
             elif zone_type == "golden_top" and score_sell >= min_golden_score:
                 rf_ok   = (rf_dir <= 0) or sell_sig
                 flow_ok = flow_side not in ("BUY", "STRONG_BUY")
@@ -3658,7 +3735,6 @@ class UltraCouncilAI:
         # 5) القرار العادي مع CVD Filter
         if entry_signal is None:
             if analysis.get("score_buy", 0) >= self.min_score and analysis["score_buy"] > analysis["score_sell"]:
-                # 🔫 SNIPER BUY FILTER
                 sniper_ok = True
                 if cvd_sig != "bullish":
                     sniper_ok = False
@@ -3679,7 +3755,6 @@ class UltraCouncilAI:
                     return None, "buy_rejected_sniper_filter", analysis
                     
             elif analysis.get("score_sell", 0) >= self.min_score and analysis["score_sell"] > analysis["score_buy"]:
-                # 🔫 SNIPER SELL FILTER
                 sniper_ok = True
                 if cvd_sig != "bearish":
                     sniper_ok = False
@@ -3730,7 +3805,7 @@ class UltraProAIBot:
         log_g(f"🔹 Risk Allocation: {RISK_ALLOC*100}%")
         log_g(f"🔹 Mode: {'LIVE' if MODE_LIVE else 'PAPER'} {'(DRY RUN)' if DRY_RUN else ''}")
         log_g(f"🔹 Web Service: http://0.0.0.0:{PORT}")
-        log_g("🔹 FEATURES: RF Real + EdgeAlgo + SMC + Golden Zones + Trap Mode + Stop-Hunt Prediction + SMART PROFIT ENGINE + Web Service + ULTRA PANEL + ADX+ATR FILTER + VWAP + Ultra Market Structure + AUTO-RECOVERY SYSTEM + EMA HOLD ENGINE + EMA CROSS CLASSIFIER")
+        log_g("🔹 FEATURES: RF Real + EdgeAlgo + SMC + Golden Zones + Trap Mode + Stop-Hunt Prediction + SMART PROFIT ENGINE + Web Service + ULTRA PANEL + ADX+ATR FILTER + VWAP + Ultra Market Structure + AUTO-RECOVERY SYSTEM + EMA HOLD ENGINE + EMA CROSS CLASSIFIER + TREND BIRTH ENGINE + SMART COOLDOWN SYSTEM")
         
         balance_now = self.exchange.get_balance()
         log_equity_snapshot(balance_now, self.state["compound_pnl"])
@@ -3761,15 +3836,12 @@ class UltraProAIBot:
                     time.sleep(5)
                     continue
 
-                # تحديث state بالرصيد
                 self.state["balance"] = balance
                 self.state.setdefault("compound_pnl", 0.0)
                 self.state["mode_live"] = MODE_LIVE
 
-                # Snapshot للرصيد كل دورة
                 log_equity_snapshot(balance, self.state.get("compound_pnl", 0.0))
 
-                # 🔄 Auto-Recovery: ركب على الصفقة لو موجودة
                 self.position_manager.sync_with_exchange(df)
 
                 if not self.state["open"]:
@@ -3796,39 +3868,48 @@ class UltraProAIBot:
                     time.sleep(5)
 
     def _handle_trading_decision(self, df, current_price, balance):
-        """معالجة قرار التداول المتكامل"""
+        """معالجة قرار التداول المتكامل مع نظام الكول داون الذكي"""
         if balance <= 10:
             return
 
-        # ⛔ فلتر كول داون بعد آخر صفقة
-        cd = int(self.state.get("cooldown_bars", 0) or 0)
-        if cd > 0:
-            # نقلّل العداد كل شمعة جديدة فقط
-            last_bar_time = self.state.get("last_bar_time")
-            current_bar_time = str(df.index[-1]) if hasattr(df, "index") else None
-            if current_bar_time and current_bar_time != last_bar_time:
-                self.state["cooldown_bars"] = max(cd - 1, 0)
-                self.state["last_bar_time"] = current_bar_time
-
-            log_i(
-                f"⏸ COOLDOWN ACTIVE | bars_left={self.state['cooldown_bars']} | "
-                f"last_close={self.state.get('last_close_reason')}"
-            )
-            return
-            
-        # تحليل السوق عبر مجلس الإدارة المتكامل
         decision, reason, analysis = self.council.should_enter_trade(df)
         
-        # تسجيل الـ Ultra Panel
         log_ultra_panel(analysis, self.state)
         
         if analysis.get("signals"):
             log_i(f"🔍 ULTRA Analysis: {', '.join(analysis['signals'][:3])}...")
         
         if decision:
+            # ===== SMART COOLDOWN CHECK =====
+            cooldown_active, mins_left = is_cooldown_active(self.state)
+            
+            if cooldown_active:
+                # استثناء: Trend Birth Engine يكسر الكول داون دائماً
+                tb = analysis.get("trend_birth", {})
+                if tb.get("active") and tb.get("confidence", 0) >= 0.80:
+                    log_w(
+                        f"⚡ TREND BIRTH OVERRIDE COOLDOWN: {tb['side']} @ {tb['entry_zone']} | "
+                        f"confidence={tb['confidence']:.2f} | "
+                        f"minutes_left={mins_left:.1f}"
+                    )
+                # استثناء: ترند قوي يكسر الكول داون
+                elif is_strong_trend_opportunity(decision, analysis):
+                    log_w(
+                        f"⚡ TREND STRENGTH OVERRIDE COOLDOWN: {decision.upper()} | "
+                        f"conf={analysis.get('confidence'):.2f} | "
+                        f"score_b={analysis.get('score_buy')} "
+                        f"score_s={analysis.get('score_sell')} | "
+                        f"minutes_left={mins_left:.1f}"
+                    )
+                else:
+                    log_i(
+                        f"⏸ COOLDOWN ACTIVE | minutes_left={mins_left:.1f} | "
+                        f"last_close={self.state.get('last_close_reason')}"
+                    )
+                    return
+
             log_i(f"🎯 ULTRA Decision: {reason}")
 
-            # عرض تفاصيل Edge Algo
             edge_setup = analysis.get("edge_setup")
             if edge_setup and edge_setup.get("valid"):
                 log_i(
@@ -3842,11 +3923,14 @@ class UltraProAIBot:
                     f"Tags: {edge_setup['tags']}"
                 )
 
-            # فتح المركز
+            tb = analysis.get("trend_birth", {})
+            if tb.get("active"):
+                analysis["trade_mode"] = "FULL_TREND"
+                log_i(f"🔥 TREND BIRTH MODE: {tb['side']} @ {tb['entry_zone']} → FULL_TREND profile")
+
             if self.position_manager.open_position(decision.upper(), df, analysis):
                 log_g(f"💰 ULTRA Position opened successfully | Signals: {len(analysis['signals'])}")
                 
-                # عرض تفاصيل Profit Profile
                 profile = self.state.get("profit_profile", "SCALP_STRICT")
                 log_i(f"📊 PROFIT PROFILE ACTIVATED: {profile} | سيتم إدارة الصفقة تلقائياً")
             else:
@@ -3866,9 +3950,15 @@ class UltraProAIBot:
             "version": BOT_VERSION
         }
         
-        # إضافة معلومات Profit Engine
         if self.state["open"] and self.state.get("profit_engine_active"):
             status["profit_engine"] = self.position_manager.profit_engine.get_status()
+        
+        cooldown_active, mins_left = is_cooldown_active(self.state)
+        status["cooldown"] = {
+            "active": cooldown_active,
+            "minutes_left": mins_left,
+            "until": self.state.get("cooldown_until")
+        }
         
         return status
 
@@ -3916,7 +4006,8 @@ def create_app(bot_instance):
             "trade_profile": status["position"].get("trade_profile", "N/A"),
             "profit_profile": status["position"].get("profit_profile", "N/A"),
             "profit_engine_active": status["position"].get("profit_engine_active", False),
-            "cooldown_bars": status["position"].get("cooldown_bars", 0),
+            "cooldown_active": status["cooldown"]["active"],
+            "cooldown_minutes_left": round(status["cooldown"]["minutes_left"], 1),
             "last_close_reason": status["position"].get("last_close_reason", None),
             "version": status["version"],
             "timestamp": datetime.now().isoformat()
@@ -3936,6 +4027,13 @@ def create_app(bot_instance):
             return jsonify({"status": "starting"})
         return jsonify({"error": "Bot already running or not initialized"})
     
+    @app.route("/reset_cooldown")
+    def reset_cooldown():
+        if bot_instance:
+            bot_instance.state["cooldown_until"] = None
+            return jsonify({"status": "cooldown_reset"})
+        return jsonify({"error": "Bot not running"})
+    
     return app
 
 # ============================================
@@ -3947,28 +4045,21 @@ def main():
     global bot
     
     try:
-        # طباعة البانر المحترف
         log_banner()
         
-        # إعداد معالجات الإشارات
         setup_signal_handlers()
         
-        # تشغيل KeepAlive loop
         threading.Thread(target=keepalive_loop, daemon=True).start()
         
-        # إنشاء البوت
         bot = UltraProAIBot()
         
-        # تشغيل البوت
         bot.start()
         
-        # تشغيل حلقة التداول في خيط منفصل
         trade_thread = threading.Thread(target=bot.trade_loop, daemon=True)
         trade_thread.start()
         
         log_g(f"🌐 Web Service starting on port {PORT}...")
         
-        # إنشاء وتشغيل Flask
         app_instance = create_app(bot)
         app_instance.run(host="0.0.0.0", port=PORT, debug=False, use_reloader=False)
         
