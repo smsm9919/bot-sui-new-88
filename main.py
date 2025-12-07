@@ -5027,16 +5027,10 @@ def pretty_snapshot(bal, info, ind, spread_bps, reason=None, df=None):
         print(colored(f"   {bal_line}", "yellow"))
         if STATE["open"]:
             lamp='🟩 LONG' if STATE['side']=='long' else '🟥 SHORT'
-            print(f"   {lamp}  Entry={fmt(STATE['entry'])}  Qty={fmt(STATE['qty'],4)}")
-print(f"   {lamp}  Entry={fmt(STATE['entry'])}  Qty={fmt(STATE['qty'],4)}  Bars={STATE['bars']}  Trail={fmt(STATE['trail'])}  BE={fmt(STATE['breakeven'])}")
+            print(f"   {lamp} {STATE['qty']:.4f} @ {STATE['entry']:.6f}  P&L={fmt(STATE['pnl'])}  bars={STATE['bars']}")
             print(f"   🎯 TP_done={STATE['profit_targets_achieved']}  HP={fmt(STATE['highest_profit_pct'],2)}%")
-            print(f"   🎯 MODE={STATE.get('mode', 'trend')}  TP_PROFILE={STATE.get('tp_profile', 'none')}  SIGNAL_STRENGTH={STATE.get('signal_strength', 'none')}")
-            profit_profile = STATE.get("profit_profile", {})
-            if isinstance(profit_profile, dict):
-                profile_label = profit_profile.get('label', 'unknown')
-                print(f"   📊 PROFILE_LABEL={profile_label}")
         else:
-            print("   🟦 NO POSITION")
+            print("   No position")
         print(colored("─"*100,"cyan"))
 # =================== API / KEEPALIVE ===================
 app = Flask(__name__)
