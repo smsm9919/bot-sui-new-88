@@ -4444,7 +4444,7 @@ def trade_loop_enhanced_with_smart_patch():
                     
                     # اكتشاف الانضغاط (الضغط قبل الاختراق)
                     range_5 = df['high'].astype(float).tail(5).max() - df['low'].astype(float).tail(5).min()
-                    range_10 = df['high'].ast(float).tail(10).max() - df['low'].astype(float).tail(10).min()
+                    range_10 = df['high'].astype(float).tail(10).max() - df['low'].astype(float).tail(10).min()
                     compression_ratio = range_5 / range_10 if range_10 > 0 else 1.0
                     is_compressed = compression_ratio < 0.5
                     
@@ -5015,7 +5015,7 @@ def pretty_snapshot(bal, info, ind, spread_bps, reason=None, df=None):
     if LOG_LEGACY:
         left_s = time_to_candle_close(df) if df is not None else 0
         print(colored("─"*100,"cyan"))
-        print(colored(f"📊 {SYMBOL} {INTERVAL} • {EXCHANGE_NAME.upper()} • {'LIVE' if MODE_LIVE else 'PAPER'} • {datetime.utcnow().strftime('%Y-%m-d %H:%M:%S')} UTC","cyan"))
+        print(colored(f"📊 {SYMBOL} {INTERVAL} • {EXCHANGE_NAME.upper()} • {'LIVE' if MODE_LIVE else 'PAPER'} • {datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S')} UTC","cyan"))
         print(colored("─"*100,"cyan"))
         print("📈 INDICATORS & RF")
         print(f"   💲 Price {fmt(info.get('price'))} | RF filt={fmt(info.get('filter'))}  hi={fmt(info.get('hi'))} lo={fmt(info.get('lo'))}")
