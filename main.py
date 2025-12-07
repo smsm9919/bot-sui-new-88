@@ -3533,7 +3533,7 @@ def open_market_enhanced(side, qty, price):
             "breakeven_armed": False,
             "highest_profit_pct": 0.0,
             "profit_targets_achieved": 0,
-            "profit_profile": profit_profile["label"],
+            "profit_profile": profit_profile,  # ✅ تخزين القاموس الكامل
             "council_controlled": STATE.get("last_entry_source") == "COUNCIL_STRONG"
         })
 
@@ -4160,11 +4160,17 @@ def manage_after_entry_enhanced_with_smart_patch(df, ind, info, performance_stat
     #  SMART PROFIT CORE (SCALP / TREND) — DYNAMIC BY COUNCIL
     # ============================================
 
-    profit_profile = STATE.get("profit_profile", {}) or {}
+    # ✅ إصلاح: معالجة profit_profile لضمان أنه قاموس
+    profit_profile = STATE.get("profit_profile")
+    if isinstance(profit_profile, str):
+        # إذا كان نصًا (من إصدار سابق)، استخدم القاموس المناسب
+        profit_profile = PROFIT_PROFILE_CONFIG.get(profit_profile, {})
+    elif not isinstance(profit_profile, dict):
+        profit_profile = {}
 
     if mode == "scalp":
         # نجيب هدف السكالب من البروفايل أو من الافتراضي
-        tp_full = profit_profile.get("scalp_tp_full_pct", SCALP_FULL_TP_PCT)
+        tp_full = profit_profile.get("scalp_tp_full_pct") if isinstance(profit_profile, dict) else SCALP_FULL_TP_PCT
         if pnl_pct >= tp_full and not STATE.get("smart_scalp_full_done", False):
             log_g(f"💰 SMART SCALP TP FULL [{profit_profile.get('type','n/a')}] "
                   f"| pnl={pnl_pct:.2f}% >= {tp_full:.2f}%")
@@ -4176,10 +4182,10 @@ def manage_after_entry_enhanced_with_smart_patch(df, ind, info, performance_stat
 
     else:
         # ترند: TP1 + TP2 ديناميك حسب البروفايل
-        tp1_pct = profit_profile.get("tp1_pct", TREND_TP1_PCT)        # افتراضي 1.5%
-        tp2_pct = profit_profile.get("tp2_pct", TREND_TP2_PCT)        # افتراضي 3.0%
-        tp1_frac = profit_profile.get("tp1_fraction", TREND_TP1_CLOSE_PCT)  # افتراضي 40%
-        tp2_frac = profit_profile.get("tp2_fraction", TREND_TP2_CLOSE_PCT)  # افتراضي 60%
+        tp1_pct = profit_profile.get("tp1_pct") if isinstance(profit_profile, dict) else TREND_TP1_PCT        # افتراضي 1.5%
+        tp2_pct = profit_profile.get("tp2_pct") if isinstance(profit_profile, dict) else TREND_TP2_PCT        # افتراضي 3.0%
+        tp1_frac = profit_profile.get("tp1_fraction") if isinstance(profit_profile, dict) else TREND_TP1_CLOSE_PCT  # افتراضي 40%
+        tp2_frac = profit_profile.get("tp2_fraction") if isinstance(profit_profile, dict) else TREND_TP2_CLOSE_PCT  # افتراضي 60%
 
         # TP1: إغلاق جزئي
         if (pnl_pct >= tp1_pct 
@@ -5001,7 +5007,7 @@ def pretty_snapshot(bal, info, ind, spread_bps, reason=None, df=None):
     if LOG_LEGACY:
         left_s = time_to_candle_close(df) if df is not None else 0
         print(colored("─"*100,"cyan"))
-        print(colored(f"📊 {SYMBOL} {INTERVAL} • {EXCHANGE_NAME.upper()} • {'LIVE' if MODE_LIVE else 'PAPER'} • {datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S')} UTC","cyan"))
+        print(colored(f"📊 {SYMBOL} {INTERVAL} • {EXCHANGE_NAME.upper()} • {'LIVE' if MODE_LIVE else 'PAPER'} • {datetime.utcnow().strftime('%Y-%m-d %H:%M:%S')} UTC","cyan"))
         print(colored("─"*100,"cyan"))
         print("📈 INDICATORS & RF")
         print(f"   💲 Price {fmt(info.get('price'))} | RF filt={fmt(info.get('filter'))}  hi={fmt(info.get('hi'))} lo={fmt(info.get('lo'))}")
@@ -5016,13 +5022,13 @@ def pretty_snapshot(bal, info, ind, spread_bps, reason=None, df=None):
             print(f"   {lamp}  Entry={fmt(STATE['entry'])}  Qty={fmt(STATE['qty'],4)}  Bars={STATE['bars']}  Trail={fmt(STATE['trail'])}  BE={fmt(STATE['breakeven'])}")
             print(f"   🎯 TP_done={STATE['profit_targets_achieved']}  HP={fmt(STATE['highest_profit_pct'],2)}%")
             print(f"   🎯 MODE={STATE.get('mode', 'trend')}  TP_PROFILE={STATE.get('tp_profile', 'none')}  SIGNAL_STRENGTH={STATE.get('signal_strength', 'none')}")
+            profit_profile = STATE.get("profit_profile", {})
+            if isinstance(profit_profile, dict):
+                profile_label = profit_profile.get('label', 'unknown')
+                print(f"   📊 PROFILE_LABEL={profile_label}")
         else:
-            print("   ⚪ FLAT")
-            if wait_for_next_signal_side:
-                print(colored(f"   ⏳ Waiting for opposite RF: {wait_for_next_signal_side.upper()}", "cyan"))
-        if reason: print(colored(f"   ℹ️ reason: {reason}", "white"))
+            print("   🟦 NO POSITION")
         print(colored("─"*100,"cyan"))
-
 # =================== API / KEEPALIVE ===================
 app = Flask(__name__)
 
