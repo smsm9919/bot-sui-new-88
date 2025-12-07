@@ -23,6 +23,7 @@ ULTRA PRO AI BOT - الإصدار المتكامل الذكي المحسن
 • EMA CROSS CLASSIFIER - نظام تصنيف تقاطع EMA القوي/الضعيف
 • TREND BIRTH ENGINE - نظام كشف ولادة الترند مع دخول OB/FVG
 • SMART COOLDOWN SYSTEM - نظام كول داون 30 دقيقة مع استثناء الترند القوي
+• ACCUMULATION ENGINE - تمييز تجميع السيولة الذكي من المصيدة
 """
 
 import os
@@ -44,6 +45,55 @@ import threading
 import sys
 import signal
 from termcolor import colored
+
+# =================== ACCUMULATION ENGINE ===================
+
+def detect_accumulation(df, smc, flow, htf):
+    """
+    يميز بين:
+    - liquidity_trap  → عكس الكسر
+    - smart_accum     → مع الاتجاه
+    """
+    score_trap = 0
+    score_smart = 0
+
+    # 1) Range ضيق + ADX ضعيف
+    if smc.get("range_pct", 99) < 1.5 and smc.get("adx", 99) < 18:
+        score_trap += 1
+        score_smart += 1
+
+    # 2) Wickiness + Sweeps
+    if smc.get("wick_factor", 0) > 1.5:
+        score_trap += 2
+
+    if smc.get("sweeps", 0) >= 2:
+        score_trap += 2
+
+    # 3) Flow
+    if flow.get("cvd_trend") == "flat":
+        score_trap += 1
+
+    if flow.get("cvd_trend") in ("up", "down"):
+        score_smart += 1
+
+    # 4) Structure
+    if smc.get("higher_lows"):
+        score_smart += 2
+
+    if smc.get("lower_highs"):
+        score_smart += 2
+
+    # 5) HTF Bias
+    if htf.get("trend") in ("bull", "bear"):
+        score_smart += 1
+
+    if score_trap >= 4 and score_trap > score_smart:
+        return {"type": "liquidity_trap", "score": score_trap}
+
+    if score_smart >= 4:
+        return {"type": "smart_accum", "score": score_smart}
+
+    return {"type": "none", "score": 0}
 
 Side = Literal["BUY", "SELL"]
 
@@ -301,143 +351,6 @@ def compute_indicators(df: pd.DataFrame) -> dict:
     }
 
 # =========================
-# RANGE FILTER REAL (RF) — PINE EXACT
-# =========================
-
-def compute_range_filter(df: pd.DataFrame, period: int = 20, qty: float = 3.5) -> dict:
-    """
-    تحويل سكريبت Pine Range Filter (DW) إلى Python
-    يرجّع:
-      - rf_filt, rf_dir
-      - rf_buy_signal, rf_sell_signal
-      - hi_band, lo_band
-    ويضيف الأعمدة دي في df أيضًا.
-    """
-    src = df["close"].astype(float).copy()
-
-    if len(src) < period + 2:
-        # df صغير → رجّع قيم افتراضية
-        df["rf_filt"] = src
-        df["rf_hi"] = src
-        df["rf_lo"] = src
-        df["rf_dir"] = 0
-        df["rf_buy_signal"] = False
-        df["rf_sell_signal"] = False
-        return {
-            "filt": float(src.iloc[-1]),
-            "hi_band": float(src.iloc[-1]),
-            "lo_band": float(src.iloc[-1]),
-            "dir": 0,
-            "buy_signal": False,
-            "sell_signal": False,
-        }
-
-    # ===== rng_size من Pine =====
-    diff = (src - src.shift(1)).abs()
-    avrng = diff.ewm(span=period, adjust=False).mean()
-    wper = (period * 2) - 1
-    ac = avrng.ewm(span=wper, adjust=False).mean() * qty  # AC في Pine
-
-    # ===== rng_filt array logic =====
-    filt_vals = []
-    hi_vals = []
-    lo_vals = []
-
-    # أول قيمة
-    first_x = float(src.iloc[0])
-    first_r = float(ac.iloc[0])
-    cur_filt = first_x
-    filt_vals.append(cur_filt)
-    hi_vals.append(cur_filt + first_r)
-    lo_vals.append(cur_filt - first_r)
-
-    for i in range(1, len(src)):
-        x = float(src.iloc[i])
-        r = float(ac.iloc[i])
-        prev = cur_filt
-
-        # نفس منطق:
-        # if x - r > rfilt[1] → rfilt[0] = x - r
-        if x - r > prev:
-            cur_filt = x - r
-        # if x + r < rfilt[1] → rfilt[0] = x + r
-        elif x + r < prev:
-            cur_filt = x + r
-        # else يبقى كما هو
-
-        filt_vals.append(cur_filt)
-        hi_vals.append(cur_filt + r)
-        lo_vals.append(cur_filt - r)
-
-    rf_filt = pd.Series(filt_vals, index=df.index)
-    hi_band = pd.Series(hi_vals, index=df.index)
-    lo_band = pd.Series(lo_vals, index=df.index)
-
-    # ===== Direction + Signals من Pine =====
-    fdir = [0] * len(src)
-    cond_ini = [0] * len(src)
-    long_sig = [False] * len(src)
-    short_sig = [False] * len(src)
-
-    for i in range(1, len(src)):
-        # fdir := filt > filt[1] ? 1 : filt < filt[1] ? -1 : fdir
-        if rf_filt.iloc[i] > rf_filt.iloc[i - 1]:
-            fdir[i] = 1
-        elif rf_filt.iloc[i] < rf_filt.iloc[i - 1]:
-            fdir[i] = -1
-        else:
-            fdir[i] = fdir[i - 1]
-
-        upward = fdir[i] == 1
-        downward = fdir[i] == -1
-
-        # longCond / shortCond من Pine بالظبط
-        longCond = (
-            (src.iloc[i] > rf_filt.iloc[i] and src.iloc[i] > src.iloc[i - 1] and upward)
-            or (src.iloc[i] > rf_filt.iloc[i] and src.iloc[i] < src.iloc[i - 1] and upward)
-        )
-        shortCond = (
-            (src.iloc[i] < rf_filt.iloc[i] and src.iloc[i] < src.iloc[i - 1] and downward)
-            or (src.iloc[i] < rf_filt.iloc[i] and src.iloc[i] > src.iloc[i - 1] and downward)
-        )
-
-        # CondIni := long ? 1 : short ? -1 : CondIni[1]
-        if longCond:
-            cond_ini[i] = 1
-        elif shortCond:
-            cond_ini[i] = -1
-        else:
-            cond_ini[i] = cond_ini[i - 1]
-
-        # longCondition = longCond and CondIni[1] == -1
-        if longCond and cond_ini[i - 1] == -1:
-            long_sig[i] = True
-        # shortCondition = shortCond and CondIni[1] == 1
-        if shortCond and cond_ini[i - 1] == 1:
-            short_sig[i] = True
-
-    rf_dir = pd.Series(fdir, index=df.index)
-    buy_series = pd.Series(long_sig, index=df.index)
-    sell_series = pd.Series(short_sig, index=df.index)
-
-    # الحق الأعمدة في df لاستخدامها لاحقاً لو حبّينا
-    df["rf_filt"] = rf_filt
-    df["rf_hi"] = hi_band
-    df["rf_lo"] = lo_band
-    df["rf_dir"] = rf_dir
-    df["rf_buy_signal"] = buy_series
-    df["rf_sell_signal"] = sell_series
-
-    return {
-        "filt": float(rf_filt.iloc[-1]),
-        "hi_band": float(hi_band.iloc[-1]),
-        "lo_band": float(lo_band.iloc[-1]),
-        "dir": int(rf_dir.iloc[-1]),
-        "buy_signal": bool(buy_series.iloc[-1]),
-        "sell_signal": bool(sell_series.iloc[-1]),
-    }
-
-# =========================
 # VWAP ENGINE (SESSION VWAP)
 # =========================
 
@@ -634,6 +547,157 @@ def classify_ema_crossover(df: pd.DataFrame, fast: int = 20, slow: int = 50, loo
             "fast": None,
             "slow": None,
         }
+
+# =========================
+# RANGE FILTER REAL (RF) — PINE EXACT
+# =========================
+
+def compute_range_filter(df: pd.DataFrame, period: int = 20, qty: float = 3.5) -> dict:
+    """
+    تحويل سكريبت Pine Range Filter (DW) إلى Python
+    يرجّع:
+      - rf_filt, rf_dir
+      - rf_buy_signal, rf_sell_signal
+      - hi_band, lo_band
+    ويضيف الأعمدة دي في df أيضًا.
+    """
+    src = df["close"].astype(float).copy()
+
+    if len(src) < period + 2:
+        # df صغير → رجّع قيم افتراضية
+        df["rf_filt"] = src
+        df["rf_hi"] = src
+        df["rf_lo"] = src
+        df["rf_dir"] = 0
+        df["rf_buy_signal"] = False
+        df["rf_sell_signal"] = False
+        return {
+            "filt": float(src.iloc[-1]),
+            "hi_band": float(src.iloc[-1]),
+            "lo_band": float(src.iloc[-1]),
+            "dir": 0,
+            "buy_signal": False,
+            "sell_signal": False,
+        }
+
+    # ===== rng_size من Pine =====
+    diff = (src - src.shift(1)).abs()
+    avrng = diff.ewm(span=period, adjust=False).mean()
+    wper = (period * 2) - 1
+    ac = avrng.ewm(span=wper, adjust=False).mean() * qty  # AC في Pine
+
+    # ===== rng_filt array logic =====
+    filt_vals = []
+    hi_vals = []
+    lo_vals = []
+
+    # أول قيمة
+    first_x = float(src.iloc[0])
+    first_r = float(ac.iloc[0])
+    cur_filt = first_x
+    filt_vals.append(cur_filt)
+    hi_vals.append(cur_filt + first_r)
+    lo_vals.append(cur_filt - first_r)
+
+    for i in range(1, len(src)):
+        x = float(src.iloc[i])
+        r = float(ac.iloc[i])
+        prev = cur_filt
+
+        # نفس منطق:
+        # if x - r > rfilt[1] → rfilt[0] = x - r
+        if x - r > prev:
+            cur_filt = x - r
+        # if x + r < rfilt[1] → rfilt[0] = x + r
+        elif x + r < prev:
+            cur_filt = x + r
+        # else يبقى كما هو
+
+        filt_vals.append(cur_filt)
+        hi_vals.append(cur_filt + r)
+        lo_vals.append(cur_filt - r)
+
+    rf_filt = pd.Series(filt_vals, index=df.index)
+    hi_band = pd.Series(hi_vals, index=df.index)
+    lo_band = pd.Series(lo_vals, index=df.index)
+
+    # ===== Direction + Signals من Pine =====
+    fdir = [0] * len(src)
+    cond_ini = [0] * len(src)
+    long_sig = [False] * len(src)
+    short_sig = [False] * len(src)
+
+    for i in range(1, len(src)):
+        # fdir := filt > filt[1] ? 1 : filt < filt[1] ? -1 : fdir
+        if rf_filt.iloc[i] > rf_filt.iloc[i - 1]:
+            fdir[i] = 1
+        elif rf_filt.iloc[i] < rf_filt.iloc[i - 1]:
+            fdir[i] = -1
+        else:
+            fdir[i] = fdir[i - 1]
+
+        upward = fdir[i] == 1
+        downward = fdir[i] == -1
+
+        # longCond / shortCond من Pine بالظبط
+        longCond = (
+            (src.iloc[i] > rf_filt.iloc[i] and src.iloc[i] > src.iloc[i - 1] and upward)
+            or (src.iloc[i] > rf_filt.iloc[i] and src.iloc[i] < src.iloc[i - 1] and upward)
+        )
+        shortCond = (
+            (src.iloc[i] < rf_filt.iloc[i] and src.iloc[i] < src.iloc[i - 1] and downward)
+            or (src.iloc[i] < rf_filt.iloc[i] and src.iloc[i] > src.iloc[i - 1] and downward)
+        )
+
+        # CondIni := long ? 1 : short ? -1 : CondIni[1]
+        if longCond:
+            cond_ini[i] = 1
+        elif shortCond:
+            cond_ini[i] = -1
+        else:
+            cond_ini[i] = cond_ini[i - 1]
+
+        # longCondition = longCond and CondIni[1] == -1
+        if longCond and cond_ini[i - 1] == -1:
+            long_sig[i] = True
+        # shortCondition = shortCond and CondIni[1] == 1
+        if shortCond and cond_ini[i - 1] == 1:
+            short_sig[i] = True
+
+    rf_dir = pd.Series(fdir, index=df.index)
+    buy_series = pd.Series(long_sig, index=df.index)
+    sell_series = pd.Series(short_sig, index=df.index)
+
+    # الحق الأعمدة في df لاستخدامها لاحقاً لو حبّينا
+    df["rf_filt"] = rf_filt
+    df["rf_hi"] = hi_band
+    df["rf_lo"] = lo_band
+    df["rf_dir"] = rf_dir
+    df["rf_buy_signal"] = buy_series
+    df["rf_sell_signal"] = sell_series
+
+    return {
+        "filt": float(rf_filt.iloc[-1]),
+        "hi_band": float(hi_band.iloc[-1]),
+        "lo_band": float(lo_band.iloc[-1]),
+        "dir": int(rf_dir.iloc[-1]),
+        "buy_signal": bool(buy_series.iloc[-1]),
+        "sell_signal": bool(sell_series.iloc[-1]),
+    }
+
+# =================== RF FAST MODE ===================
+
+def rf_fast_entry_allowed(rf_ctx, accel):
+    """
+    يسمح بدخول RF مبكر في الانفجارات
+    """
+    if not rf_ctx.get("flip"):
+        return False
+
+    if accel.get("range_expansion") and accel.get("momentum") > 0.7:
+        return True
+
+    return False
 
 # =========================
 # ULTRA MARKET STRUCTURE ENGINE
@@ -1276,6 +1340,19 @@ def select_profit_profile(trade_mode, analysis):
     ema_cross_label = ema_cross.get("label", "none")
     ema_cross_strength = ema_cross.get("strength")
 
+    # ================= ACCUMULATION ENGINE OVERRIDE =================
+    accumulation = analysis.get("accumulation", {})
+    acc_type = accumulation.get("type", "none")
+    
+    # 1) Smart Accumulation مع قوة CVD → ترند كامل
+    if acc_type == "smart_accum" and analysis.get("orderflow", {}).get("cvd_strength", 0) > 0.6:
+        return "FULL_TREND"
+    
+    # 2) Liquidity Trap → سكالب صارم
+    elif acc_type == "liquidity_trap":
+        return "SCALP_STRICT"
+    # ===============================================================
+
     # Trend Birth Override: استخدم FULL_TREND دائماً
     if analysis.get("trend_birth", {}).get("active"):
         return "FULL_TREND"
@@ -1529,6 +1606,14 @@ def log_ultra_panel(analysis: dict, state: dict):
             f"conf={trend_birth['confidence']:.2f} | "
             f"reasons={', '.join(trend_birth['reasons'])}"
         )
+    
+    # 14) ACCUMULATION ENGINE INFO
+    accumulation = a.get("accumulation", {})
+    if accumulation.get("type") != "none":
+        log_i(
+            f"🧠 ACCUMULATION: {accumulation['type']} (score={accumulation['score']}) | "
+            f"CVD_trend={of_ctx.get('cvd_trend', 'flat')}"
+        )
 
 # ============================================
 #  BOOT BANNER SYSTEM
@@ -1574,6 +1659,7 @@ def log_banner():
     print(colored("  • EMA CROSS CLASSIFIER - Strong/Weak Crossover Detection", "yellow"))
     print(colored("  • TREND BIRTH ENGINE - نظام كشف ولادة الترند مع دخول OB/FVG", "yellow", attrs=["bold"]))
     print(colored("  • SMART COOLDOWN SYSTEM - 30 دقيقة مع استثناء الترند القوي", "yellow", attrs=["bold"]))
+    print(colored("  • ACCUMULATION ENGINE - تمييز تجميع السيولة الذكي من المصيدة", "yellow", attrs=["bold"]))
 
     print("="*80)
     print(colored("🚀 INITIALIZING ULTRA PRO AI ENGINE...", "cyan", attrs=["bold"]))
@@ -1835,6 +1921,7 @@ class StateManager:
             "cooldown_until": None,
             "last_close_reason": None,
             "last_close_time": None,
+            "last_log": 0,
         }
         self.state_file = "bot_state.json"
         self.load_state()
@@ -1917,6 +2004,7 @@ class StateManager:
             "cooldown_until": None,
             "last_close_reason": None,
             "last_close_time": None,
+            "last_log": 0,
         })
         self.save_state()
     
@@ -2156,9 +2244,9 @@ class TrendAnalyzer:
         except:
             return 0.0
 
-# ============================================
-#  STOP HUNT DETECTION ENGINE WITH ADX+ATR FILTER
-# ============================================
+# =========================
+# STOP HUNT DETECTION ENGINE WITH ADX+ATR FILTER
+# =========================
 
 class StopHuntDetector:
     """محرك كشف مناطق ضرب الستوبات مع ADX+ATR فلتر"""
@@ -2363,9 +2451,9 @@ class StopHuntDetector:
                 active_zones.append(zone)
         return active_zones
 
-# ============================================
-#  PROFIT ENGINE - نظام جني الأرباح الذكي مع Hold-TP
-# ============================================
+# =========================
+# PROFIT ENGINE - نظام جني الأرباح الذكي مع Hold-TP
+# =========================
 
 class ProfitEngine:
     """محرك جني الأرباح والوقف المتحرك الذكي مع Hold-TP"""
@@ -2718,6 +2806,20 @@ class SmartPositionManager:
             trade_type = "trend_birth"
             trade_mode = "FULL_TREND"
 
+        # ================= ACCUMULATION ENGINE OVERRIDE =================
+        accumulation = analysis.get("accumulation", {})
+        acc_type = accumulation.get("type", "none")
+        
+        if acc_type == "liquidity_trap":
+            trade_type = "liquidity_trap"
+            trade_mode = "SCALP"
+            log_g("🧠 Liquidity Trap Detected → SCALP Mode")
+        elif acc_type == "smart_accum":
+            trade_type = "smart_accum"
+            trade_mode = "TREND"
+            log_g("🧠 Smart Accumulation Detected → TREND Mode")
+        # ===============================================================
+
         if self.exchange.execute_order(exchange_side, position_size, current_price):
             self.state.update({
                 "open": True,
@@ -2785,6 +2887,7 @@ class SmartPositionManager:
             "stop_hunt_trap_side": None,
             "stop_hunt_trap_quality": 0.0,
             "signals": ["RECOVERED_FROM_EXCHANGE"],
+            "accumulation": {"type": "none", "score": 0}
         }
         trade_mode = "SCALP"
 
@@ -3118,6 +3221,30 @@ class EdgeAlgoEngine:
         self.last_setup = setup
         return setup
 
+# =========================
+# HTF TREND ENGINE
+# =========================
+
+def compute_htf_trend(df, period=50):
+    """
+    حساب اتجاه الاتجاه العام (HTF) باستخدام بسيط للـ SMA.
+    """
+    if len(df) < period:
+        return {"trend": "range"}
+
+    close = df["close"].astype(float)
+    sma = close.rolling(window=period).mean()
+
+    current_close = close.iloc[-1]
+    current_sma = sma.iloc[-1]
+
+    if current_close > current_sma * 1.02:
+        return {"trend": "bull"}
+    elif current_close < current_sma * 0.98:
+        return {"trend": "bear"}
+    else:
+        return {"trend": "range"}
+
 # ============================================
 #  ULTRA COUNCIL AI - نظام التصويت الذكي المتكامل
 # ============================================
@@ -3197,6 +3324,7 @@ class UltraCouncilAI:
                 "sell_wall": False,
                 "wall_side": None,
                 "wall_distance": None,
+                "cvd_trend": "flat",
             },
             "cvd_divergence": {
                 "signal": None,
@@ -3221,6 +3349,8 @@ class UltraCouncilAI:
                 "entry_zone": None,
                 "reasons": []
             },
+            "htf_ctx": {"trend": "range"},
+            "accumulation": {"type": "none", "score": 0},
         }
 
     def build_context(self, df, current_price, stop_hunt_info, fvg_ctx, liquidity_zones):
@@ -3231,6 +3361,13 @@ class UltraCouncilAI:
             "liquidity_sweep": False,
             "fake_break": False,
             "stop_hunt_zone": False,
+            "adx": 0,
+            "higher_lows": False,
+            "lower_highs": False,
+            "stop_hunt_zones": [],
+            "range_pct": 0,
+            "wick_factor": 0,
+            "sweeps": 0,
         }
 
         high = df["high"].astype(float)
@@ -3251,6 +3388,35 @@ class UltraCouncilAI:
             diff_pct = abs(current_price - level) / current_price
             if diff_pct < 0.002:
                 ctx["liquidity_sweep"] = True
+
+        # حساب ADX من trend_info (سيتم إضافته لاحقًا)
+        ctx["adx"] = self.trend_analyzer.adx
+
+        # حساب higher_lows و lower_highs
+        lows = low.tail(lookback).values
+        highs = high.tail(lookback).values
+        ctx["higher_lows"] = all(lows[i] >= lows[i-1] for i in range(1, len(lows))) if len(lows) > 1 else False
+        ctx["lower_highs"] = all(highs[i] <= highs[i-1] for i in range(1, len(highs))) if len(highs) > 1 else False
+
+        # حساب النطاق المئوي
+        range_pct = (recent_high - recent_low) / recent_low * 100 if recent_low > 0 else 0
+        ctx["range_pct"] = range_pct
+
+        # حساب Wick factor
+        wick_ratios = []
+        for i in range(-10, 0):
+            candle_high = high.iloc[i]
+            candle_low = low.iloc[i]
+            candle_close = df["close"].iloc[i]
+            candle_open = df["open"].iloc[i]
+            body = abs(candle_close - candle_open)
+            wick = (candle_high - candle_low) - body
+            if body != 0:
+                wick_ratios.append(wick / body)
+        ctx["wick_factor"] = sum(wick_ratios) / len(wick_ratios) if wick_ratios else 0
+
+        # حساب Sweeps
+        ctx["sweeps"] = stop_hunt_info.get("active_count", 0)
 
         return ctx
 
@@ -3295,6 +3461,21 @@ class UltraCouncilAI:
                 elif wall_side == "SELL":
                     score_sell += 0.5
                     signals.append("🧱 Sell Wall Resistance")
+            
+            # حساب اتجاه CVD
+            cvd_values = compute_cvd_from_ohlcv(df)
+            if len(cvd_values) >= 10:
+                recent_cvd = cvd_values.iloc[-10:]
+                if recent_cvd.is_monotonic_increasing:
+                    cvd_trend = "up"
+                elif recent_cvd.is_monotonic_decreasing:
+                    cvd_trend = "down"
+                else:
+                    cvd_trend = "flat"
+            else:
+                cvd_trend = "flat"
+            
+            orderflow_ctx["cvd_trend"] = cvd_trend
             
             cvd_sig = detect_cvd_divergence(df)
             analysis_result = self._empty_analysis()
@@ -3346,6 +3527,16 @@ class UltraCouncilAI:
                 signals.append(
                     f"🔥 TREND BIRTH {trend_birth['side']} @ {trend_birth['entry_zone']}"
                 )
+            
+            # ===== ACCUMULATION ENGINE =====
+            htf_ctx = compute_htf_trend(df, period=50)
+            
+            accumulation_ctx = detect_accumulation(df, smc_ctx, orderflow_ctx, htf_ctx)
+            analysis_result["accumulation"] = accumulation_ctx
+            analysis_result["htf_ctx"] = htf_ctx
+            
+            if accumulation_ctx["type"] != "none":
+                signals.append(f"🧠 ACCUMULATION: {accumulation_ctx['type']} (score={accumulation_ctx['score']})")
             
             # ===== RF REAL CONTRIBUTION =====
             if rf_ctx.get("buy_signal") and current_price > rf_ctx.get("filt", current_price):
@@ -3520,6 +3711,10 @@ class UltraCouncilAI:
                 {},
                 self.stop_hunt_detector.detect_liquidity_zones(current_price)
             )
+            
+            # إضافة بيانات الستوب هانت إلى smc_ctx
+            smc_ctx["stop_hunt_zones"] = stop_hunt_zones
+            smc_ctx["adx"] = trend_info.get("adx", 0)
 
             edge_setup = None
             if edge_side:
@@ -3592,10 +3787,13 @@ class UltraCouncilAI:
                 "ema_trend": ema_trend,
                 "ema_cross": ema_cross,
                 "trend_birth": trend_birth,
+                "htf_ctx": htf_ctx,
+                "accumulation": accumulation_ctx,
             }
             
         except Exception as e:
             log_e(f"❌ Ultra market analysis error: {e}")
+            traceback.print_exc()
             return self._empty_analysis()
 
     def should_enter_trade(self, df):
@@ -3611,6 +3809,44 @@ class UltraCouncilAI:
             entry_signal = "buy" if tb["side"] == "BUY" else "sell"
             reason = f"TREND_BIRTH_{tb['side']}_{tb['entry_zone']}"
             return entry_signal, reason, analysis
+
+        # ================= ACCUMULATION ENGINE DECISION =================
+        accumulation = analysis.get("accumulation", {})
+        acc_type = accumulation.get("type", "none")
+        
+        # 1) Liquidity Trap → عكس الكسر
+        if acc_type == "liquidity_trap":
+            smc_ctx = analysis.get("smc_ctx", {})
+            last_sweep = None
+            
+            # تحديد اتجاه الكسر الأخير من stop_hunt_zones
+            stop_hunt_zones = smc_ctx.get("stop_hunt_zones", [])
+            if stop_hunt_zones:
+                last_zone = stop_hunt_zones[-1]
+                if last_zone["type"] == "buy_stop_hunt":
+                    last_sweep = "down"  # كسر هابط
+                elif last_zone["type"] == "sell_stop_hunt":
+                    last_sweep = "up"    # كسر صاعد
+            
+            if last_sweep == "up":
+                if analysis.get("score_sell", 0) >= self.min_score - 2:
+                    return "sell", f"🧠 Liquidity Trap detected → EXPECT SELL (counter breakout)", analysis
+            elif last_sweep == "down":
+                if analysis.get("score_buy", 0) >= self.min_score - 2:
+                    return "buy", f"🧠 Liquidity Trap detected → EXPECT BUY (counter breakout)", analysis
+        
+        # 2) Smart Accumulation → مع الاتجاه
+        elif acc_type == "smart_accum":
+            htf_ctx = analysis.get("htf_ctx", {})
+            htf_trend = htf_ctx.get("trend", "range")
+            
+            if htf_trend == "bull":
+                if analysis.get("score_buy", 0) >= self.min_score - 1:
+                    return "buy", f"🧠 Smart Accumulation → CONTINUATION BUY", analysis
+            elif htf_trend == "bear":
+                if analysis.get("score_sell", 0) >= self.min_score - 1:
+                    return "sell", f"🧠 Smart Accumulation → CONTINUATION SELL", analysis
+        # ===============================================================
 
         trap_side = analysis.get("stop_hunt_trap_side")
         trap_q = analysis.get("stop_hunt_trap_quality", 0.0)
@@ -3805,7 +4041,7 @@ class UltraProAIBot:
         log_g(f"🔹 Risk Allocation: {RISK_ALLOC*100}%")
         log_g(f"🔹 Mode: {'LIVE' if MODE_LIVE else 'PAPER'} {'(DRY RUN)' if DRY_RUN else ''}")
         log_g(f"🔹 Web Service: http://0.0.0.0:{PORT}")
-        log_g("🔹 FEATURES: RF Real + EdgeAlgo + SMC + Golden Zones + Trap Mode + Stop-Hunt Prediction + SMART PROFIT ENGINE + Web Service + ULTRA PANEL + ADX+ATR FILTER + VWAP + Ultra Market Structure + AUTO-RECOVERY SYSTEM + EMA HOLD ENGINE + EMA CROSS CLASSIFIER + TREND BIRTH ENGINE + SMART COOLDOWN SYSTEM")
+        log_g("🔹 FEATURES: RF Real + EdgeAlgo + SMC + Golden Zones + Trap Mode + Stop-Hunt Prediction + SMART PROFIT ENGINE + Web Service + ULTRA PANEL + ADX+ATR FILTER + VWAP + Ultra Market Structure + AUTO-RECOVERY SYSTEM + EMA HOLD ENGINE + EMA CROSS CLASSIFIER + TREND BIRTH ENGINE + SMART COOLDOWN SYSTEM + ACCUMULATION ENGINE")
         
         balance_now = self.exchange.get_balance()
         log_equity_snapshot(balance_now, self.state["compound_pnl"])
@@ -3848,6 +4084,19 @@ class UltraProAIBot:
                     self._handle_trading_decision(df, current_price, balance)
                 else:
                     self.position_manager.manage_position(df)
+                    
+                    # ================= LIVE LOG كل 30 ثانية =================
+                    now_ts = time.time()
+                    if now_ts - self.state.get("last_log", 0) >= 30:
+                        self.state["last_log"] = now_ts
+                        analysis = self.council.analyze_market(df)
+                        log_i(
+                            f"📊 LIVE | {self.state.get('side', 'NO_POS').upper()} | "
+                            f"mode={self.state.get('trade_type', 'N/A')} | "
+                            f"acc={analysis.get('accumulation', {}).get('type', 'none')} | "
+                            f"cvd={analysis.get('orderflow', {}).get('cvd_trend', 'flat')} | "
+                            f"vwap={analysis.get('vwap', 0):.4f}"
+                        )
 
                 consecutive_errors = 0
                 time.sleep(10)
