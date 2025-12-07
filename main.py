@@ -627,45 +627,64 @@ class TrendAnalyzer:
             self.trend = "flat"
             
     def _calculate_adx_atr(self, df):
-        """حساب ADX و DI و ATR"""
+        """حساب ADX و DI و ATR بطريقة مبسطة"""
         try:
             if len(df) < 14:
                 return
                 
-            high = df['high'].astype(float)
-            low = df['low'].astype(float)
-            close = df['close'].astype(float)
+            # نسخة من dataframe لضمان عدم التعديل على الأصل
+            df_copy = df.copy()
+            df_copy['high'] = df_copy['high'].astype(float)
+            df_copy['low'] = df_copy['low'].astype(float)
+            df_copy['close'] = df_copy['close'].astype(float)
             
-            # حساب +DM و -DM
-            plus_dm = high.diff()
-            minus_dm = -low.diff()
+            # حساب True Range (TR)
+            high_low = df_copy['high'] - df_copy['low']
+            high_close = abs(df_copy['high'] - df_copy['close'].shift(1))
+            low_close = abs(df_copy['low'] - df_copy['close'].shift(1))
             
-            plus_dm = np.where((plus_dm > minus_dm) & (plus_dm > 0), plus_dm, 0)
-            minus_dm = np.where((minus_dm > plus_dm) & (minus_dm > 0), minus_dm, 0)
-            
-            # حساب TR
-            tr1 = high - low
-            tr2 = abs(high - close.shift(1))
-            tr3 = abs(low - close.shift(1))
-            tr = np.maximum(np.maximum(tr1, tr2), tr3)
-            
-            # حساب المتوسطات
+            tr = pd.concat([high_low, high_close, low_close], axis=1).max(axis=1)
             atr = tr.rolling(14).mean()
             self.atr = float(atr.iloc[-1]) if not pd.isna(atr.iloc[-1]) else 0.0
             
             # حساب ATR Multiplier
-            atr_base = tr.rolling(20).mean().iloc[-1] if len(tr) >= 20 else self.atr
+            if len(tr) >= 20:
+                atr_base = tr.rolling(20).mean().iloc[-1]
+            else:
+                atr_base = self.atr
             self.atr_mult = self.atr / atr_base if atr_base > 0 else 1.0
             
-            # حساب DI
-            plus_di = 100 * (plus_dm.rolling(14).mean() / atr)
-            minus_di = 100 * (minus_dm.rolling(14).mean() / atr)
+            # حساب +DM و -DM
+            up_move = df_copy['high'] - df_copy['high'].shift(1)
+            down_move = df_copy['low'].shift(1) - df_copy['low']
+            
+            plus_dm = pd.Series(0.0, index=df_copy.index)
+            minus_dm = pd.Series(0.0, index=df_copy.index)
+            
+            # شروط +DM
+            cond_plus = (up_move > down_move) & (up_move > 0)
+            plus_dm[cond_plus] = up_move
+            
+            # شروط -DM
+            cond_minus = (down_move > up_move) & (down_move > 0)
+            minus_dm[cond_minus] = down_move
+            
+            # حساب المتوسطات للـ DM
+            plus_dm_smooth = plus_dm.rolling(14).mean()
+            minus_dm_smooth = minus_dm.rolling(14).mean()
+            
+            # حساب +DI و -DI
+            plus_di = 100 * (plus_dm_smooth / atr)
+            minus_di = 100 * (minus_dm_smooth / atr)
             
             self.di_plus = float(plus_di.iloc[-1]) if not pd.isna(plus_di.iloc[-1]) else 0.0
             self.di_minus = float(minus_di.iloc[-1]) if not pd.isna(minus_di.iloc[-1]) else 0.0
             
             # حساب ADX
-            dx = 100 * abs(plus_di - minus_di) / (plus_di + minus_di)
+            # تجنب القسمة على صفر
+            di_sum = plus_di + minus_di
+            di_sum = di_sum.replace(0, 0.001)
+            dx = 100 * abs(plus_di - minus_di) / di_sum
             adx = dx.rolling(14).mean()
             self.adx = float(adx.iloc[-1]) if not pd.isna(adx.iloc[-1]) else 0.0
             
