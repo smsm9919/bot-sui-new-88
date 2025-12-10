@@ -1450,13 +1450,16 @@ ex = make_ex()
 # =================== EXCHANGE-SPECIFIC ADAPTERS ===================
 def exchange_specific_params(side, is_close=False):
     if EXCHANGE_NAME == "bybit":
-        if POSITION_MODE == "hedge":
-            return {"positionSide": "Long" if side == "buy" else "Short", "reduceOnly": is_close}
-        return {"positionSide": "Both", "reduceOnly": is_close}
+        # ✅ ONEWAY mode الصحيح مع Bybit
+        return {"reduceOnly": is_close}
     else:
         if POSITION_MODE == "hedge":
-            return {"positionSide": "LONG" if side == "buy" else "SHORT", "reduceOnly": is_close}
+            return {
+                "positionSide": "LONG" if side == "buy" else "SHORT",
+                "reduceOnly": is_close
+            }
         return {"positionSide": "BOTH", "reduceOnly": is_close}
+
 
 def exchange_set_leverage(exchange, leverage, symbol):
     try:
