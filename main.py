@@ -3661,11 +3661,9 @@ def _arm_wait_after_close(prev_side):
     log_i(f"🛑 WAIT FOR NEXT SIGNAL: {wait_for_next_signal_side}")
 
 def wait_gate_allow(df, info):
-    if wait_for_next_signal_side is None: 
-        return True, ""
-    
-    bar_ts = int(info.get("time") or 0)
-    need = (wait_for_next_signal_side=="buy" and info.get("long")) or (wait_for_next_signal_side=="sell" and info.get("short"))
+    # تعطيل منطق الانتظار بعد إغلاق الصفقة
+    return True, ""
+
     
     if need:
         return True, ""
