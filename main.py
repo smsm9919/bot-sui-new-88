@@ -193,8 +193,9 @@ COOLDOWN_SECONDS = 10 * 60  # 10 دقائق تبريد بعد أي صفقة كا
 ADX_GATE = 17
 
 # =================== ZONE / ADX / LIQUIDITY / CROSS GATES ===================
-ZONE_STRONG_THRESHOLD = 7.5
-ZONE_MID_THRESHOLD    = 5.0
+ZONE_STRONG_THRESHOLD = 7.0   # بدل 7.5 - دخول أسهل للمناطق القوية
+ZONE_MID_THRESHOLD    = 5.0   # كما هي
+
 ZONE_TOUCH_LOOKBACK   = 150    # عدد الشموع لقياس لمس/كسر المنطقة
 
 ADX_ACCUM_MAX         = 18.0
@@ -1415,8 +1416,11 @@ def compute_zone_strength(zone: dict) -> dict:
         zone["volume_score"] * 0.4 +
         zone["touches"]      * 0.2 +
         zone["holds"]        * 0.3 -
-        zone["breaks"]       * 0.3
+        min(zone["breaks"], 3) * 0.3   # ما نعاقبش بأكتر من 3 كسور
     )
+    
+    # Clamp بين 0 و 10 — مفيش أرقام بالسالب
+    strength = max(0.0, min(strength, 10.0))
     zone["strength"] = float(strength)
 
     if strength >= ZONE_STRONG_THRESHOLD:
@@ -1667,30 +1671,27 @@ def compute_cross_strength(df: pd.DataFrame, side: str, current_zone: dict | Non
 def evaluate_entry_gates(df: pd.DataFrame, side: str, council_data: dict, smc_data: dict, snap: dict):
     """
     Gate نهائي قبل فتح الصفقة:
-      1) STRONG_ZONE فقط
-      2) Liquidity Absorption (مش توزيع فاضي)
-      3) ADX Cycle صحي (accumulation→expansion أو trend)
-      4) Cross Strength ≥ 5
-      5) ممنوع دخول مع ADX exhaustion + RSI divergence ضدّك
+      • Strong Zone → مسموح لو باقي الشروط تمام
+      • Mid Zone    → مسموح فقط لو:
+            - BOS في نفس الاتجاه
+            - ADX = trend قوي (مش مجرد expansion)
+            - Liquidity Absorption في نفس الاتجاه
+            - Cross Strength ≥ 6
+      • Weak Zone   → ممنوع تمامًا
     """
     current_price = float(last_val(df["close"]))
     flow = snap.get("flow") or {}
+    market_structure = (smc_data or {}).get("market_structure", {}) or {}
 
     # 1) Zone Intelligence
     zone_info = zone_intelligence(df, smc_data, side, current_price)
     zone_grade = zone_info["grade"]
-    strong_zone = (zone_grade == "strong")
+    is_weak   = (zone_grade == "weak")
+    is_mid    = (zone_grade == "mid")
+    is_strong = (zone_grade == "strong")
 
-    if not strong_zone:
-        return False, {
-            "reason": f"zone_not_strong ({zone_grade})",
-            "zone": zone_info,
-            "adx": None,
-            "liquidity": None,
-            "cross_strength": None
-        }
-
-    if zone_grade == "weak":
+    # Weak → Block دايمًا
+    if is_weak:
         return False, {
             "reason": "weak_zone_blocked",
             "zone": zone_info,
@@ -1699,7 +1700,7 @@ def evaluate_entry_gates(df: pd.DataFrame, side: str, council_data: dict, smc_da
             "cross_strength": None
         }
 
-    # 2) Liquidity Engine
+    # 2) Liquidity Engine (Absorption vs Distribution)
     liquidity_regime = classify_liquidity_regime(df, flow)
     if liquidity_regime not in ("buy_absorption", "sell_absorption"):
         return False, {
@@ -1710,7 +1711,7 @@ def evaluate_entry_gates(df: pd.DataFrame, side: str, council_data: dict, smc_da
             "cross_strength": None
         }
 
-    # ممنوع BUY لو فيه Sell Absorption فوقك
+    # ممنوع BUY لو فوقه Sell Absorption / وممنوع SELL لو تحته Buy Absorption
     if side == "BUY" and liquidity_regime == "sell_absorption":
         return False, {
             "reason": "sell_absorption_above_head",
@@ -1719,7 +1720,6 @@ def evaluate_entry_gates(df: pd.DataFrame, side: str, council_data: dict, smc_da
             "liquidity": liquidity_regime,
             "cross_strength": None
         }
-    # ممنوع SELL لو فيه Buy Absorption تحتك
     if side == "SELL" and liquidity_regime == "buy_absorption":
         return False, {
             "reason": "buy_absorption_below_feet",
@@ -1731,16 +1731,16 @@ def evaluate_entry_gates(df: pd.DataFrame, side: str, council_data: dict, smc_da
 
     # 3) ADX / ATR Phase
     adx_phase, adx_meta = compute_adx_atr_phase(df)
-
     prev_phase = adx_meta.get("prev_phase")
+
+    # منطق عام (Strong + Mid) – لازم تكون في Expansion/Trend
     phase_ok = False
-    # BUY من القاع: accumulation → expansion
     if side == "BUY":
         if prev_phase == "accumulation" and adx_phase in ("expansion", "trend"):
             phase_ok = True
         elif adx_phase == "trend":
             phase_ok = True
-    else:  # SELL من القمة: نعتبر نفس المنطق كـ دورة ترند
+    else:  # SELL
         if prev_phase == "accumulation" and adx_phase in ("expansion", "trend"):
             phase_ok = True
         elif adx_phase == "trend":
@@ -1777,23 +1777,75 @@ def evaluate_entry_gates(df: pd.DataFrame, side: str, council_data: dict, smc_da
 
     # 5) Cross Strength
     cross_strength = compute_cross_strength(df, side, zone_info.get("zone"))
-    if cross_strength < 5.0:
+
+    # Strong Zone: نكتفي بـ Cross ≥ 5
+    if is_strong and cross_strength < 5.0:
         return False, {
-            "reason": f"cross_strength_low ({cross_strength:.1f})",
+            "reason": f"cross_strength_low_strong ({cross_strength:.1f})",
             "zone": zone_info,
             "adx": {"phase": adx_phase, **adx_meta},
             "liquidity": liquidity_regime,
             "cross_strength": cross_strength
         }
 
-    # كل حاجة PASS
+    # Mid Zone: شروط زيادة (BOS + ADX trend قوي + Cross ≥ 6 + Absorption في نفس الاتجاه)
+    if is_mid:
+        # لازم BOS في نفس اتجاه الصفقة
+        bos_ok = False
+        if side == "BUY" and market_structure.get("bos_bullish"):
+            bos_ok = True
+        if side == "SELL" and market_structure.get("bos_bearish"):
+            bos_ok = True
+
+        if not bos_ok:
+            return False, {
+                "reason": "mid_zone_without_matching_BOS",
+                "zone": zone_info,
+                "adx": {"phase": adx_phase, **adx_meta},
+                "liquidity": liquidity_regime,
+                "cross_strength": cross_strength
+            }
+
+        # Mid Zone → نسمح فقط لو ADX فعليًا في حالة TRND (مش بس expansion)
+        if adx_phase != "trend":
+            return False, {
+                "reason": f"mid_zone_adx_not_trend ({adx_phase})",
+                "zone": zone_info,
+                "adx": {"phase": adx_phase, **adx_meta},
+                "liquidity": liquidity_regime,
+                "cross_strength": cross_strength
+            }
+
+        # Cross لازم يكون أقوى (≥ 6)
+        if cross_strength < CROSS_STRONG_THRESHOLD:  # 6.0
+            return False, {
+                "reason": f"mid_zone_cross_not_strong ({cross_strength:.1f})",
+                "zone": zone_info,
+                "adx": {"phase": adx_phase, **adx_meta},
+                "liquidity": liquidity_regime,
+                "cross_strength": cross_strength
+            }
+
+        # Liquidity Absorption بالفعل اتحققت فوق – هنا بس نوضح في اللوج إنها صفقة Mid
+        return True, {
+            "reason": None,
+            "grade": "mid",
+            "zone": zone_info,
+            "adx": {"phase": adx_phase, **adx_meta},
+            "liquidity": liquidity_regime,
+            "cross_strength": cross_strength
+        }
+
+    # Strong Zone وكل الشروط عدّت
     return True, {
         "reason": None,
+        "grade": "strong",
         "zone": zone_info,
         "adx": {"phase": adx_phase, **adx_meta},
         "liquidity": liquidity_regime,
         "cross_strength": cross_strength
     }
+
 
 # =================== PROFESSIONAL COUNCIL WITH SMC ===================
 def ultimate_council_professional(df):
