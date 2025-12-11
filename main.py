@@ -185,7 +185,7 @@ def detect_fvg(candles):
 
     # Bullish FVG
     if a['high'] < c['low']:
-        return ("bullish", a['high'], c['low'])
+        return ("bullish", a['high"], c['low'])
 
     # Bearish FVG
     if a['low'] > c['high']:
@@ -1571,47 +1571,84 @@ def compute_momentum_indicators(df):
     }
 
 def compute_trend_strength(df, ind):
-    close = df['close'].astype(float)
-    adx = safe_get(ind, 'adx', 0)
-    plus_di = safe_get(ind, 'plus_di', 0)
-    minus_di = safe_get(ind, 'minus_di', 0)
-    
-    momentum_5 = ((close.iloc[-1] - close.iloc[-5]) / close.iloc[-5]) * 100 if len(close) >= 5 else 0
-    momentum_10 = ((close.iloc[-1] - close.iloc[-10]) / close.iloc[-10]) * 100 if len(close) >= 10 else 0
-    
-    trend_consistency = 0
-    if len(close) >= 10:
-        up_days = sum(close.diff().tail(10) > 0)
-        down_days = sum(close.diff().tail(10) < 0)
-        trend_consistency = max(up_days, down_days) / 10.0
-    
-    if adx > 40 and abs(momentum_5) > 3.0 and trend_consistency > 0.7:
-        strength = "very_strong"
-        multiplier = 2.0
-    elif adx > 30 and abs(momentum_5) > 2.0 and trend_consistency > 0.6:
-        strength = "strong"
-        multiplier = 1.5
-    elif adx > 25 and abs(momentum_5) > 1.0:
-        strength = "moderate"
-        multiplier = 1.2
-    elif adx > 20:
-        strength = "weak"
-        multiplier = 1.0
-    else:
-        strength = "no_trend"
-        multiplier = 0.8
-    
-    direction = "up" if plus_di > minus_di else "down"
-    
-    return {
-        "strength": strength,
-        "direction": direction,
-        "multiplier": multiplier,
-        "adx": adx,
-        "momentum_5": momentum_5,
-        "momentum_10": momentum_10,
-        "consistency": trend_consistency
-    }
+    """
+    Trend Strength Engine (EdgeAlgo Style)
+    يحلل الاتجاه الحقيقي بناءً على:
+        - EMA 20 / EMA 50 / EMA 100
+        - slope
+        - ADX / DI
+        - momentum
+    ويرجع:
+        trend: bull / bear / chop
+        direction: up / down / flat
+        strength: weak / moderate / strong / very_strong
+        confidence: رقم صغير 0 → 1
+        multiplier: 1 → 2 حسب صلابة الترند
+    """
+    try:
+        close = df["close"].astype(float)
+        ema20 = close.ewm(span=20).mean()
+        ema50 = close.ewm(span=50).mean()
+        ema100 = close.ewm(span=100).mean()
+
+        c = close.iloc[-1]
+        e20 = ema20.iloc[-1]
+        e50 = ema50.iloc[-1]
+        e100 = ema100.iloc[-1]
+
+        adx = float(ind.get("adx", 0.0))
+        plus_di = float(ind.get("plus_di", 0.0))
+        minus_di = float(ind.get("minus_di", 0.0))
+
+        # اتجاه أساسي
+        if c > e20 > e50 > e100:
+            direction = "up"
+        elif c < e20 < e50 < e100:
+            direction = "down"
+        else:
+            direction = "flat"
+
+        # قوة الاتجاه
+        if adx >= 35 and abs(plus_di - minus_di) >= 10:
+            strength = "very_strong"
+            multiplier = 2.0
+        elif adx >= 25:
+            strength = "strong"
+            multiplier = 1.6
+        elif adx >= 18:
+            strength = "moderate"
+            multiplier = 1.3
+        else:
+            strength = "weak"
+            multiplier = 1.0
+
+        # ثقة الاتجاه
+        confidence = max(0.0, min(1.0, adx / 40))
+
+        # trend النهائي
+        if direction == "up":
+            trend = "bull"
+        elif direction == "down":
+            trend = "bear"
+        else:
+            trend = "chop"
+
+        return {
+            "trend": trend,
+            "direction": direction,
+            "strength": strength,
+            "confidence": confidence,
+            "multiplier": multiplier,
+        }
+
+    except Exception:
+        return {
+            "trend": "chop",
+            "direction": "flat",
+            "strength": "weak",
+            "confidence": 0.0,
+            "multiplier": 1.0,
+        }
 
 # =================== EDGE ALGO EMA CONTEXT ===================
 def build_ema_edge_context(trend_strength: dict) -> dict:
@@ -3171,25 +3208,54 @@ STATE = {
     "tp1_done": False, "highest_profit_pct": 0.0,
     "profit_targets_achieved": 0,
 }
+
 compound_pnl = 0.0
+
+# لم نعد نستخدم منطق "انتظار إشارة RF معاكسة"
+# لكن نحتفظ بالمتغير للتوافق مع /metrics والـ UI
 wait_for_next_signal_side = None
 
-# =================== WAIT FOR NEXT SIGNAL ===================
+# تبريد بعد كل صفقة مغلقة (بالثواني) — 10 دقائق
+TRADE_COOLDOWN_SEC = 10 * 60
+last_trade_close_ts = 0.0
+
+# =================== COOLDOWN AFTER CLOSE (10 دقائق) ===================
 def _arm_wait_after_close(prev_side):
-    global wait_for_next_signal_side
-    wait_for_next_signal_side = "sell" if prev_side=="long" else ("buy" if prev_side=="short" else None)
-    log_i(f"🛑 WAIT FOR NEXT SIGNAL: {wait_for_next_signal_side}")
+    """
+    بعد إغلاق أي صفقة:
+      - نلغي منطق wait_for_next_signal_side
+      - ونفعل تبريد زمني 10 دقائق قبل السماح بأي دخول جديد
+    """
+    global wait_for_next_signal_side, last_trade_close_ts
+    wait_for_next_signal_side = None  # لم نعد نستخدمها للدخول
+    last_trade_close_ts = time.time()
+    log_i(f"🧊 COOLDOWN ARMED for {TRADE_COOLDOWN_SEC}s after close (prev_side={prev_side})")
 
 def wait_gate_allow(df, info):
-    if wait_for_next_signal_side is None: 
+    """
+    Gate بسيط للتبريد بعد كل صفقة:
+      - لو مفيش صفقة مفتوحة، ومرّ أقل من TRADE_COOLDOWN_SEC من آخر إغلاق → نمنع أي دخول جديد.
+      - غير كده → نسمح بالدخول.
+    """
+    global last_trade_close_ts
+
+    # لو في صفقة مفتوحة بالفعل → ما فيش تبريد، الإدارة داخل إدارة الصفقة نفسها
+    if STATE.get("open"):
         return True, ""
-    
-    bar_ts = int(info.get("time") or 0)
-    need = (wait_for_next_signal_side=="buy" and info.get("long")) or (wait_for_next_signal_side=="sell" and info.get("short"))
-    
-    if need:
+
+    # لو ما حصلش أي صفقة قبل كده → لا يوجد تبريد
+    if last_trade_close_ts <= 0:
         return True, ""
-    return False, f"wait-for-next-RF({wait_for_next_signal_side})"
+
+    elapsed = time.time() - last_trade_close_ts
+    remaining = TRADE_COOLDOWN_SEC - elapsed
+
+    if remaining > 0:
+        # نمنع الدخول لأن فترة التبريد لسه شغالة
+        return False, f"cooldown_active_{int(remaining)}s"
+    
+    # خلصت فترة التبريد
+    return True, ""
 
 # =================== ORDERS ===================
 def _read_position():
@@ -4093,8 +4159,13 @@ def pretty_snapshot(bal, info, ind, spread_bps, reason=None, df=None):
             print(f"   🎯 MODE={STATE.get('mode', 'trend')}  TP_PROFILE={STATE.get('tp_profile', 'none')}")
         else:
             print("   ⚪ FLAT")
-            if wait_for_next_signal_side:
-                print(colored(f"   ⏳ Waiting for opposite RF: {wait_for_next_signal_side.upper()}", "cyan"))
+            # عرض حالة التبريد بعد آخر صفقة
+            if last_trade_close_ts > 0:
+                remaining = TRADE_COOLDOWN_SEC - (time.time() - last_trade_close_ts)
+                if remaining > 0:
+                    mins = int(remaining // 60)
+                    secs = int(remaining % 60)
+                    print(colored(f"   ⏳ COOLDOWN ACTIVE: {mins:02d}:{secs:02d} min remaining", "cyan"))
         if reason: print(colored(f"   ℹ️ reason: {reason}", "white"))
         print(colored("─"*100,"cyan"))
 
@@ -4124,6 +4195,7 @@ def metrics():
         "state": STATE, "compound_pnl": compound_pnl,
         "entry_mode": "SUPER_COUNCIL_AI_GOLDEN_SCALP_SMART_PROFIT_TP_PROFILE_COUNCIL_STRONG", 
         "wait_for_next_signal": wait_for_next_signal_side,
+        "cooldown_remaining_sec": max(0, int(TRADE_COOLDOWN_SEC - (time.time() - last_trade_close_ts))) if last_trade_close_ts > 0 else 0,
         "guards": {"max_spread_bps": MAX_SPREAD_BPS, "final_chunk_qty": FINAL_CHUNK_QTY},
         "scalp_mode": SCALP_MODE,
         "super_council_ai": COUNCIL_AI_MODE,
@@ -4141,6 +4213,7 @@ def health():
         "compound_pnl": compound_pnl, "timestamp": datetime.utcnow().isoformat(),
         "entry_mode": "SUPER_COUNCIL_AI_GOLDEN_SCALP_SMART_PROFIT_TP_PROFILE_COUNCIL_STRONG", 
         "wait_for_next_signal": wait_for_next_signal_side,
+        "cooldown_remaining_sec": max(0, int(TRADE_COOLDOWN_SEC - (time.time() - last_trade_close_ts))) if last_trade_close_ts > 0 else 0,
         "scalp_mode": SCALP_MODE,
         "super_council_ai": COUNCIL_AI_MODE,
         "smart_profit_ai": True,
