@@ -158,7 +158,7 @@ def detect_ob(candles):
     
     # Bearish OB
     if b['close'] > b['open'] and c['close'] < c['open']:
-        return ("bearish", b['open'], b['close"])
+        return ("bearish", b['open'], b['close'])
     
     return None
 
@@ -332,9 +332,6 @@ def smart_profit_ai(position_side, entry_price, current_price, trend_strength, v
         elif profit_pct <= -2.0:
             return "STOP_LOSS_STRONG_TREND"
 
-    # تسجيل قرار جني الأرباح
-    log_i(f"💰 PROFIT AI | decision={decision} | pnl={profit_pct:.2f}% | trend_strength={trend_strength} | mode={mode}")
-    
     return "HOLD"
 
 def apply_smart_profit_strategy():
@@ -372,6 +369,9 @@ def apply_smart_profit_strategy():
             vol_boost,
             STATE.get("mode", "scalp")
         )
+        
+        # تسجيل قرار جني الأرباح
+        log_i(f"💰 PROFIT AI | decision={decision} | pnl={((current_price - STATE['entry']) / STATE['entry'] * 100 * (1 if STATE['side'] == 'long' else -1)):.2f}% | trend_strength={trend_strength} | mode={STATE.get('mode', 'scalp')}")
         
         # تنفيذ القرار
         if decision != "HOLD":
@@ -413,6 +413,148 @@ def apply_smart_profit_strategy():
     except Exception as e:
         log_w(f"Smart profit strategy error: {e}")
 
+# =================== BALANCED TREND RIDE + PROFIT PROTECT ===================
+
+# --- Profit Protect (close on reversal while in profit) ---
+PROTECT_ENABLE = True
+PROTECT_MIN_PROFIT_PCT = 0.55       # يبدأ يحمي بعد +0.55%
+PROTECT_GIVEBACK_PCT   = 0.45       # لو خسر من القمة 0.45% → إنذار
+PROTECT_MIN_ADX        = 17.0       # أقل من كده ترند ضعيف/رينج
+PROTECT_ADX_DROP       = 6.0        # لو ADX نزل 6 نقاط من آخر قياس → إنذار
+PROTECT_CANDLE_SCORE   = 2.2        # score_sell/score_buy من compute_candles
+PROTECT_VOTES_NEEDED   = 2          # لازم 2 من 3 علشان نقفل (متوازن)
+
+# --- Re-entry after close (wait pullback) ---
+REENTRY_PULLBACK_ENABLE = True
+REENTRY_PULLBACK_ATR     = 0.40     # عمق التصحيح المطلوب
+REENTRY_PULLBACK_MAX_ATR = 1.50     # لو التصحيح زاد جدًا نلغي الانتظار
+
+# --- Cancel/Block re-entry if ADX weak ---
+REENTRY_ADX_CANCEL = True
+REENTRY_MIN_ADX    = 19.0
+
+# --- BE Lock Trail (never worse than breakeven after armed) ---
+BE_LOCK_ENABLE = True
+BE_LOCK_BUFFER_PCT = 0.03 / 100     # 0.03% buffer للرسوم/السبريد
+
+# ---------- Profit Protect Exit Function ----------
+def should_profit_protect_close(df, ind, info):
+    if not PROTECT_ENABLE or not STATE.get("open") or (STATE.get("qty") or 0) <= 0:
+        return (False, "")
+
+    px = float(info.get("price") or price_now() or 0)
+    entry = float(STATE.get("entry") or 0)
+    side = STATE.get("side")  # long/short
+    if px <= 0 or entry <= 0 or side not in ("long","short"):
+        return (False, "")
+
+    pnl_pct = (px - entry) / entry * 100.0 * (1 if side == "long" else -1)
+    STATE["pnl"] = pnl_pct
+
+    if pnl_pct < PROTECT_MIN_PROFIT_PCT:
+        return (False, "")
+
+    peak = float(STATE.get("highest_profit_pct") or pnl_pct)
+    giveback = max(0.0, peak - pnl_pct)
+
+    adx = float(safe_get(ind, "adx", 0.0))
+    plus_di = float(safe_get(ind, "plus_di", 0.0))
+    minus_di = float(safe_get(ind, "minus_di", 0.0))
+    prev_adx = float(STATE.get("_prev_adx", adx))
+    adx_drop = max(0.0, prev_adx - adx)
+
+    candles = compute_candles(df)  # موجودة عندك 
+    wick_up = bool(candles.get("wick_up_big"))
+    wick_dn = bool(candles.get("wick_dn_big"))
+    score_buy = float(candles.get("score_buy", 0.0))
+    score_sell = float(candles.get("score_sell", 0.0))
+
+    # في الترند القوي جدا، نقلل تأثير الشموع
+    if adx >= 28:
+        candle_rev = False
+    else:
+        candle_rev = True
+
+    votes = 0
+    reasons = []
+
+    # 1) Giveback من القمة
+    if giveback >= PROTECT_GIVEBACK_PCT:
+        votes += 1
+        reasons.append(f"giveback={giveback:.2f}% peak={peak:.2f} now={pnl_pct:.2f}")
+
+    # 2) ضعف الترند (ADX ضعيف أو بينزل)
+    if adx < PROTECT_MIN_ADX or adx_drop >= PROTECT_ADX_DROP:
+        votes += 1
+        reasons.append(f"adx_weak adx={adx:.1f} drop={adx_drop:.1f}")
+
+    # 3) انعكاس (DI flip أو شموع)
+    if side == "long":
+        di_flip = (minus_di > plus_di)
+        candle_rev = (score_sell >= PROTECT_CANDLE_SCORE) or wick_up
+        if di_flip or candle_rev:
+            votes += 1
+            reasons.append(f"rev_long di+={plus_di:.1f} di-={minus_di:.1f} sellScore={score_sell:.1f} wickUp={wick_up}")
+    else:
+        di_flip = (plus_di > minus_di)
+        candle_rev = (score_buy >= PROTECT_CANDLE_SCORE) or wick_dn
+        if di_flip or candle_rev:
+            votes += 1
+            reasons.append(f"rev_short di+={plus_di:.1f} di-={minus_di:.1f} buyScore={score_buy:.1f} wickDn={wick_dn}")
+
+    if votes >= PROTECT_VOTES_NEEDED:
+        return (True, " | ".join(reasons))
+
+    return (False, "")
+
+# ---------- Re-entry Pullback Gate ----------
+def reentry_pullback_allow(desired_signal: str, ind: dict, info: dict):
+    pb = STATE.get("reentry_pullback") or {}
+    if not REENTRY_PULLBACK_ENABLE or STATE.get("open"):
+        return (True, "")
+
+    if not pb.get("active"):
+        return (True, "")
+
+    # فقط لنفس الاتجاه اللي اتقفل
+    if desired_signal != pb.get("dir"):
+        return (True, "")
+
+    # ADX weak → block
+    if REENTRY_ADX_CANCEL:
+        adx = float(safe_get(ind, "adx", 0.0))
+        if adx < REENTRY_MIN_ADX:
+            return (False, f"REENTRY_BLOCK_ADX_WEAK adx={adx:.1f}")
+
+    px = float((info or {}).get("price") or price_now() or 0)
+    atr = float(safe_get(ind, "atr", 0.0))
+    ref = float(pb.get("ref") or px)
+    if px <= 0 or atr <= 0:
+        return (False, "REENTRY_WAIT_NO_ATR")
+
+    # pullback depth
+    if desired_signal == "buy":
+        depth = ref - px
+    else:
+        depth = px - ref
+
+    if depth >= (REENTRY_PULLBACK_MAX_ATR * atr):
+        pb["active"] = False
+        STATE["reentry_pullback"] = pb
+        return (False, "REENTRY_CANCEL_EXTREME")
+
+    if depth >= (REENTRY_PULLBACK_ATR * atr):
+        pb["pulled"] = True
+
+    if not pb.get("pulled"):
+        STATE["reentry_pullback"] = pb
+        return (False, f"REENTRY_WAIT_PULLBACK depth={depth:.6f}")
+
+    # ✅ pullback حصل → اسمح
+    pb["active"] = False
+    STATE["reentry_pullback"] = pb
+    return (True, "REENTRY_OK_AFTER_PULLBACK")
+
 # ---------- Initialize Global Objects ----------
 trend_ctx = SmartTrendContext()
 smc_detector = SMCDetector()
@@ -443,7 +585,7 @@ SHADOW_MODE_DASHBOARD = False
 DRY_RUN = False
 
 # ==== Addon: Logging + Recovery Settings ====
-BOT_VERSION = f"SUI ULTRA PRO AI v7.0 — {EXCHANGE_NAME.upper()} - SMART PROFIT AI + TP PROFILE + COUNCIL STRONG ENTRY"
+BOT_VERSION = f"SUI ULTRA PRO AI v7.0 — {EXCHANGE_NAME.upper()} - SMART PROFIT AI + TP PROFILE + COUNCIL STRONG ENTRY + BALANCED TREND RIDE"
 print("🚀 Booting:", BOT_VERSION, flush=True)
 
 STATE_PATH = "./bot_state.json"
@@ -2940,6 +3082,20 @@ def manage_intelligent_trailing_stop(current_price, side, ind, trend_strength):
             if STATE["trail"] < STATE.get("entry", float('inf')):
                 log_i(f"🔽 وقف متحرك محدث: {STATE['trail']:.6f} (قوة الترند: {trend_strength['strength']})")
     
+    # ===== BE LOCK =====
+    if BE_LOCK_ENABLE and STATE.get("breakeven_armed") and STATE.get("breakeven") and STATE.get("trail") is not None:
+        be = float(STATE["breakeven"])
+        buf = be * BE_LOCK_BUFFER_PCT
+
+        if side == "long":
+            min_trail = be + buf
+            if STATE["trail"] < min_trail:
+                STATE["trail"] = min_trail
+        else:
+            max_trail = be - buf
+            if STATE["trail"] > max_trail:
+                STATE["trail"] = max_trail
+    
     if STATE.get("trail"):
         if (side == "long" and current_price <= STATE["trail"]) or (side == "short" and current_price >= STATE["trail"]):
             log_w(f"🛑 وقف متحرك: {current_price} vs trail {STATE['trail']}")
@@ -3113,7 +3269,9 @@ def open_market_enhanced(side, qty, price):
             "highest_profit_pct": 0.0,
             "profit_targets_achieved": 0,
             "profit_profile": profit_profile["label"],
-            "council_controlled": STATE.get("last_entry_source") == "COUNCIL_STRONG"
+            "council_controlled": STATE.get("last_entry_source") == "COUNCIL_STRONG",
+            "_prev_adx": safe_get(ind, "adx", 0.0),
+            "_last_adx": safe_get(ind, "adx", 0.0)
         })
         
         # إعادة تعيين حالة reentry إذا كانت نشطة
@@ -3329,6 +3487,18 @@ def _arm_wait_after_close(prev_side):
     wait_for_next_signal_side = None  # لم نعد نستخدمها للدخول
     last_trade_close_ts = time.time()
     log_i(f"🧊 COOLDOWN ARMED for {TRADE_COOLDOWN_SEC}s after close (prev_side={prev_side})")
+    
+    # ===== Re-entry pullback armed after close =====
+    if REENTRY_PULLBACK_ENABLE:
+        ref_px = price_now() or 0
+        last_dir = "buy" if prev_side == "long" else "sell" if prev_side == "short" else None
+        STATE["reentry_pullback"] = {
+            "active": bool(last_dir),
+            "dir": last_dir,
+            "ref": float(ref_px),
+            "pulled": False
+        }
+        log_i(f"⏳ REENTRY PULLBACK ARMED | dir={last_dir} ref={fmt(ref_px)}")
 
 def wait_gate_allow(df, info):
     """
@@ -3417,7 +3587,8 @@ def _reset_after_close(reason, prev_side=None):
         "open": False, "side": None, "entry": None, "qty": 0.0,
         "pnl": 0.0, "bars": 0, "trail": None, "breakeven": None,
         "tp1_done": False, "highest_profit_pct": 0.0, "profit_targets_achieved": 0,
-        "trail_tightened": False, "partial_taken": False
+        "trail_tightened": False, "partial_taken": False,
+        "_prev_adx": 0.0, "_last_adx": 0.0
     })
     save_state({"in_position": False, "position_qty": 0})
     
@@ -3447,6 +3618,13 @@ def manage_trade_by_profile(df, ind, info):
     
     if pnl_pct > STATE["highest_profit_pct"]:
         STATE["highest_profit_pct"] = pnl_pct
+
+    # ✅ Profit Protect Exit (balanced)
+    ok_close, why = should_profit_protect_close(df, ind, info)
+    if ok_close:
+        log_w(f"🧯 PROFIT PROTECT EXIT | pnl={STATE.get('pnl',0):.2f}% | {why}")
+        close_market_strict(f"profit_protect | {why}")
+        return
 
     # جلب إعدادات الـ Profile
     management = STATE.get("management", {})
@@ -3964,6 +4142,10 @@ def trade_loop_enhanced_with_smart_patch():
             ind = compute_indicators(df)
             spread_bps = orderbook_spread_bps()
             
+            # تحديث ADX السابق
+            STATE["_prev_adx"] = float(STATE.get("_last_adx", safe_get(ind, "adx", 0.0)))
+            STATE["_last_adx"] = float(safe_get(ind, "adx", 0.0))
+            
             # تحديث orderbook للـFlow Boost
             try:
                 STATE["last_orderbook"] = ex.fetch_order_book(SYMBOL, limit=FLOW_STACK_DEPTH)
@@ -4147,6 +4329,16 @@ def trade_loop_enhanced_with_smart_patch():
                 if not allow_reentry:
                     log_i(f"⏸️ REENTRY GATE BLOCKED {final_signal.upper()} | {reentry_reason}")
                     final_signal = None
+            
+            # ===== فحص بوابة Re-entry Pullback =====
+            if final_signal and not STATE["open"]:
+                allow_pb, pb_reason = reentry_pullback_allow(final_signal, ind, info)
+                if not allow_pb:
+                    log_i(f"🕒 REENTRY PULLBACK BLOCKED [{final_signal.upper()}] → {pb_reason}")
+                    final_signal = None
+                else:
+                    if pb_reason:
+                        entry_reasons.append(pb_reason)
 
             # ===== تنفيذ الدخول إن وجد إشارة نهائية =====
             if final_signal and not STATE["open"]:
@@ -4316,7 +4508,7 @@ def mark_position(color):
 @app.route("/")
 def home():
     mode='LIVE' if MODE_LIVE else 'PAPER'
-    return f"✅ SUI ULTRA PRO AI Bot — {EXCHANGE_NAME.upper()} — {SYMBOL} {INTERVAL} — {mode} — Super Council AI + Intelligent Trend Riding + Smart Profit AI + TP Profile System + Council Strong Entry"
+    return f"✅ SUI ULTRA PRO AI Bot — {EXCHANGE_NAME.upper()} — {SYMBOL} {INTERVAL} — {mode} — Super Council AI + Intelligent Trend Riding + Smart Profit AI + TP Profile System + Council Strong Entry + Balanced Trend Ride"
 
 @app.route("/metrics")
 def metrics():
@@ -4325,7 +4517,7 @@ def metrics():
         "symbol": SYMBOL, "interval": INTERVAL, "mode": "live" if MODE_LIVE else "paper",
         "leverage": LEVERAGE, "risk_alloc": RISK_ALLOC, "price": price_now(),
         "state": STATE, "compound_pnl": compound_pnl,
-        "entry_mode": "SUPER_COUNCIL_AI_GOLDEN_SCALP_SMART_PROFIT_TP_PROFILE_COUNCIL_STRONG", 
+        "entry_mode": "SUPER_COUNCIL_AI_GOLDEN_SCALP_SMART_PROFIT_TP_PROFILE_COUNCIL_STRONG_BALANCED_TREND_RIDE", 
         "wait_for_next_signal": wait_for_next_signal_side,
         "cooldown_remaining_sec": max(0, int(TRADE_COOLDOWN_SEC - (time.time() - last_trade_close_ts))) if last_trade_close_ts > 0 else 0,
         "guards": {"max_spread_bps": MAX_SPREAD_BPS, "final_chunk_qty": FINAL_CHUNK_QTY},
@@ -4336,7 +4528,12 @@ def metrics():
         "tp_profile_system": True,
         "council_strong_entry": COUNCIL_STRONG_ENTRY,
         "hard_stop_loss": HARD_STOP_LOSS_PCT,
-        "reentry_active": REENTRY_ACTIVE
+        "reentry_active": REENTRY_ACTIVE,
+        "balanced_trend_ride": {
+            "profit_protect": PROTECT_ENABLE,
+            "reentry_pullback": REENTRY_PULLBACK_ENABLE,
+            "be_lock": BE_LOCK_ENABLE
+        }
     })
 
 @app.route("/health")
@@ -4345,7 +4542,7 @@ def health():
         "ok": True, "exchange": EXCHANGE_NAME, "mode": "live" if MODE_LIVE else "paper",
         "open": STATE["open"], "side": STATE["side"], "qty": STATE["qty"],
         "compound_pnl": compound_pnl, "timestamp": datetime.utcnow().isoformat(),
-        "entry_mode": "SUPER_COUNCIL_AI_GOLDEN_SCALP_SMART_PROFIT_TP_PROFILE_COUNCIL_STRONG", 
+        "entry_mode": "SUPER_COUNCIL_AI_GOLDEN_SCALP_SMART_PROFIT_TP_PROFILE_COUNCIL_STRONG_BALANCED_TREND_RIDE", 
         "wait_for_next_signal": wait_for_next_signal_side,
         "cooldown_remaining_sec": max(0, int(TRADE_COOLDOWN_SEC - (time.time() - last_trade_close_ts))) if last_trade_close_ts > 0 else 0,
         "scalp_mode": SCALP_MODE,
@@ -4354,7 +4551,12 @@ def health():
         "tp_profile_system": True,
         "council_strong_entry": COUNCIL_STRONG_ENTRY,
         "hard_stop_loss": HARD_STOP_LOSS_PCT,
-        "reentry_active": REENTRY_ACTIVE
+        "reentry_active": REENTRY_ACTIVE,
+        "balanced_trend_ride": {
+            "profit_protect": PROTECT_ENABLE,
+            "reentry_pullback": REENTRY_PULLBACK_ENABLE,
+            "be_lock": BE_LOCK_ENABLE
+        }
     }), 200
 
 # ============================================
@@ -4402,6 +4604,28 @@ def smart_stats():
             "pullback_atr": REENTRY_PULLBACK_ATR,
             "pullback_max": REENTRY_PULLBACK_MAX,
             "current_state": STATE.get("reentry", {})
+        },
+        "balanced_trend_ride": {
+            "profit_protect": {
+                "enabled": PROTECT_ENABLE,
+                "min_profit_pct": PROTECT_MIN_PROFIT_PCT,
+                "giveback_pct": PROTECT_GIVEBACK_PCT,
+                "min_adx": PROTECT_MIN_ADX,
+                "adx_drop": PROTECT_ADX_DROP,
+                "candle_score": PROTECT_CANDLE_SCORE,
+                "votes_needed": PROTECT_VOTES_NEEDED
+            },
+            "reentry_pullback": {
+                "enabled": REENTRY_PULLBACK_ENABLE,
+                "pullback_atr": REENTRY_PULLBACK_ATR,
+                "pullback_max_atr": REENTRY_PULLBACK_MAX_ATR,
+                "adx_cancel": REENTRY_ADX_CANCEL,
+                "min_adx": REENTRY_MIN_ADX
+            },
+            "be_lock": {
+                "enabled": BE_LOCK_ENABLE,
+                "buffer_pct": BE_LOCK_BUFFER_PCT
+            }
         }
     })
 
@@ -4443,8 +4667,9 @@ def verify_execution_environment():
     print(f"🔧 EXCHANGE: {EXCHANGE_NAME.upper()} | SYMBOL: {SYMBOL}", flush=True)
     print(f"🔧 EXECUTE_ORDERS: {EXECUTE_ORDERS} | DRY_RUN: {DRY_RUN}", flush=True)
     print(f"🎯 GOLDEN ENTRY: score={GOLDEN_ENTRY_SCORE} | ADX={GOLDEN_ENTRY_ADX}", flush=True)
-    print(f"🚀 SMART PATCH: OB/FVG + SMC + Golden Zones + Volume Confirmation + SMART PROFIT AI + TP PROFILE + COUNCIL STRONG ENTRY", flush=True)
+    print(f"🚀 SMART PATCH: OB/FVG + SMC + Golden Zones + Volume Confirmation + SMART PROFIT AI + TP PROFILE + COUNCIL STRONG ENTRY + BALANCED TREND RIDE", flush=True)
     print(f"🧠 SMART PROFIT AI: Scalp + Trend + Volume Analysis + TP Profile (1→2→3) + Council Strong Entry Activated", flush=True)
+    print(f"⚖️ BALANCED TREND RIDE: Profit Protect + Re-entry Pullback + BE Lock", flush=True)
     print(f"🛑 HARD STOP LOSS: {HARD_STOP_LOSS_PCT}% active", flush=True)
     print(f"⏳ REENTRY SYSTEM: Active={REENTRY_ACTIVE}, Pullback={REENTRY_PULLBACK_ATR}ATR", flush=True)
 
@@ -4457,7 +4682,8 @@ if __name__ == "__main__":
     
     log_i(f"🚀 SUI ULTRA PRO AI BOT STARTED - {BOT_VERSION}")
     log_i(f"🎯 SYMBOL: {SYMBOL} | INTERVAL: {INTERVAL} | LEVERAGE: {LEVERAGE}x")
-    log_i(f"💡 SMART PATCH ACTIVATED: Golden Zones + SMC + OB/FVG + Zero Reversal Scalping + SMART PROFIT AI + TP PROFILE + COUNCIL STRONG ENTRY")
+    log_i(f"💡 SMART PATCH ACTIVATED: Golden Zones + SMC + OB/FVG + Zero Reversal Scalping + SMART PROFIT AI + TP PROFILE + COUNCIL STRONG ENTRY + BALANCED TREND RIDE")
+    log_i(f"⚖️ BALANCED TREND RIDE: Profit Protect (0.55%+) + Re-entry Pullback (0.4ATR) + BE Lock (0.03%)")
     log_i(f"🛑 HARD STOP LOSS: {HARD_STOP_LOSS_PCT}% active for all trades")
     log_i(f"⏳ REENTRY SYSTEM: Waiting {REENTRY_PULLBACK_ATR}ATR pullback after close")
     
