@@ -7,11 +7,13 @@ SUI ULTRA PRO AI BOT - الإصدار الذكي المتقدم المتكامل
 • إدارة صفقات ذكية متكيفة مع قوة الترند
 • نظام Footprint + Diagonal Order-Flow المتقدم
 • Multi-Exchange Support: BingX & Bybit
-• HQ Trading Intelligence Patch - مناطق ذهبية + SMC + OB/FVG
+• HQ Trading Intelligence Patch - مناطق ذهبية + SMC + OB/FVG + BOX ENGINE + VOLUME ANALYSIS + VWAP INTEGRATION
 • SMART PROFIT AI - نظام جني الأرباح الذكي المتقدم
 • TP PROFILE SYSTEM - نظام جني الأرباح الذكي (1→2→3 مرات)
 • COUNCIL STRONG ENTRY - دخول ذكي من مجلس الإدارة في المناطق القوية
-• PATCH V2.0: Iron SL + Regime Watcher + Mega Council + Smart Trend Exit
+• NEW INTELLIGENT PATCH - Advanced Market Analysis & Smart Monitoring
+• FVG REAL vs FAKE + STOP HUNT - تمييز FVG الحقيقي من الفيك وكشف مصائد السيولة
+• BOX REJECTION PRO - دخول محترف من رفض البوكس مع VWAP
 """
 
 import os, time, math, random, signal, sys, traceback, logging, json
@@ -124,6 +126,659 @@ class SMCDetector:
                 
         return zones
 
+# =================== FVG REAL vs FAKE + STOP HUNT ===================
+
+def classify_fvg_context(df, fvg_signal, lookahead=3):
+    """
+    تمييز الـ FVG الحقيقي من الفيك + معرفة هل حصل استغلال سيولة (stop hunt) جوه المنطقة.
+    fvg_signal = (kind, low, high) من detect_fvg
+    """
+    if not fvg_signal or len(df) < 30:
+        return {"kind": None, "real": False, "stop_hunt": False, "reason": "no_fvg", "zone": None}
+
+    kind, z_low, z_high = fvg_signal
+    closes = df["close"].astype(float).values
+    highs  = df["high"].astype(float).values
+    lows   = df["low"].astype(float).values
+    vols   = df["volume"].astype(float).values
+
+    last_idx = len(df) - 1
+    last_close = closes[last_idx]
+
+    zone_mid = (z_low + z_high) / 2.0
+    atr_val = df["close"].astype(float).rolling(14).apply(lambda x: x.max()-x.min()).iloc[-1]
+    if not np.isfinite(atr_val) or atr_val <= 0:
+        atr_val = abs(z_high - z_low)
+
+    zone_height = abs(z_high - z_low)
+
+    # شرط displacement محترم (فارق واضح عن الشموع السابقة)
+    recent_rng = max(highs[-5:]) - min(lows[-5:])
+    displacement_ok = zone_height >= 0.5 * atr_val and zone_height >= 0.25 * recent_rng
+
+    # حجم أعلى من المتوسط وقت تكوين الـ FVG
+    vol_ma = df["volume"].rolling(20).mean().iloc[-2]
+    vol_ok = vols[-2] > 1.2 * vol_ma if np.isfinite(vol_ma) else False
+
+    # هل السعر رجع عمل tap محترم للمنطقة وارتد؟
+    tap_bars = df.tail(lookahead+2)
+    tap_high = tap_bars["high"].astype(float).max()
+    tap_low  = tap_bars["low"].astype(float).min()
+    tap_close = tap_bars["close"].astype(float).iloc[-1]
+
+    touched_zone = (tap_low <= z_high and tap_high >= z_low)
+
+    if kind == "bullish":
+        respected = touched_zone and tap_close > zone_mid
+        invalidated_fast = touched_zone and tap_close < z_low
+    else:
+        respected = touched_zone and tap_close < zone_mid
+        invalidated_fast = touched_zone and tap_close > z_high
+
+    real = displacement_ok and vol_ok and respected and not invalidated_fast
+
+    # 🔍 Stop-hunt من جوه الـ FVG:
+    # - ذيل طويل يخترق المنطقة ويرجع يقفل داخلها أو عكسها
+    last_h = highs[-1]; last_l = lows[-1]
+    body = abs(closes[-1] - df["open"].astype(float).values[-1])
+    rng  = max(last_h - last_l, 1e-12)
+    upper_wick = last_h - max(closes[-1], df["open"].astype(float).values[-1])
+    lower_wick = min(closes[-1], df["open"].astype(float).values[-1]) - last_l
+
+    stop_hunt = False
+    if kind == "bullish":
+        # ضرب ستوبات تحت المنطقة ورجع فوق
+        if last_l < z_low and closes[-1] > z_low and lower_wick > 0.6*rng and body < 0.4*rng:
+            stop_hunt = True
+    else:
+        # ضرب ستوبات فوق المنطقة ورجع تحت
+        if last_h > z_high and closes[-1] < z_high and upper_wick > 0.6*rng and body < 0.4*rng:
+            stop_hunt = True
+
+    reason = []
+    if real: reason.append("real_fvg")
+    if invalidated_fast: reason.append("invalidated_fast")
+    if stop_hunt: reason.append("stop_hunt_wick")
+    if not reason: reason.append("neutral")
+
+    return {
+        "kind": kind,
+        "real": bool(real),
+        "stop_hunt": bool(stop_hunt),
+        "reason": "+".join(reason),
+        "zone": (z_low, z_high, zone_mid)
+    }
+
+# =================== BOX & VOLUME SETTINGS ===================
+BOX_LOOKBACK_BARS = int(os.getenv("BOX_LOOKBACK_BARS", "120"))  # عدد الشمعات اللي نقيم عليها البوكس
+BOX_STRONG_REJECT_MIN = int(os.getenv("BOX_STRONG_REJECT_MIN", "2"))  # أقل عدد رفضات يعتبر قوي
+BOX_MAX_BREAKS       = int(os.getenv("BOX_MAX_BREAKS", "1"))   # لو أكتر من كده يبقى البوكس ضعيف
+BOX_MIN_TOUCHES      = int(os.getenv("BOX_MIN_TOUCHES", "2"))
+BOX_MAX_HEIGHT_BP    = float(os.getenv("BOX_MAX_HEIGHT_BP", "60"))  # أقصى ارتفاع بوكس مقبول
+BOX_VOL_STRONG_RATIO = float(os.getenv("BOX_VOL_STRONG_RATIO", "1.4"))  # فوليوم رفض / متوسط
+BOX_VOL_WEAK_RATIO   = float(os.getenv("BOX_VOL_WEAK_RATIO", "0.8"))    # لو أقل من كده يبقى ضعيف
+
+# =================== BOX ENGINE SETTINGS ===================
+BOX_LOOKBACK      = 120    # عدد الشمعات اللي نبني منها البوكسات
+BOX_MIN_TOUCHES   = 2      # كام لمسة عشان نعتبره بوكس محترم
+BOX_MAX_HEIGHT_BP = 60     # أقصى ارتفاع للبوكس (bps) عشان ما يكونش منطقة واسعة ضعيفة
+BOX_RET_TEST_BARS = 6      # كام شمعة نسمح بيها لإعادة الاختبار
+BOX_STRONG_WICK_R = 1.8    # نسبة طول الذيل/الجسم لاعتبار ارتداد قوي
+BOX_MIN_RR_SCALP  = 1.4    # أقل RR لصفقة سكالب
+BOX_MIN_RR_TREND  = 2.0    # أقل RR لصفقة ترند
+BALANCED_MIN_SCORE = 4.0   # عتبة عامة
+BALANCED_MIN_BOX   = 0.0   # لو عايز تجبره يستخدم بوكس قوي ارفعها
+
+# ===== BOX SMART TRADER CONFIG =====
+# قوة البوكس + الفوليوم لازم يكونوا واضحين
+BOX_REJECTION_MIN_REJECTS      = 1      # أقل عدد رفضات في البوكس
+BOX_REJECTION_REQUIRE_STRONG   = True   # لازم label="strong" من analyze_box_volume_context
+
+# خروج عند لمس البوكس العكسي
+BOX_REVERSE_TOUCH_EXIT         = True
+BOX_TOUCH_EXIT_MIN_PNL         = 0.40   # أقل ربح (٪) قبل ما نسمح بقفل عند البوكس العكسي
+
+# خروج احترافي عند التصحيح العميق عشان نعيد الدخول من جديد
+PULLBACK_EXIT_MIN_PROFIT       = 0.80   # لازم أكون شفت ربح أد كده على الأقل
+PULLBACK_EXIT_FROM_HIGH        = 1.00   # فرق (٪) من أعلى ربح للـ PnL الحالي يعتبر تصحيح يستاهل خروج
+
+# =================== BOX DETECTION ENGINE ===================
+
+class SRBox:
+    def __init__(self, kind, low, high, touches, start_idx, last_touch_idx):
+        self.kind = kind          # "demand" أو "supply"
+        self.low = low
+        self.high = high
+        self.touches = touches
+        self.start_idx = start_idx
+        self.last_touch_idx = last_touch_idx
+
+    @property
+    def mid(self):
+        return (self.low + self.high) / 2.0
+
+def _detect_swings(df, window=3):
+    h = df["high"].astype(float).values
+    l = df["low"].astype(float).values
+    swings_hi = []
+    swings_lo = []
+
+    for i in range(window, len(df) - window):
+        if h[i] == max(h[i-window:i+window+1]):
+            swings_hi.append(i)
+        if l[i] == min(l[i-window:i+window+1]):
+            swings_lo.append(i)
+    return swings_hi, swings_lo
+
+def build_sr_boxes(df):
+    """
+    يبني بوكسات عرض/طلب بسيطة من الـ swing highs/lows
+    ويرمي البوكسات الواسعة أو اللي مالهاش لمسات كفاية
+    """
+    if len(df) < 40:
+        return []
+
+    swings_hi, swings_lo = _detect_swings(df)
+    closes = df["close"].astype(float).values
+    boxes = []
+
+    # Demand boxes من swing lows
+    for idx in swings_lo:
+        base = closes[idx]
+        low  = df["low"].astype(float).values[idx]
+        high = base
+        height_bps = abs(high - low) / base * 10000
+        if height_bps > BOX_MAX_HEIGHT_BP:
+            continue
+
+        touches = 0
+        last_touch = idx
+        for j in range(idx, len(df)):
+            if df["low"].iloc[j] <= high and df["low"].iloc[j] >= low:
+                touches += 1
+                last_touch = j
+        if touches >= BOX_MIN_TOUCHES:
+            boxes.append(SRBox("demand", low, high, touches, idx, last_touch))
+
+    # Supply boxes من swing highs
+    for idx in swings_hi:
+        base = closes[idx]
+        high = df["high"].astype(float).values[idx]
+        low  = base
+        height_bps = abs(high - low) / base * 10000
+        if height_bps > BOX_MAX_HEIGHT_BP:
+            continue
+
+        touches = 0
+        last_touch = idx
+        for j in range(idx, len(df)):
+            if df["high"].iloc[j] >= low and df["high"].iloc[j] <= high:
+                touches += 1
+                last_touch = j
+        if touches >= BOX_MIN_TOUCHES:
+            boxes.append(SRBox("supply", low, high, touches, idx, last_touch))
+
+    return boxes
+
+def analyze_box_volume_context(df, box):
+    """
+    تقييم البوكس من حيث:
+    - عدد الرفضات clean rejections
+    - عدد الاختراقات الحقيقية
+    - الفوليوم داخل/عند حواف البوكس
+    """
+    if df is None or box is None or len(df) < 10:
+        return {
+            "rejects": 0,
+            "breaks": 0,
+            "avg_vol": 0.0,
+            "rej_vol_avg": 0.0,
+            "vol_ratio": 0.0,
+            "label": "unknown",
+        }
+
+    # نشتغل على آخر N شمعة
+    sub = df.iloc[-BOX_LOOKBACK_BARS:]
+    high = sub["high"].astype(float)
+    low  = sub["low"].astype(float)
+    close = sub["close"].astype(float)
+    open_ = sub["open"].astype(float)
+    vol  = sub["volume"].astype(float)
+
+    b_low  = float(box.low)
+    b_high = float(box.high)
+    b_mid  = float(box.mid)
+
+    avg_vol = float(vol.mean()) if len(vol) else 0.0
+
+    rejects = 0
+    breaks  = 0
+    rej_vols = []
+
+    for i in range(1, len(sub)):
+        h = high.iloc[i]
+        l = low.iloc[i]
+        c = close.iloc[i]
+        o = open_.iloc[i]
+        v = vol.iloc[i]
+
+        prev_c = close.iloc[i-1]
+        prev_h = high.iloc[i-1]
+        prev_l = low.iloc[i-1]
+
+        # ========== supply box (مقاومة) ==========
+        if box.kind == "supply":
+            # رفض نظيف: اختراق أعلى البوكس و إغلاق تحت mid
+            swept_above = (prev_h > b_high * 1.0005)
+            closed_back = (c <= b_mid) and (h >= b_high * 0.999)
+            bear_body   = (c < o)
+
+            if swept_above and closed_back and bear_body:
+                rejects += 1
+                rej_vols.append(v)
+                continue
+
+            # اختراق حقيقي: إغلاق واضح فوق البوكس
+            if c > b_high * 1.002 and prev_c > b_high:
+                breaks += 1
+
+        # ========== demand box (دعم) ==========
+        else:
+            # رفض نظيف: اختراق تحت البوكس و إغلاق فوق mid
+            swept_below = (prev_l < b_low * 0.9995)
+            closed_back = (c >= b_mid) and (l <= b_low * 1.001)
+            bull_body   = (c > o)
+
+            if swept_below and closed_back and bull_body:
+                rejects += 1
+                rej_vols.append(v)
+                continue
+
+            # اختراق حقيقي: إغلاق واضح تحت البوكس
+            if c < b_low * 0.998 and prev_c < b_low:
+                breaks += 1
+
+    rej_vol_avg = float(sum(rej_vols) / len(rej_vols)) if rej_vols else 0.0
+    vol_ratio = (rej_vol_avg / avg_vol) if (avg_vol > 0 and rej_vol_avg > 0) else 0.0
+
+    # label strength
+    label = "normal"
+    if rejects >= BOX_STRONG_REJECT_MIN and breaks <= BOX_MAX_BREAKS and vol_ratio >= BOX_VOL_STRONG_RATIO:
+        label = "strong"
+    elif breaks > BOX_MAX_BREAKS or vol_ratio <= BOX_VOL_WEAK_RATIO:
+        label = "weak"
+
+    return {
+        "rejects": rejects,
+        "breaks": breaks,
+        "avg_vol": round(avg_vol, 2),
+        "rej_vol_avg": round(rej_vol_avg, 2),
+        "vol_ratio": round(vol_ratio, 2),
+        "label": label,
+    }
+
+def analyze_box_context(df, boxes):
+    """
+    يرجّع سياق البوكس الأقرب للسعر الحالي:
+    - breakout_retest_long / short
+    - strong_reversal_long / short
+    - weak_retest / no_setup
+    """
+    if not boxes or len(df) < 10:
+        return {"ctx": "none", "tier": "none", "score": 0.0, "rr": 0.0, "dir": None, "debug": "no_boxes"}
+
+    close = float(df["close"].iloc[-1])
+    high  = float(df["high"].iloc[-1])
+    low   = float(df["low"].iloc[-1])
+    o     = float(df["open"].iloc[-1])
+
+    # بوكس الأقرب للسعر
+    best = None
+    best_dist = 1e9
+    for b in boxes:
+        if b.low <= close <= b.high:
+            dist = 0
+        else:
+            dist = min(abs(close - b.low), abs(close - b.high))
+        if dist < best_dist:
+            best = b
+            best_dist = dist
+
+    if not best:
+        return {"ctx": "none", "tier": "none", "score": 0.0, "rr": 0.0, "dir": None, "debug": "no_near_box"}
+
+    # نحسب شوية معلومات
+    body = abs(close - o)
+    rng  = max(high - low, 1e-9)
+    up_wick   = high - max(o, close)
+    down_wick = min(o, close) - low
+
+    # نجيب أقرب بوكس عكسي عشان نحسب RR
+    opp_dir = "supply" if best.kind == "demand" else "demand"
+    opp_levels = [ (b.low, b.high) for b in boxes if b.kind == opp_dir ]
+    if opp_levels:
+        if best.kind == "demand":
+            target_price = min(l for (l, h) in opp_levels)  # أعلى بوكس عرض فوق
+        else:
+            target_price = max(h for (l, h) in opp_levels)  # أدنى بوكس طلب تحت
+        rr = abs(target_price - close) / max(close - best.low, best.high - close, 1e-9)
+    else:
+        rr = 2.0  # نفترض RR محترم لو مفيش عكس قريب
+
+    ctx = "none"
+    tier = "weak"
+    score = 0.0
+    direction = None
+    debug = []
+
+    # ----- Demand box حالات -----
+    if best.kind == "demand":
+        # اختراق تحت البوكس ثم رجوع فوقه بفتيلة قوية = ارتداد قوي (قاع قوي)
+        if low < best.low and close > best.low:
+            wick_ratio = down_wick / max(body, 1e-9)
+            if wick_ratio >= BOX_STRONG_WICK_R:
+                ctx = "strong_reversal_long"
+                tier = "strong"
+                score += 3.0
+                direction = "buy"
+                debug.append("sweep_below_demand_with_strong_wick")
+        # إعادة اختبار أعلى البوكس بعد اختراق سابق
+        elif best.low <= close <= best.high:
+            ctx = "retest_long"
+            tier = "mid"
+            score += 1.5
+            direction = "buy"
+            debug.append("retest_demand_box")
+
+    # ----- Supply box حالات -----
+    else:
+        if high > best.high and close < best.high:
+            wick_ratio = up_wick / max(body, 1e-9)
+            if wick_ratio >= BOX_STRONG_WICK_R:
+                ctx = "strong_reversal_short"
+                tier = "strong"
+                score += 3.0
+                direction = "sell"
+                debug.append("sweep_above_supply_with_strong_wick")
+        elif best.low <= close <= best.high:
+            ctx = "retest_short"
+            tier = "mid"
+            score += 1.5
+            direction = "sell"
+            debug.append("retest_supply_box")
+
+    # ==== تقييم سلوك وفوليوم البوكس ====
+    vol_ctx = analyze_box_volume_context(df, best)
+    box_vol_label = vol_ctx["label"]
+    box_height_bps = abs(best.high - best.low) / best.mid * 10000
+
+    if box_vol_label == "strong":
+        score += 1.0
+    elif box_vol_label == "weak":
+        score -= 1.0
+
+    debug.append(
+        f"vol_ctx={box_vol_label}"
+        f"|rej={vol_ctx['rejects']}"
+        f"|brk={vol_ctx['breaks']}"
+        f"|vr={vol_ctx['vol_ratio']:.2f}"
+    )
+
+    # تعديل القوة بالـ RR
+    if rr >= BOX_MIN_RR_SCALP:
+        score += 1.0
+        debug.append(f"ok_scalp_rr={rr:.2f}")
+    elif rr >= BOX_MIN_RR_TREND:
+        score += 2.0
+        if tier == "mid":
+            tier = "strong"
+        debug.append(f"good_trend_rr={rr:.2f}")
+    else:
+        score -= 1.0
+        debug.append(f"poor_rr={rr:.2f}")
+
+    if ctx == "none":
+        tier = "none"
+
+    return {
+        "ctx": ctx,
+        "tier": tier,
+        "score": round(score, 2),
+        "rr": round(rr, 2),
+        "dir": direction,
+        "debug": ";".join(debug),
+        "box": best,
+        "box_touches": best.touches,
+        "box_height_bps": round(box_height_bps, 1),
+        "box_vol": vol_ctx,
+    }
+
+# =================== BOX QUALITY + REJECTION MODULE ===================
+
+def evaluate_box_quality(df, box_ctx, vwap_price=None):
+    """
+    قياس قوة البوكس:
+    - عدد اللمسات
+    - ارتفاع البوكس
+    - قربه من swing مهم
+    - حجم التداول داخل البوكس
+    """
+    if not box_ctx or box_ctx.get("ctx") == "none":
+        return {"score": 0.0, "tier": "none", "why": "no_box"}
+
+    box = box_ctx.get("box")
+    if not box:
+        return {"score": 0.0, "tier": "none", "why": "no_box_obj"}
+
+    close_arr = df["close"].astype(float).values
+    vol_arr   = df["volume"].astype(float).values
+
+    base_price = close_arr[-1]
+    height = abs(box.high - box.low)
+    height_bps = (height / base_price) * 10000
+
+    # كلما البوكس أضيق → أحسن
+    height_score = max(0.0, 3.0 - (height_bps / BOX_MAX_HEIGHT_BP) * 3.0)
+
+    # لمساته
+    touches_score = min(box.touches, 5) * 0.7
+
+    # حجم داخل البوكس
+    in_box_mask = (df["low"].astype(float) >= box.low) & (df["high"].astype(float) <= box.high)
+    box_vol = vol_arr[in_box_mask.values].sum() if in_box_mask.any() else 0.0
+    vol_ma = df["volume"].rolling(30).mean().iloc[-1]
+    vol_ratio = (box_vol / (vol_ma * max(in_box_mask.sum(), 1))) if vol_ma else 1.0
+    vol_score = 0.0
+    if vol_ratio > 1.2:
+        vol_score = 2.0
+    elif vol_ratio > 0.8:
+        vol_score = 1.0
+
+    # علاقة السعر الحالي بالبوكس
+    price = base_price
+    dist_from_mid = abs(price - box.mid) / max(height, 1e-12)
+    dist_score = 1.5 if dist_from_mid <= 0.5 else 0.5
+
+    # VWAP bonus
+    vwap_score = 0.0
+    if vwap_price:
+        if box.kind == "supply" and vwap_price <= box.mid:
+            vwap_score = 1.0  # بيع من فوق vwap
+        elif box.kind == "demand" and vwap_price >= box.mid:
+            vwap_score = 1.0  # شراء من تحت vwap
+
+    total = height_score + touches_score + vol_score + dist_score + vwap_score
+
+    if total >= 6.0:
+        tier = "strong"
+    elif total >= 4.0:
+        tier = "medium"
+    else:
+        tier = "weak"
+
+    return {
+        "score": round(float(total),2),
+        "tier": tier,
+        "height_bps": height_bps,
+        "vol_ratio": round(float(vol_ratio),2) if vol_ma else None,
+        "why": f"h={height_bps:.1f}bps touches={box.touches} vol_ratio={vol_ratio:.2f if vol_ma else 1.0}"
+    }
+
+
+def evaluate_box_rejection_for_entry(df, box_ctx, vwap_price, side):
+    """
+    منطق دخول من رفض بوكس:
+    - للـ SELL: رفض من بوكس supply + إغلاق تحت mid + تحت/حول VWAP
+    - للـ BUY : رفض من بوكس demand + إغلاق فوق mid + فوق/حول VWAP
+    """
+    if not box_ctx or box_ctx.get("ctx") == "none":
+        return {"ok": False, "reason": "no_box"}
+
+    box = box_ctx.get("box")
+    if not box:
+        return {"ok": False, "reason": "no_box_obj"}
+
+    quality = evaluate_box_quality(df, box_ctx, vwap_price)
+    if quality["tier"] == "weak":
+        return {"ok": False, "reason": "weak_box"}
+
+    last = df.iloc[-1]
+    prev = df.iloc[-2]
+
+    close  = float(last["close"])
+    high   = float(last["high"])
+    low    = float(last["low"])
+    prev_c = float(prev["close"])
+
+    body = abs(close - float(last["open"]))
+    rng  = max(float(last["high"]) - float(last["low"]), 1e-12)
+    upper_wick = float(last["high"]) - max(close, float(last["open"]))
+    lower_wick = min(close, float(last["open"])) - float(last["low"])
+
+    in_box = (low <= box.high and high >= box.low)
+    above_mid = close > box.mid
+    below_mid = close < box.mid
+
+    # SELL من بوكس supply
+    if side == "short" and box.kind == "supply":
+        # رفض = شمعة اخترقت لفوق جوه البوكس لكن قفلت تحت الـ mid وتحت/قريب من vwap
+        cond_reject = (
+            in_box and
+            close < box.mid and
+            close < prev_c and
+            upper_wick > 0.5*rng and
+            body < 0.5*rng
+        )
+        vwap_ok = (vwap_price is None) or (close <= vwap_price)
+        if cond_reject and vwap_ok:
+            return {
+                "ok": True,
+                "reason": "box_supply_rejection_short",
+                "quality": quality
+            }
+
+    # BUY من بوكس demand
+    if side == "long" and box.kind == "demand":
+        cond_reject = (
+            in_box and
+            close > box.mid and
+            close > prev_c and
+            lower_wick > 0.5*rng and
+            body < 0.5*rng
+        )
+        vwap_ok = (vwap_price is None) or (close >= vwap_price)
+        if cond_reject and vwap_ok:
+            return {
+                "ok": True,
+                "reason": "box_demand_rejection_long",
+                "quality": quality
+            }
+
+    return {"ok": False, "reason": "no_clear_rejection", "quality": quality}
+
+def manage_box_safety_during_trade(df, box_ctx, vwap_price):
+    """
+    حماية الصفقة المفتوحة من اختراق عكسي للبوكس:
+    - لو دخلنا SELL من supply:
+        رجع السعر فوق mid + فوق VWAP → نطلب تشديد ستوب / خروج مبكر
+    - لو دخلنا BUY من demand:
+        رجع السعر تحت mid + تحت VWAP → نفس الفكرة
+    """
+    if not STATE.get("open"):
+        return {"action": "NONE", "reason": "no_position"}
+
+    if not box_ctx or box_ctx.get("ctx") == "none" or not box_ctx.get("box"):
+        return {"action": "NONE", "reason": "no_box"}
+
+    box = box_ctx["box"]
+    last = df.iloc[-1]
+    close = float(last["close"])
+
+    in_box = (float(last["low"]) <= box.high and float(last["high"]) >= box.low)
+
+    if STATE["side"] == "short" and box.kind == "supply":
+        # رجع جوه البوكس + فوق الـ mid + VWAP قلب لفوق → خطر اختراق
+        if in_box and close > box.mid and (vwap_price is None or close > vwap_price):
+            return {
+                "action": "TIGHTEN_OR_EXIT",
+                "reason": "short_inside_supply_box_above_mid_vwap"
+            }
+
+    if STATE["side"] == "long" and box.kind == "demand":
+        if in_box and close < box.mid and (vwap_price is None or close < vwap_price):
+            return {
+                "action": "TIGHTEN_OR_EXIT",
+                "reason": "long_inside_demand_box_below_mid_vwap"
+            }
+
+    return {"action": "NONE", "reason": "box_safe"}
+
+# ---------- VWAP Calculation ----------
+def compute_vwap(df):
+    """حساب VWAP (Volume Weighted Average Price)"""
+    if len(df) < 20:
+        return {"ok": False, "vwap": 0.0, "position": "none", "slope_bps": 0.0}
+    
+    try:
+        high = df['high'].astype(float)
+        low = df['low'].astype(float)
+        close = df['close'].astype(float)
+        volume = df['volume'].astype(float)
+        
+        # حساب Typical Price
+        typical_price = (high + low + close) / 3
+        
+        # حساب VWAP
+        vwap = (typical_price * volume).cumsum() / volume.cumsum()
+        
+        current_vwap = float(vwap.iloc[-1])
+        current_price = float(close.iloc[-1])
+        
+        # تحديد موقع السعر بالنسبة لـ VWAP
+        if current_price > current_vwap * 1.001:  # فوق ب 0.1%
+            position = "above"
+        elif current_price < current_vwap * 0.999:  # تحت ب 0.1%
+            position = "below" 
+        else:
+            position = "at"
+            
+        # حساب ميل VWAP (bps)
+        if len(vwap) >= 5:
+            vwap_5 = float(vwap.iloc[-5])
+            slope_bps = ((current_vwap - vwap_5) / vwap_5) * 10000
+        else:
+            slope_bps = 0.0
+            
+        return {
+            "ok": True,
+            "vwap": current_vwap,
+            "position": position,
+            "slope_bps": slope_bps,
+            "price_vs_vwap": ((current_price - current_vwap) / current_vwap) * 100
+        }
+    except Exception as e:
+        return {"ok": False, "vwap": 0.0, "position": "none", "slope_bps": 0.0}
+
 # ---------- Volume Confirmation ----------
 def volume_is_strong(vol_list, window=20, threshold=1.4):
     if len(vol_list) < window:
@@ -159,7 +814,7 @@ def detect_ob(candles):
     
     # Bearish OB
     if b['close'] > b['open'] and c['close'] < c['open']:
-        return ("bearish", b['open'], b['close"])
+        return ("bearish", b['open'], b['close'])
     
     return None
 
@@ -441,7 +1096,7 @@ SHADOW_MODE_DASHBOARD = False
 DRY_RUN = False
 
 # ==== Addon: Logging + Recovery Settings ====
-BOT_VERSION = f"SUI ULTRA PRO AI v7.0 — {EXCHANGE_NAME.upper()} - SMART PROFIT AI + TP PROFILE + COUNCIL STRONG ENTRY + PATCH V2.0"
+BOT_VERSION = f"SUI ULTRA PRO AI v7.0 — {EXCHANGE_NAME.upper()} - SMART PROFIT AI + TP PROFILE + COUNCIL STRONG ENTRY + BOX ENGINE + VOLUME ANALYSIS + VWAP INTEGRATION + NEW INTELLIGENT PATCH + FVG REAL vs FAKE + BOX REJECTION PRO"
 print("🚀 Booting:", BOT_VERSION, flush=True)
 
 STATE_PATH = "./bot_state.json"
@@ -738,29 +1393,13 @@ FG_G="\x1b[32m"; FG_R="\x1b[31m"; FG_C="\x1b[36m"; FG_Y="\x1b[33m"; FG_M="\x1b[3
 MIN_QTY = 0.1  # الحد الأدنى للكمية المسموح بها
 MIN_BALANCE_FOR_TRADE = 10.0  # الحد الأدنى للرصيد لفتح صفقة
 
-# ===== IRON STOP (BYBIT TICKS) =====
-HARD_SL_ON = os.getenv("HARD_SL_ON", "1").lower() in ("1","true","yes")
-HARD_SL_TICKS = int(os.getenv("HARD_SL_TICKS", "8"))  # 8 نقاط
-
-# ===== REGIME WATCHER =====
-WATCHER_ON = os.getenv("WATCHER_ON", "1").lower() in ("1","true","yes")
-REGIME_ADX_GATE = float(os.getenv("REGIME_ADX_GATE", "25"))
-DI_EDGE = float(os.getenv("DI_EDGE", "2.0"))
-ATR_EXPAND_K = float(os.getenv("ATR_EXPAND_K", "1.08"))
-ATR_CONTRACT_K = float(os.getenv("ATR_CONTRACT_K", "0.92"))
-HIST_N = int(os.getenv("WATCH_HIST_N", "20"))
-
-# ===== TREND EXIT ENGINE =====
-EXIT_ADX_GATE = float(os.getenv("EXIT_ADX_GATE", "25"))
-EXIT_DI_EDGE = float(os.getenv("EXIT_DI_EDGE", "2.0"))
-EXIT_WEAKNESS_VOTES = int(os.getenv("EXIT_WEAKNESS_VOTES", "2"))  # 2 من 3 => close
-EXIT_MIN_PROFIT_PCT = float(os.getenv("EXIT_MIN_PROFIT_PCT", "0.25"))  # ما يقفلش ضعف إلا وهو ربحان
-
 # =================== PROFESSIONAL LOGGING ===================
 def log_i(msg): print(f"ℹ️ {msg}", flush=True)
 def log_g(msg): print(f"✅ {msg}", flush=True)
 def log_w(msg): print(f"🟨 {msg}", flush=True)
 def log_e(msg): print(f"❌ {msg}", flush=True)
+def log_y(msg): print(f"🟡 {msg}", flush=True)  # إضافة للتحذيرات الصفراء
+def log_r(msg): print(f"🔴 {msg}", flush=True)  # إضافة للتحذيرات الحمراء
 
 def log_banner(text): print(f"\n{'—'*12} {text} {'—'*12}\n", flush=True)
 
@@ -1590,131 +2229,46 @@ def compute_momentum_indicators(df):
     }
 
 def compute_trend_strength(df, ind):
-    """
-    Trend Strength Engine (EdgeAlgo Style)
-    يحلل الاتجاه الحقيقي بناءً على:
-        - EMA 20 / EMA 50 / EMA 100
-        - slope
-        - ADX / DI
-        - momentum
-    ويرجع:
-        trend: bull / bear / chop
-        direction: up / down / flat
-        strength: weak / moderate / strong / very_strong
-        confidence: رقم صغير 0 → 1
-        multiplier: 1 → 2 حسب صلابة الترند
-    """
-    try:
-        close = df["close"].astype(float)
-        ema20 = close.ewm(span=20).mean()
-        ema50 = close.ewm(span=50).mean()
-        ema100 = close.ewm(span=100).mean()
-
-        c = close.iloc[-1]
-        e20 = ema20.iloc[-1]
-        e50 = ema50.iloc[-1]
-        e100 = ema100.iloc[-1]
-
-        adx = float(ind.get("adx", 0.0))
-        plus_di = float(ind.get("plus_di", 0.0))
-        minus_di = float(ind.get("minus_di", 0.0))
-
-        # اتجاه أساسي
-        if c > e20 > e50 > e100:
-            direction = "up"
-        elif c < e20 < e50 < e100:
-            direction = "down"
-        else:
-            direction = "flat"
-
-        # قوة الاتجاه
-        if adx >= 35 and abs(plus_di - minus_di) >= 10:
-            strength = "very_strong"
-            multiplier = 2.0
-        elif adx >= 25:
-            strength = "strong"
-            multiplier = 1.6
-        elif adx >= 18:
-            strength = "moderate"
-            multiplier = 1.3
-        else:
-            strength = "weak"
-            multiplier = 1.0
-
-        # ثقة الاتجاه
-        confidence = max(0.0, min(1.0, adx / 40))
-
-        # trend النهائي
-        if direction == "up":
-            trend = "bull"
-        elif direction == "down":
-            trend = "bear"
-        else:
-            trend = "chop"
-
-        return {
-            "trend": trend,
-            "direction": direction,
-            "strength": strength,
-            "confidence": confidence,
-            "multiplier": multiplier,
-        }
-
-    except Exception:
-        return {
-            "trend": "chop",
-            "direction": "flat",
-            "strength": "weak",
-            "confidence": 0.0,
-            "multiplier": 1.0,
-        }
-
-# =================== EDGE ALGO EMA CONTEXT ===================
-def build_ema_edge_context(trend_strength: dict) -> dict:
-    """
-    تحويل ناتج compute_trend_strength إلى سياق EMA جاهز للـ Entry Engine
-      trend_strength: dict راجع من compute_trend_strength(df, ind)
-    يرجّع:
-      - trend: bull / bear / chop / flat
-      - direction: up / down / flat
-      - strength_label: weak / moderate / strong / very_strong
-      - score: رقم تجميعي للكروس + قوة الترند
-    """
-    if not isinstance(trend_strength, dict):
-        trend_strength = {}
-
-    trend = (trend_strength.get("trend") or trend_strength.get("direction") or "flat").lower()
-    direction = (trend_strength.get("direction") or trend).lower()
-    strength_label = (trend_strength.get("strength") or "").lower()
-    multiplier = float(trend_strength.get("multiplier", 1.0) or 1.0)
-    confidence = float(trend_strength.get("confidence", 0.0) or 0.0)
-
-    base_map = {
-        "very_strong": 4.0,
-        "strong": 3.0,
-        "moderate": 2.0,
-        "weak": 1.0,
-    }
-    base = base_map.get(strength_label, 1.0)
-
-    score = base * multiplier + confidence * 2.0
-
-    # label نهائي
-    if direction in ("up", "bull"):
-        label = "strong_bull" if base >= 3.0 else "bull"
-    elif direction in ("down", "bear"):
-        label = "strong_bear" if base >= 3.0 else "bear"
+    close = df['close'].astype(float)
+    adx = safe_get(ind, 'adx', 0)
+    plus_di = safe_get(ind, 'plus_di', 0)
+    minus_di = safe_get(ind, 'minus_di', 0)
+    
+    momentum_5 = ((close.iloc[-1] - close.iloc[-5]) / close.iloc[-5]) * 100 if len(close) >= 5 else 0
+    momentum_10 = ((close.iloc[-1] - close.iloc[-10]) / close.iloc[-10]) * 100 if len(close) >= 10 else 0
+    
+    trend_consistency = 0
+    if len(close) >= 10:
+        up_days = sum(close.diff().tail(10) > 0)
+        down_days = sum(close.diff().tail(10) < 0)
+        trend_consistency = max(up_days, down_days) / 10.0
+    
+    if adx > 40 and abs(momentum_5) > 3.0 and trend_consistency > 0.7:
+        strength = "very_strong"
+        multiplier = 2.0
+    elif adx > 30 and abs(momentum_5) > 2.0 and trend_consistency > 0.6:
+        strength = "strong"
+        multiplier = 1.5
+    elif adx > 25 and abs(momentum_5) > 1.0:
+        strength = "moderate"
+        multiplier = 1.2
+    elif adx > 20:
+        strength = "weak"
+        multiplier = 1.0
     else:
-        label = "chop"
-
+        strength = "no_trend"
+        multiplier = 0.8
+    
+    direction = "up" if plus_di > minus_di else "down"
+    
     return {
-        "trend": trend,
+        "strength": strength,
         "direction": direction,
-        "strength_label": strength_label or "weak",
         "multiplier": multiplier,
-        "confidence": confidence,
-        "score": float(score),
-        "label": label,
+        "adx": adx,
+        "momentum_5": momentum_5,
+        "momentum_10": momentum_10,
+        "consistency": trend_consistency
     }
 
 def rsi_ma_context(df):
@@ -2247,11 +2801,40 @@ def super_council_ai_enhanced(df):
         volume_profile = compute_volume_profile(df)
         momentum = compute_momentum_indicators(df)
         trend_strength = compute_trend_strength(df, ind)
-        ema_ctx = build_ema_edge_context(trend_strength)
         
         # الاكتشاف المبكر للترند والاختراق
         early_trend = detect_early_trend(df, ind)
         breakout = detect_breakout_opportunity(df, ind)
+        
+        # === FVG REAL vs FAKE + STOP HUNT VOTE ===
+        try:
+            fvg_signal = detect_fvg(df)
+            fvg_ctx = classify_fvg_context(df, fvg_signal)
+        except Exception as e:
+            fvg_ctx = {"kind": None, "real": False, "stop_hunt": False, "reason": f"error:{e}", "zone": None}
+
+        fvg_votes_b = 0
+        fvg_votes_s = 0
+        fvg_score_b = 0.0
+        fvg_score_s = 0.0
+
+        if fvg_ctx["real"]:
+            if fvg_ctx["kind"] == "bullish":
+                fvg_votes_b += 2
+                fvg_score_b += 1.5
+            elif fvg_ctx["kind"] == "bearish":
+                fvg_votes_s += 2
+                fvg_score_s += 1.5
+
+        if fvg_ctx["stop_hunt"]:
+            # Stop hunt صعودي (تحت المنطقة) → فرصة BUY
+            if fvg_ctx["kind"] == "bullish":
+                fvg_votes_b += 3
+                fvg_score_b += 2.0
+            # Stop hunt هبوطي (فوق المنطقة) → فرصة SELL
+            elif fvg_ctx["kind"] == "bearish":
+                fvg_votes_s += 3
+                fvg_score_s += 2.0
         
         # إصلاح: استخدام last_scalar بدلاً من الوصول المباشر
         close_series = df['close'].astype(float)
@@ -2305,6 +2888,15 @@ def super_council_ai_enhanced(df):
                        f"Δscore: B+{boost['score_b']:.1f} S+{boost['score_s']:.1f}")
         except Exception as e:
             logs.append(f"🟨 FLOW-BOOST error: {e}")
+
+        # ===== FVG REAL vs FAKE BOOST =====
+        votes_b += fvg_votes_b
+        votes_s += fvg_votes_s
+        score_b += fvg_score_b
+        score_s += fvg_score_s
+        
+        if fvg_ctx["real"] or fvg_ctx["stop_hunt"]:
+            logs.append(f"🎯 FVG CONTEXT → {fvg_ctx['kind']} real={fvg_ctx['real']} stop_hunt={fvg_ctx['stop_hunt']} reason={fvg_ctx['reason']}")
 
         # ===== EARLY TREND DETECTION BOOST =====
         if EARLY_TREND_DETECTION and early_trend["trend"] != "neutral":
@@ -2551,9 +3143,7 @@ def super_council_ai_enhanced(df):
             "trend_strength": trend_strength,
             "early_trend": early_trend,
             "breakout": breakout,
-            # Edge Algo EMA context
-            "ema_trend": ema_ctx.get("label"),
-            "ema_score": ema_ctx.get("score", 0.0),
+            "fvg_ctx": fvg_ctx
         })
 
         return {
@@ -2566,165 +3156,13 @@ def super_council_ai_enhanced(df):
             "trend_strength": trend_strength,
             "early_trend": early_trend,
             "breakout": breakout,
-            "flow": flow,
-            "ema": ema_ctx,
+            "fvg_ctx": fvg_ctx
         }
     except Exception as e:
         log_w(f"super_council_ai_enhanced error: {e}")
         import traceback
         log_w(f"Traceback: {traceback.format_exc()}")
         return {"b":0,"s":0,"score_b":0.0,"score_s":0.0,"logs":[],"ind":{},"confidence":0.0}
-
-# =================== EDGE EMA PRO ENTRY ENGINE ===================
-def _classify_zone_strength(gz: dict) -> str:
-    if not gz or not isinstance(gz, dict) or not gz.get("ok"):
-        return "none"
-    try:
-        score = float(gz.get("score", 0.0))
-    except Exception:
-        score = 0.0
-    if score >= 7.5:
-        return "strong"
-    if score >= 5.0:
-        return "mid"
-    if score > 0.0:
-        return "weak"
-    return "none"
-
-
-def _classify_flow_bias(flow: dict) -> str:
-    if not flow or not flow.get("ok"):
-        return "unknown"
-    delta = float(flow.get("delta_last", 0.0) or 0.0)
-    cvd_trend = (flow.get("cvd_trend") or "").lower()
-    if delta > 0 and cvd_trend == "up":
-        return "bullish"
-    if delta < 0 and cvd_trend == "down":
-        return "bearish"
-    return "flat"
-
-
-def pro_entry_engine_edge_ema(side: str, council_data: dict):
-    """
-    Gate دخول احترافي مبني على:
-      - council_data["ema"]  (Edge Algo EMA context)
-      - golden_zone (gz)
-      - flow (CVD/delta)
-      - ADX من ind
-    يرجّع: (ok: bool, info: dict)
-    """
-    side = (side or "").lower()
-    if side not in ("buy", "sell"):
-        return False, {"reason": "no_side"}
-
-    ind = council_data.get("ind", {}) or {}
-    gz = council_data.get("gz", {}) or {}
-    ema_ctx = council_data.get("ema", {}) or {}
-    flow = council_data.get("flow", {}) or {}
-
-    adx = float(ind.get("adx", 0.0) or 0.0)
-    plus_di = float(ind.get("plus_di", 0.0) or 0.0)
-    minus_di = float(ind.get("minus_di", 0.0) or 0.0)
-    di_spread = abs(plus_di - minus_di)
-
-    zone_grade = _classify_zone_strength(gz)
-    ema_trend = (ema_ctx.get("label") or ema_ctx.get("trend") or "chop").lower()
-    ema_score = float(ema_ctx.get("score", 0.0) or 0.0)
-    flow_bias = _classify_flow_bias(flow)
-    flow_z = float(flow.get("delta_z", 0.0) or 0.0)
-    cvd_trend = (flow.get("cvd_trend") or "").lower()
-
-    # 1) سوق نايم جداً → بلوك
-    if adx < 15 and zone_grade in ("none", "weak"):
-        return False, {
-            "reason": f"adx_low({adx:.1f})_no_strong_zone",
-            "zone_grade": zone_grade,
-            "ema_trend": ema_trend,
-            "ema_score": ema_score,
-            "flow_bias": flow_bias,
-            "adx": adx,
-        }
-
-    # 2) DI Spread ضعيف + مفيش Zone قوية → بلوك
-    if di_spread < 5 and zone_grade in ("none", "weak") and ema_score < 3.0:
-        return False, {
-            "reason": f"di_spread_low({di_spread:.1f})_no_edge",
-            "zone_grade": zone_grade,
-            "ema_trend": ema_trend,
-            "ema_score": ema_score,
-            "flow_bias": flow_bias,
-            "adx": adx,
-        }
-
-    # 3) اتجاه EMA ضد الصفقة بدون Golden قوي
-    if side == "buy":
-        ema_bad = ema_trend in ("bear", "strong_bear")
-    else:
-        ema_bad = ema_trend in ("bull", "strong_bull")
-
-    if ema_bad and zone_grade not in ("strong", "mid"):
-        return False, {
-            "reason": "ema_trend_against_side_no_strong_zone",
-            "zone_grade": zone_grade,
-            "ema_trend": ema_trend,
-            "ema_score": ema_score,
-            "flow_bias": flow_bias,
-            "adx": adx,
-        }
-
-    # 4) Flow ضد الصفقة + Spike واضح
-    if flow and flow.get("ok"):
-        if side == "buy" and flow_bias == "bearish" and flow_z <= -FLOW_SPIKE_Z:
-            return False, {
-                "reason": f"flow_strong_bearish_z={flow_z:.2f}",
-                "zone_grade": zone_grade,
-                "ema_trend": ema_trend,
-                "ema_score": ema_score,
-                "flow_bias": flow_bias,
-                "adx": adx,
-            }
-        if side == "sell" and flow_bias == "bullish" and flow_z >= FLOW_SPIKE_Z:
-            return False, {
-                "reason": f"flow_strong_bullish_z={flow_z:.2f}",
-                "zone_grade": zone_grade,
-                "ema_trend": ema_trend,
-                "ema_score": ema_score,
-                "flow_bias": flow_bias,
-                "adx": adx,
-            }
-
-    # 5) حد أدنى لـ EMA score حسب وجود Zone
-    if zone_grade in ("strong", "mid"):
-        if ema_score < 1.5:
-            return False, {
-                "reason": f"ema_score_low_for_zone({ema_score:.1f})",
-                "zone_grade": zone_grade,
-                "ema_trend": ema_trend,
-                "ema_score": ema_score,
-                "flow_bias": flow_bias,
-                "adx": adx,
-            }
-    else:
-        # بدون Zone لازم EMA يكون قوي
-        if ema_score < 2.5:
-            return False, {
-                "reason": f"ema_score_low_no_zone({ema_score:.1f})",
-                "zone_grade": zone_grade,
-                "ema_trend": ema_trend,
-                "ema_score": ema_score,
-                "flow_bias": flow_bias,
-                "adx": adx,
-            }
-
-    # كل الفلاتر عدّت → OK
-    return True, {
-        "zone_grade": zone_grade,
-        "ema_trend": ema_trend,
-        "ema_score": ema_score,
-        "flow_bias": flow_bias,
-        "adx": adx,
-    }
-
 
 council_votes_pro_enhanced = super_council_ai_enhanced
 council_votes_pro = super_council_ai_enhanced
@@ -2738,7 +3176,7 @@ def detect_super_scalp_opportunity(df, ind, flow, volume_profile, momentum, spre
         if not SCALP_MODE or not SCALP_EXECUTE:
             return (None, "scalp_off")
 
-        if spread_bps is not None and spread_bps > MAX_SPREAD_BPS:
+        if spread_bps is None and spread_bps > MAX_SPREAD_BPS:
             return (None, f"spread>{MAX_SPREAD_BPS}bps")
 
         current_price = float(df['close'].iloc[-1])
@@ -2989,6 +3427,7 @@ def decide_tp_profile(council_conf, council_total_score, trend_strength, mode="t
     if (council_conf >= COUNCIL_STRONG_TH and 
         trend_strength >= TREND_STRONG_TH and
         mode == "trend"):
+
         reason = f"ترند قوي ({trend_strength}) | مجلس عالي ({council_conf:.1%})"
         return "strong", TP_STRONG_LEVELS, TP_STRONG_WEIGHTS, "🟢", reason
     
@@ -3055,29 +3494,6 @@ def open_market_enhanced(side, qty, price):
     # ✅ نحسب بيانات المجلس الحقيقية للصفقة
     council_data = super_council_ai_enhanced(df)
 
-    # ✅ Gate: EDGE EMA + GOLDEN + FLOW + ADX قبل أي تنفيذ
-    try:
-        pro_ok, pro_info = pro_entry_engine_edge_ema(side, council_data)
-    except Exception as e:
-        log_w(f"pro_entry_engine_edge_ema error: {e}")
-        pro_ok = True
-        pro_info = {"reason": "engine_error_pass"}
-
-    if not pro_ok:
-        reason = pro_info.get("reason", "pro_entry_block")
-        log_i(f"🛡 PRO ENTRY BLOCKED [{side.upper()}] → {reason}")
-        log_i(f"   • zone={pro_info.get('zone_grade')} | "
-              f"ema={pro_info.get('ema_trend')}({pro_info.get('ema_score')}) | "
-              f"flow={pro_info.get('flow_bias')} | "
-              f"adx={pro_info.get('adx', 0):.1f}")
-        return False
-    else:
-        log_i(f"✅ PRO ENTRY PASS [{side.upper()}] | "
-              f"zone={pro_info.get('zone_grade')} | "
-              f"ema={pro_info.get('ema_trend')}({pro_info.get('ema_score'):.1f}) | "
-              f"flow={pro_info.get('flow_bias')} | "
-              f"adx={pro_info.get('adx', 0):.1f}")
-
     # ✅ نحدد Profit Profile المناسب
     profit_profile = classify_profit_profile(df, ind, council_data, trend_info, mode)
 
@@ -3120,15 +3536,6 @@ def open_market_enhanced(side, qty, price):
             "profit_profile": profit_profile["label"],
             "council_controlled": STATE.get("last_entry_source") == "COUNCIL_STRONG"
         })
-        
-        # 🧱 IRON SL (Bybit ticks)
-        if HARD_SL_ON:
-            STATE["tick_size"] = get_tick_size(ex, SYMBOL)
-            STATE["hard_sl_ticks"] = HARD_SL_TICKS
-            STATE["hard_sl_price"] = compute_iron_sl_price(
-                ex, SYMBOL, STATE["entry"], STATE["side"], HARD_SL_TICKS
-            )
-            log_w(f"🧱 IRON SL ARMED | ticks={HARD_SL_TICKS} | tick={STATE['tick_size']:.8f} | sl={STATE['hard_sl_price']:.6f}")
 
         save_state({
             "in_position": True,
@@ -3235,56 +3642,26 @@ STATE = {
     "pnl": 0.0, "bars": 0, "trail": None, "breakeven": None,
     "tp1_done": False, "highest_profit_pct": 0.0,
     "profit_targets_achieved": 0,
-    "peak_pnl_pct": 0.0,
 }
-
 compound_pnl = 0.0
-
-# لم نعد نستخدم منطق "انتظار إشارة RF معاكسة"
-# لكن نحتفظ بالمتغير للتوافق مع /metrics والـ UI
 wait_for_next_signal_side = None
 
-# تبريد بعد كل صفقة مغلقة (بالثواني) — 10 دقائق
-TRADE_COOLDOWN_SEC = 10 * 60
-last_trade_close_ts = 0.0
-
-# =================== COOLDOWN AFTER CLOSE (10 دقائق) ===================
+# =================== WAIT FOR NEXT SIGNAL ===================
 def _arm_wait_after_close(prev_side):
-    """
-    بعد إغلاق أي صفقة:
-      - نلغي منطق wait_for_next_signal_side
-      - ونفعل تبريد زمني 10 دقائق قبل السماح بأي دخول جديد
-    """
-    global wait_for_next_signal_side, last_trade_close_ts
-    wait_for_next_signal_side = None  # لم نعد نستخدمها للدخول
-    last_trade_close_ts = time.time()
-    log_i(f"🧊 COOLDOWN ARMED for {TRADE_COOLDOWN_SEC}s after close (prev_side={prev_side})")
+    global wait_for_next_signal_side
+    wait_for_next_signal_side = "sell" if prev_side=="long" else ("buy" if prev_side=="short" else None)
+    log_i(f"🛑 WAIT FOR NEXT SIGNAL: {wait_for_next_signal_side}")
 
 def wait_gate_allow(df, info):
-    """
-    Gate بسيط للتبريد بعد كل صفقة:
-      - لو مفيش صفقة مفتوحة، ومرّ أقل من TRADE_COOLDOWN_SEC من آخر إغلاق → نمنع أي دخول جديد.
-      - غير كده → نسمح بالدخول.
-    """
-    global last_trade_close_ts
-
-    # لو في صفقة مفتوحة بالفعل → ما فيش تبريد، الإدارة داخل إدارة الصفقة نفسها
-    if STATE.get("open"):
+    if wait_for_next_signal_side is None: 
         return True, ""
-
-    # لو ما حصلش أي صفقة قبل كده → لا يوجد تبريد
-    if last_trade_close_ts <= 0:
-        return True, ""
-
-    elapsed = time.time() - last_trade_close_ts
-    remaining = TRADE_COOLDOWN_SEC - elapsed
-
-    if remaining > 0:
-        # نمنع الدخول لأن فترة التبريد لسه شغالة
-        return False, f"cooldown_active_{int(remaining)}s"
     
-    # خلصت فترة التبريد
-    return True, ""
+    bar_ts = int(info.get("time") or 0)
+    need = (wait_for_next_signal_side=="buy" and info.get("long")) or (wait_for_next_signal_side=="sell" and info.get("short"))
+    
+    if need:
+        return True, ""
+    return False, f"wait-for-next-RF({wait_for_next_signal_side})"
 
 # =================== ORDERS ===================
 def _read_position():
@@ -3347,8 +3724,7 @@ def _reset_after_close(reason, prev_side=None):
         "open": False, "side": None, "entry": None, "qty": 0.0,
         "pnl": 0.0, "bars": 0, "trail": None, "breakeven": None,
         "tp1_done": False, "highest_profit_pct": 0.0, "profit_targets_achieved": 0,
-        "trail_tightened": False, "partial_taken": False,
-        "peak_pnl_pct": 0.0
+        "trail_tightened": False, "partial_taken": False
     })
     save_state({"in_position": False, "position_qty": 0})
     
@@ -3685,114 +4061,8 @@ def build_tp_plan_for_trade(council_data, trend_strength, mode):
         "reason": reason
     }
 
-# =================== PATCH V2.0 - IRON SL + WATCHER + CROSS ENGINE + MEGA COUNCIL ===================
-
-def get_tick_size(exchange, symbol: str) -> float:
-    try:
-        m = exchange.market(symbol)
-        # precision.price -> tick
-        p = (m.get("precision") or {}).get("price", None)
-        if isinstance(p, int) and p >= 0:
-            return 10 ** (-p)
-        info = m.get("info") or {}
-        for k in ("tickSize", "tick_size", "priceFilterTickSize"):
-            if k in info and float(info[k]) > 0:
-                return float(info[k])
-    except Exception:
-        pass
-    return 0.0001  # fallback
-
-def compute_iron_sl_price(exchange, symbol: str, entry_price: float, side: str, ticks: int) -> float:
-    tick = get_tick_size(exchange, symbol)
-    dist = tick * float(ticks)
-    return (entry_price - dist) if side == "long" else (entry_price + dist)
-
-def _push_hist(key, value, n=20):
-    h = STATE.setdefault(key, [])
-    h.append(float(value))
-    if len(h) > n:
-        h.pop(0)
-    return h
-
-def _slope(hist, n=5):
-    if not hist or len(hist) < n+1:
-        return 0.0
-    return float(hist[-1]) - float(hist[-1-n])
-
-def _atr_regime(atr_now, atr_ma):
-    if atr_ma <= 0:
-        return "stable"
-    r = atr_now / atr_ma
-    if r >= ATR_EXPAND_K: return "expand"
-    if r <= ATR_CONTRACT_K: return "contract"
-    return "stable"
-
-def regime_watcher(ind):
-    adx = float(safe_get(ind, "adx", 0.0))
-    atr = float(safe_get(ind, "atr", 0.0))
-    dip = float(safe_get(ind, "plus_di", 0.0))
-    dim = float(safe_get(ind, "minus_di", 0.0))
-
-    adx_hist = _push_hist("hist_adx", adx, n=HIST_N)
-    atr_hist = _push_hist("hist_atr", atr, n=HIST_N)
-
-    adx_s = _slope(adx_hist, n=5)
-    atr_ma = sum(atr_hist)/max(1,len(atr_hist))
-    atr_reg = _atr_regime(atr, atr_ma)
-
-    if dip > dim + DI_EDGE: side = "up"
-    elif dim > dip + DI_EDGE: side = "down"
-    else: side = "flat"
-
-    # تصنيف المرحلة (علمي/عملي)
-    if adx >= REGIME_ADX_GATE and side in ("up","down"):
-        regime = "TREND_UP" if side=="up" else "TREND_DOWN"
-        explain = f"ADX {adx:.1f} strong because DI side={side} | ATR={atr_reg}"
-    elif atr_reg == "contract" and (adx < REGIME_ADX_GATE or adx_s < 0):
-        regime = "COMPRESSION"
-        explain = f"ADX cooling({adx:.1f}) + ATR contract => compression (wait confirm)"
-    elif adx_s < 0 and adx >= 18 and side in ("up","down"):
-        regime = "PULLBACK"
-        explain = f"ADX falling({adx:.1f}) but DI side={side} => pullback (not reversal)"
-    else:
-        regime = "CHOP"
-        explain = f"weak/chop | ADX={adx:.1f} DI+={dip:.1f} DI-={dim:.1f} ATR={atr_reg}"
-
-    flags = {"regime": regime, "side": side, "adx": adx, "adx_slope": adx_s, "atr": atr, "atr_reg": atr_reg,
-             "di_plus": dip, "di_minus": dim}
-    return flags, explain
-
-def cross_engine(ind):
-    """
-    تقاطع DI (قوي) + دعم ADX rising
-    """
-    out = {"buy": 0.0, "sell": 0.0, "tags": []}
-
-    dip = float(safe_get(ind, "plus_di", 0.0))
-    dim = float(safe_get(ind, "minus_di", 0.0))
-    adx = float(safe_get(ind, "adx", 0.0))
-
-    dip_hist = _push_hist("hist_dip", dip, n=HIST_N)
-    dim_hist = _push_hist("hist_dim", dim, n=HIST_N)
-    adx_hist = STATE.get("hist_adx", [])
-
-    adx_rising = _slope(adx_hist, n=3) > 0
-
-    if len(dip_hist) >= 2 and len(dim_hist) >= 2:
-        dip2, dip1 = dip_hist[-2], dip_hist[-1]
-        dim2, dim1 = dim_hist[-2], dim_hist[-1]
-
-        # DI Cross
-        if dip2 <= dim2 and dip1 > dim1:
-            pts = 2.0 + (1.0 if adx_rising and adx >= 20 else 0.0)
-            out["buy"] += pts; out["tags"].append(f"DI_X_BUY(+{pts:.1f})")
-        if dim2 <= dip2 and dim1 > dip1:
-            pts = 2.0 + (1.0 if adx_rising and adx >= 20 else 0.0)
-            out["sell"] += pts; out["tags"].append(f"DI_X_SELL(+{pts:.1f})")
-
-    return out
-
 def manage_after_entry_enhanced_with_smart_patch(df, ind, info, performance_stats):
+    global wait_for_next_signal_side   # عشان نقدر نغيّر منطق الانتظار
     if not STATE["open"] or STATE["qty"] <= 0:
         return
 
@@ -3808,74 +4078,83 @@ def manage_after_entry_enhanced_with_smart_patch(df, ind, info, performance_stat
     if pnl_pct > STATE["highest_profit_pct"]:
         STATE["highest_profit_pct"] = pnl_pct
 
-    # Track peak profit
-    peak = float(STATE.get("peak_pnl_pct", -999))
-    STATE["peak_pnl_pct"] = max(peak, pnl_pct)
+    # ---- EXIT WHEN TOUCHING OPPOSITE BOX (استعداد لصفقة عكسية) ----
+    if BOX_REVERSE_TOUCH_EXIT:
+        try:
+            boxes_live = build_sr_boxes(df)
+            box_ctx_live = analyze_box_context(df, boxes_live)
+            if box_ctx_live and box_ctx_live.get("ctx") != "none":
+                opp_dir = "sell" if side == "long" else "buy"
+                b = box_ctx_live.get("box")
+                # box_ctx_live.dir = اتجاه الصفقة "الأصح" من البوكس الحالي
+                if box_ctx_live.get("dir") == opp_dir and b is not None:
+                    if b.low <= px <= b.high and pnl_pct >= BOX_TOUCH_EXIT_MIN_PNL:
+                        log_i(
+                            f"📦 OPPOSITE BOX TOUCH → closing {side.upper()} "
+                            f"to prepare for {opp_dir.upper()} | pnl={pnl_pct:.2f}%"
+                        )
+                        close_market_strict("opposite_box_touch_exit")
+                        performance_stats["total_trades"] += 1
+                        if pnl_pct > 0:
+                            performance_stats["winning_trades"] += 1
+                        # نحط الانتظار على الإتجاه العكسي عشان أول RF قوي يفتح صفقة جديدة
+                        wait_for_next_signal_side = opp_dir
+                        return
+        except Exception as e:
+            log_w(f"box_touch_exit_error: {e}")
 
-    # 🛑 IRON HARD STOP (ticks)
-    if HARD_SL_ON:
-        sl = STATE.get("hard_sl_price")
-        if sl:
-            if side == "long" and px <= sl:
-                log_w(f"🛑 IRON SL HIT | px={px:.6f} <= sl={sl:.6f} | ticks={STATE.get('hard_sl_ticks')}")
-                close_market_strict("iron_sl_ticks")
-                performance_stats["total_trades"] += 1
-                return
-            if side == "short" and px >= sl:
-                log_w(f"🛑 IRON SL HIT | px={px:.6f} >= sl={sl:.6f} | ticks={STATE.get('hard_sl_ticks')}")
-                close_market_strict("iron_sl_ticks")
-                performance_stats["total_trades"] += 1
-                return
+    # ---- EXIT ON DEEP PULLBACK (نخرج من التصحيح ونستنى ندخل من جديد) ----
+    pullback_from_high = STATE["highest_profit_pct"] - pnl_pct
+    if (
+        STATE["highest_profit_pct"] >= PULLBACK_EXIT_MIN_PROFIT
+        and pullback_from_high >= PULLBACK_EXIT_FROM_HIGH
+    ):
+        log_i(
+            f"↩️ PULLBACK EXIT: high={STATE['highest_profit_pct']:.2f}% → "
+            f"now={pnl_pct:.2f}% | diff={pullback_from_high:.2f}%"
+        )
+        close_market_strict("pullback_exit_wait_reentry")
+        performance_stats["total_trades"] += 1
+        if pnl_pct > 0:
+            performance_stats["winning_trades"] += 1
+        # ننتظر إشارة RF جديدة في نفس اتجاه الصفقة القديمة عشان نركب الموجة من أولها بعد التصحيح
+        wait_for_next_signal_side = side
+        return
 
-    # ===== ADX/ATR Smart Exit (Trend Weakness Close) =====
-    w = STATE.get("watcher")  # لو شغال watcher اللي اتفقنا عليه
-    adx = float(safe_get(ind, "adx", 0.0))
-    dip = float(safe_get(ind, "plus_di", 0.0))
-    dim = float(safe_get(ind, "minus_di", 0.0))
-    atr = float(safe_get(ind, "atr", 0.0))
+    # ===== BOX SAFETY CHECK داخل الصفقة =====
+    try:
+        boxes = build_sr_boxes(df)
+        box_ctx = analyze_box_context(df, boxes)
+        vwap_ctx = compute_vwap(df)
+        vwap_price = vwap_ctx.get("vwap")
 
-    # نقرأ adx_slope/atr_regime من watcher لو موجود
-    adx_slope = float((w or {}).get("adx_slope", 0.0))
-    atr_reg = (w or {}).get("atr_reg", (w or {}).get("atr_regime", "stable"))
+        box_safety = manage_box_safety_during_trade(df, box_ctx, vwap_price)
+        if box_safety["action"] == "TIGHTEN_OR_EXIT":
+            log_r(f"⚠️ BOX PROTECTION: {box_safety['reason']} → EXIT SMALL LOSS / TIGHT TRAIL")
 
-    # اتجاه الصفقة
-    is_long = (side == "long")
-    di_dom_ok = (dip > dim + EXIT_DI_EDGE) if is_long else (dim > dip + EXIT_DI_EDGE)
+            # هنا نقدر نختار:
+            # 1) تقفيل الصفقة مباشرة بخسارة صغيرة
+            # أو 2) تشديد التريل لاقرب سعر منطقي
+            # خلينا الآن نقفل جزء كبير من الصفقة لحماية الرصيد
 
-    # ضعف/انعكاس
-    di_converge = abs(dip - dim) <= (EXIT_DI_EDGE * 0.8)
-    di_cross_against = (dim > dip + EXIT_DI_EDGE) if is_long else (dip > dim + EXIT_DI_EDGE)
-    adx_rollover = (adx_slope < 0 and adx >= 18)  # بدأ يهبط بعد ما كان محترم
-    atr_cooling = (atr_reg == "contract")
+            close_side = "sell" if STATE["side"] == "long" else "buy"
+            close_qty = safe_qty(STATE["qty"] * 0.7)  # قفل 70% لحماية الرصيد
+            if close_qty > 0:
+                if MODE_LIVE and EXECUTE_ORDERS and not DRY_RUN:
+                    try:
+                        params = exchange_specific_params(close_side, is_close=True)
+                        ex.create_order(SYMBOL, "market", close_side, close_qty, None, params)
+                        log_r(f"🛡 BOX SAFETY CLOSE: side={close_side} qty={close_qty}")
+                    except Exception as e:
+                        log_r(f"❌ BOX SAFETY CLOSE ERROR: {e}")
+                else:
+                    log_y(f"[DRY] BOX SAFETY CLOSE: side={close_side} qty={close_qty}")
 
-    # حارس "اقفل على ربح" فقط
-    if pnl_pct >= EXIT_MIN_PROFIT_PCT:
-        weakness_votes = 0
-        reasons = []
-
-        if adx_rollover:
-            weakness_votes += 1; reasons.append("ADX_ROLLOVER")
-        if di_converge:
-            weakness_votes += 1; reasons.append("DI_CONVERGE")
-        if atr_cooling:
-            weakness_votes += 1; reasons.append("ATR_COOLING")
-        if di_cross_against:
-            weakness_votes += 2; reasons.append("DI_CROSS_AGAINST")  # أقوى
-
-        # لو الترند مازال قوي لصالحك، ممنوع يقفل بدري
-        if adx >= EXIT_ADX_GATE and di_dom_ok and not di_cross_against:
-            # HOLD: لا تقفل هنا
-            pass
-        else:
-            # شرط إضافي: ما يقفلش إلا لو بدأ يسحب من القمة
-            drawdown = STATE["peak_pnl_pct"] - pnl_pct
-            if drawdown >= 0.15:  # 0.15% سحب من القمة (قابل للضبط)
-                if weakness_votes >= EXIT_WEAKNESS_VOTES:
-                    log_w(f"🧠 EXIT ON WEAKNESS | pnl={pnl_pct:.2f}% | votes={weakness_votes} | {'+'.join(reasons)} | ADX={adx:.1f} DI+={dip:.1f} DI-={dim:.1f} ATR={atr_reg}")
-                    close_market_strict("exit_weakness_adx_atr")
-                    performance_stats["total_trades"] += 1
-                    performance_stats["winning_trades"] += 1
-                    return
+            # تحديث حالة الصفقة
+            STATE["last_box_safety_reason"] = box_safety["reason"]
+            # ممكن بعدها نكمل smart_profit عالكمية الباقية أو نرجع
+    except Exception as e:
+        log_w(f"Box safety check error: {e}")
 
     # ============================================
     #  SMART PROFIT CORE (SCALP / TREND) — DYNAMIC BY COUNCIL
@@ -3941,7 +4220,11 @@ def manage_after_entry_enhanced_with_smart_patch(df, ind, info, performance_stat
     #  SMART EXIT ENGINE (الإدارة القديمة + الدفاع)
     # ============================================
 
+    # هنا تبقى كل الدفاعات القديمة زي ما هي بدون تغيير
+    # (trend_ctx, reversal_candle, weak_volume, big_profit_protection, etc.)
+    
     # ---- حالة الترند القوي ----
+    trend_ctx = info.get("trend_ctx", SmartTrendContext())
     if trend_ctx.is_strong_trend() and mode == "trend":
         if not STATE.get("trail_tightened", False):
             STATE["trail_tightened"] = True
@@ -3972,7 +4255,7 @@ def manage_after_entry_enhanced_with_smart_patch(df, ind, info, performance_stat
                     log_e(f"❌ Reversal partial close failed: {e}")
     
     # ---- خروج عند ضعف الحجم في السكالب ----
-    vol_ok = volume_is_strong(df['volume'].astype(float).tolist())
+    vol_ok = info.get("vol_ok", False)
     if not vol_ok and pnl_pct > 0.3 and mode == "scalp":
         log_i("⛔ Weak Volume + Profit → Closing Position")
         close_market_strict("weak_volume_profit")
@@ -3998,7 +4281,7 @@ def manage_after_entry_enhanced_with_smart_patch(df, ind, info, performance_stat
     STATE["bars"] += 1
 
 # ============================================
-#  ENHANCED TRADE LOOP WITH SMART PATCH
+#  ENHANCED TRADE LOOP WITH SMART PATCH + BOX ENGINE + VOLUME ANALYSIS + VWAP INTEGRATION
 # ============================================
 
 def trade_loop_enhanced_with_smart_patch():
@@ -4029,6 +4312,240 @@ def trade_loop_enhanced_with_smart_patch():
             if STATE.get("open") and px:
                 apply_smart_profit_strategy()
                 
+            # ============================================
+            #  🚀 NEW INTELLIGENT PATCH - ADVANCED MARKET ANALYSIS
+            # ============================================
+            
+            # 1. SMART LIQUIDITY ANALYSIS
+            try:
+                orderbook = ex.fetch_order_book(SYMBOL, limit=25)
+                bids = orderbook.get('bids', [])
+                asks = orderbook.get('asks', [])
+                
+                if bids and asks:
+                    # حساب قوة الشراء والبيع في الـ orderbook
+                    top_bid_volume = sum([bid[1] for bid in bids[:3]])  # أعلى 3 عروض شراء
+                    top_ask_volume = sum([ask[1] for ask in asks[:3]])  # أدنى 3 عروض بيع
+                    total_bid_volume = sum([bid[1] for bid in bids])
+                    total_ask_volume = sum([ask[1] for ask in asks])
+                    
+                    liquidity_ratio = total_bid_volume / total_ask_volume if total_ask_volume > 0 else 1.0
+                    top_liquidity_ratio = top_bid_volume / top_ask_volume if top_ask_volume > 0 else 1.0
+                    
+                    STATE['liquidity_ratio'] = liquidity_ratio
+                    STATE['top_liquidity_ratio'] = top_liquidity_ratio
+                    
+                    # اكتشاف جدران السيولة الكبيرة
+                    avg_bid_size = total_bid_volume / len(bids) if bids else 0
+                    avg_ask_size = total_ask_volume / len(asks) if asks else 0
+                    
+                    bid_walls = [bid for bid in bids if bid[1] > avg_bid_size * 2.5]
+                    ask_walls = [ask for ask in asks if ask[1] > avg_ask_size * 2.5]
+                    
+                    STATE['bid_walls'] = len(bid_walls)
+                    STATE['ask_walls'] = len(ask_walls)
+                    STATE['liquidity_imbalance'] = "BULLISH" if liquidity_ratio > 1.3 else ("BEARISH" if liquidity_ratio < 0.7 else "BALANCED")
+                    
+                    if LOG_ADDONS:
+                        log_i(f"🧱 LIQUIDITY ANALYSIS | Ratio: {liquidity_ratio:.2f} | Top Ratio: {top_liquidity_ratio:.2f} | Walls: B{len(bid_walls)}/A{len(ask_walls)} | Imbalance: {STATE['liquidity_imbalance']}")
+                    
+            except Exception as e:
+                log_w(f"Advanced liquidity analysis error: {e}")
+            
+            # 2. ADVANCED MOMENTUM DETECTION
+            if len(df) >= 20:
+                try:
+                    closes = df['close'].astype(float)
+                    highs = df['high'].astype(float)
+                    lows = df['low'].astype(float)
+                    volumes = df['volume'].astype(float)
+                    
+                    # حساب زخم متعدد الأطر الزمنية
+                    momentum_3 = ((closes.iloc[-1] - closes.iloc[-3]) / closes.iloc[-3]) * 100
+                    momentum_5 = ((closes.iloc[-1] - closes.iloc[-5]) / closes.iloc[-5]) * 100
+                    momentum_8 = ((closes.iloc[-1] - closes.iloc[-8]) / closes.iloc[-8]) * 100
+                    
+                    # اكتشاف الاختراقات مع تأكيد الحجم
+                    resistance_10 = highs.tail(10).max()
+                    support_10 = lows.tail(10).min()
+                    resistance_20 = highs.tail(20).max()
+                    support_20 = lows.tail(20).min()
+                    
+                    current_high = highs.iloc[-1]
+                    current_low = lows.iloc[-1]
+                    current_close = closes.iloc[-1]
+                    
+                    # تأكيد الحجم للاختراقات
+                    volume_ma = volumes.rolling(10).mean().iloc[-1]
+                    volume_spike = volumes.iloc[-1] > volume_ma * 1.5
+                    
+                    breakout_up = (current_high > resistance_10) and volume_spike
+                    breakdown_down = (current_low < support_10) and volume_spike
+                    
+                    # قوة الاختراق
+                    breakout_strength = (current_high - resistance_10) / resistance_10 * 100 if breakout_up else 0
+                    breakdown_strength = (support_10 - current_low) / support_10 * 100 if breakdown_down else 0
+                    
+                    STATE['momentum_3'] = momentum_3
+                    STATE['momentum_5'] = momentum_5
+                    STATE['momentum_8'] = momentum_8
+                    STATE['breakout_up'] = breakout_up
+                    STATE['breakdown_down'] = breakdown_down
+                    STATE['breakout_strength'] = breakout_strength
+                    STATE['breakdown_strength'] = breakdown_strength
+                    STATE['resistance_10'] = resistance_10
+                    STATE['support_10'] = support_10
+                    STATE['volume_spike'] = volume_spike
+                    
+                    if LOG_ADDONS and (breakout_up or breakdown_down):
+                        log_i(f"🎯 MOMENTUM DETECTION | Breakout: {breakout_up} | Breakdown: {breakdown_down} | Strength: {max(breakout_strength, breakdown_strength):.2f}% | Volume Spike: {volume_spike}")
+                    
+                except Exception as e:
+                    log_w(f"Advanced momentum analysis error: {e}")
+            
+            # 3. ADVANCED VOLATILITY ANALYSIS & REGIME DETECTION
+            if len(df) >= 14:
+                try:
+                    # حساب ATR النسبي ومؤشرات التقلب المتقدمة
+                    atr_value = safe_get(compute_indicators(df), 'atr', 0)
+                    current_price = px or float(df['close'].iloc[-1])
+                    atr_percentage = (atr_value / current_price) * 100 if current_price > 0 else 0
+                    
+                    # تحليل نطاق التداول
+                    high_20 = df['high'].astype(float).tail(20).max()
+                    low_20 = df['low'].astype(float).tail(20).min()
+                    range_20 = high_20 - low_20
+                    range_percentage = (range_20 / current_price) * 100
+                    
+                    # تصنيف نظام التقلب
+                    if atr_percentage > 2.5 or range_percentage > 4.0:
+                        volatility_regime = "HIGH"
+                        regime_color = "🔴"
+                    elif atr_percentage > 1.2 or range_percentage > 2.0:
+                        volatility_regime = "MEDIUM" 
+                        regime_color = "🟡"
+                    else:
+                        volatility_regime = "LOW"
+                        regime_color = "🟢"
+                    
+                    # اكتشاف الانضغاط (الضغط قبل الاختراق)
+                    range_5 = df['high'].astype(float).tail(5).max() - df['low'].astype(float).tail(5).min()
+                    range_10 = df['high'].astype(float).tail(10).max() - df['low'].astype(float).tail(10).min()
+                    compression_ratio = range_5 / range_10 if range_10 > 0 else 1.0
+                    is_compressed = compression_ratio < 0.5
+                    
+                    STATE['atr_percentage'] = atr_percentage
+                    STATE['range_percentage'] = range_percentage
+                    STATE['volatility_regime'] = volatility_regime
+                    STATE['compression_ratio'] = compression_ratio
+                    STATE['is_compressed'] = is_compressed
+                    
+                    if LOG_ADDONS:
+                        log_i(f"📊 VOLATILITY REGIME | {regime_color} {volatility_regime} | ATR: {atr_percentage:.2f}% | Range: {range_percentage:.2f}% | Compression: {compression_ratio:.2f} {'🔷' if is_compressed else ''}")
+                    
+                    # تعديل إستراتيجية التداول حسب نظام التقلب
+                    if volatility_regime == "HIGH" and not STATE.get("open"):
+                        log_i(f"🎚️ HIGH VOLATILITY MODE - Tightening filters and reducing position aggression")
+                    elif volatility_regime == "LOW" and not STATE.get("open"):
+                        log_i(f"🎚️ LOW VOLATILITY MODE - Normal trading parameters")
+                        
+                except Exception as e:
+                    log_w(f"Advanced volatility analysis error: {e}")
+            
+            # 4. SMART POSITION MONITORING & ALERT SYSTEM
+            if STATE.get("open"):
+                try:
+                    entry_price = STATE.get("entry")
+                    current_pnl = STATE.get("pnl", 0)
+                    position_age = time.time() - STATE.get("opened_at", time.time())
+                    position_side = STATE.get("side")
+                    
+                    # مراقبة أداء الصفقة المتقدمة
+                    if position_age > 1800 and abs(current_pnl) < 0.3:  # 30 دقيقة مع ربح ضعيف
+                        log_i("🕒 POSITION AGING - Low PnL after extended period - Consider review")
+                        STATE['aging_alert'] = True
+                    
+                    if position_age > 3600:  # 60 دقيقة
+                        log_i("⏳ EXTENDED POSITION - Consider partial exit or trail adjustment")
+                        STATE['extended_alert'] = True
+                    
+                    # مراقبة انعكاس الترند ضد الصفقة
+                    trend_aligned = True
+                    if position_side == "long" and STATE.get('breakdown_down', False):
+                        log_w("📉 BREAKDOWN DETECTED against LONG position")
+                        STATE['against_trend_alert'] = True
+                        trend_aligned = False
+                    elif position_side == "short" and STATE.get('breakout_up', False):
+                        log_w("📈 BREAKOUT DETECTED against SHORT position") 
+                        STATE['against_trend_alert'] = True
+                        trend_aligned = False
+                    
+                    # تحليل سيولة الـ orderbook ضد الصفقة
+                    if not trend_aligned and STATE.get('liquidity_imbalance') == ("BEARISH" if position_side == "long" else "BULLISH"):
+                        log_w("💧 LIQUIDITY IMBALANCE against position - High caution")
+                        STATE['liquidity_risk_alert'] = True
+                    
+                    # نظام إنذار الذروات (تأمين الأرباح في ظروف معينة)
+                    if current_pnl > 1.5 and STATE.get('volatility_regime') == "HIGH":
+                        log_i("💰 HIGH PROFIT + HIGH VOLATILITY - Consider securing profits")
+                        STATE['profit_protection_alert'] = True
+                        
+                    if current_pnl > 2.0 and not STATE.get('trail_active'):
+                        log_i("🎯 STRONG PROFIT - Activating aggressive trailing")
+                        STATE['trail_activation_alert'] = True
+                    
+                except Exception as e:
+                    log_w(f"Smart position monitoring error: {e}")
+            
+            # 5. MARKET REGIME DETECTION & STRATEGY ADAPTATION
+            try:
+                # تحليل ظروف السوق الشاملة
+                adx_value = safe_get(compute_indicators(df), 'adx', 0)
+                rsi_value = safe_get(compute_indicators(df), 'rsi', 50)
+                
+                # تحديد نظام السوق
+                if adx_value > 35:
+                    market_regime = "TRENDING"
+                    regime_icon = "📈"
+                elif adx_value < 15:
+                    market_regime = "RANGING" 
+                    regime_icon = "➰"
+                else:
+                    market_regime = "TRANSITION"
+                    regime_icon = "🔄"
+                
+                # تحديد جودة السوق
+                if 40 <= rsi_value <= 60 and STATE.get('volatility_regime') == "MEDIUM":
+                    market_quality = "OPTIMAL"
+                    quality_icon = "🟢"
+                elif (rsi_value < 30 or rsi_value > 70) and STATE.get('volatility_regime') == "HIGH":
+                    market_quality = "EXTREME"
+                    quality_icon = "🔴"
+                else:
+                    market_quality = "NORMAL"
+                    quality_icon = "🟡"
+                
+                STATE['market_regime'] = market_regime
+                STATE['market_quality'] = market_quality
+                
+                if LOG_ADDONS:
+                    log_i(f"🏛️ MARKET REGIME | {regime_icon} {market_regime} | {quality_icon} {market_quality} | ADX: {adx_value:.1f} | RSI: {rsi_value:.1f}")
+                
+                # تعديل الإستراتيجية حسب نظام السوق
+                if market_regime == "RANGING" and market_quality == "OPTIMAL":
+                    log_i("🎯 RANGING MARKET - Favoring mean reversion strategies")
+                elif market_regime == "TRENDING" and market_quality == "OPTIMAL":
+                    log_i("🎯 TRENDING MARKET - Favoring trend following strategies")
+                elif market_quality == "EXTREME":
+                    log_i("⚠️ EXTREME MARKET CONDITIONS - High caution recommended")
+                    
+            except Exception as e:
+                log_w(f"Market regime detection error: {e}")
+            
+            # ============================================
+            #  END OF NEW INTELLIGENT PATCH
+            # ============================================
+                
             # تحديث جميع المحركات الذكية
             close_prices = df['close'].astype(float).tolist()
             volumes = df['volume'].astype(float).tolist()
@@ -4055,20 +4572,28 @@ def trade_loop_enhanced_with_smart_patch():
                 STATE["pnl"] = (px-STATE["entry"])*STATE["qty"] if STATE["side"]=="long" else (STATE["entry"]-px)*STATE["qty"]
             
             # ============================================
-            #  SMART DECISION INTELLIGENCE BLOCK
+            #  SMART DECISION INTELLIGENCE BLOCK + BOX ENGINE + VOLUME ANALYSIS + VWAP
             # ============================================
+            
+            # ===== BOX ENGINE INTEGRATION =====
+            boxes = build_sr_boxes(df)
+            box_ctx = analyze_box_context(df, boxes)
+            
+            if box_ctx["ctx"] != "none":
+                log_i(
+                    f"📦 BOX CONTEXT: {box_ctx['ctx']} | tier={box_ctx['tier']} "
+                    f"score={box_ctx['score']:.2f} rr={box_ctx['rr']:.2f} dir={box_ctx['dir']} "
+                    f"| debug={box_ctx['debug']}"
+                )
+            
+            # ===== VWAP CALCULATION =====
+            vwap_ctx = compute_vwap(df)
             
             entry_reasons = []
             allow_buy = False
             allow_sell = False
             
             close_price = float(df['close'].iloc[-1]) if len(df) > 0 else px
-            
-            # ---- تشغيل Watcher ----
-            if WATCHER_ON:
-                wflags, wexp = regime_watcher(ind)
-                STATE["watcher"] = wflags
-                log_i(f"🧭 WATCHER | {wflags['regime']} | {wexp}")
             
             # ---- Volume Confirmation ----
             vol_ok = volume_is_strong(volumes)
@@ -4101,15 +4626,15 @@ def trade_loop_enhanced_with_smart_patch():
                 allow_buy = True
                 buy_conditions.append("Golden Bottom")
             
-            # Bullish FVG (GATED)
-            if fvg_signal and fvg_signal[0] == "bullish" and vol_ok and adx_ok and trend_ctx.trend != "down":
+            # Bullish FVG
+            if fvg_signal and fvg_signal[0] == "bullish":
                 allow_buy = True
-                buy_conditions.append("Bullish FVG (gated)")
+                buy_conditions.append("Bullish FVG")
             
-            # Bullish OB (GATED)
-            if ob_signal and ob_signal[0] == "bullish" and vol_ok and adx_ok and trend_ctx.trend != "down":
+            # Bullish OB
+            if ob_signal and ob_signal[0] == "bullish":
                 allow_buy = True
-                buy_conditions.append("Bullish OB (gated)")
+                buy_conditions.append("Bullish OB")
             
             # Buy Liquidity
             if buy_liquidity and vol_ok:
@@ -4124,21 +4649,73 @@ def trade_loop_enhanced_with_smart_patch():
                 allow_sell = True
                 sell_conditions.append("Golden Top")
             
-            # Bearish FVG (GATED)
-            if fvg_signal and fvg_signal[0] == "bearish" and vol_ok and adx_ok and trend_ctx.trend != "up":
+            # Bearish FVG
+            if fvg_signal and fvg_signal[0] == "bearish":
                 allow_sell = True
-                sell_conditions.append("Bearish FVG (gated)")
+                sell_conditions.append("Bearish FVG")
             
-            # Bearish OB (GATED)
-            if ob_signal and ob_signal[0] == "bearish" and vol_ok and adx_ok and trend_ctx.trend != "up":
+            # Bearish OB
+            if ob_signal and ob_signal[0] == "bearish":
                 allow_sell = True
-                sell_conditions.append("Bearish OB (gated)")
+                sell_conditions.append("Bearish OB")
             
             # Sell Liquidity
             if sell_liquidity and vol_ok:
                 allow_sell = True
                 sell_conditions.append("Sell Liquidity Zone")
             
+            # ===== BOX + VWAP PRO ENTRY (SELL/BUY) =====
+            box_vol = box_ctx.get("box_vol", {}) if box_ctx else {}
+            box_vol_label = box_vol.get("label", "normal")
+
+            # بوكس قوي فعلاً (سلوك + فوليوم + RR)
+            box_strong_enough = (
+                box_ctx
+                and box_ctx.get("ctx") in ("strong_reversal_short", "strong_reversal_long")
+                and box_vol_label == "strong"
+                and box_ctx.get("rr", 0) >= 1.6
+            )
+
+            # قراءة ذكية لرفض البوكس مع الفوليوم
+            box_rejection_side = None
+            if box_ctx and box_ctx.get("ctx") in ("strong_reversal_short", "strong_reversal_long"):
+                rej_cnt   = box_vol.get("rejects", 0)
+                strong_ok = (box_vol_label == "strong") if BOX_REJECTION_REQUIRE_STRONG else True
+                if rej_cnt >= BOX_REJECTION_MIN_REJECTS and strong_ok:
+                    box_rejection_side = box_ctx.get("dir")  # "buy" لو demand قوي، "sell" لو supply قوي
+                    entry_reasons.append(
+                        f"BOX_REJECTION_CONFIRMED({box_rejection_side},rej={rej_cnt},vol={box_vol_label})"
+                    )
+
+                    # من تحت: فوليوم قوي عند demand ⇒ BUY واضح
+                    if box_rejection_side == "buy":
+                        allow_buy = True
+                        allow_sell = False  # ما تبيعش في القاع
+                    # من فوق: فوليوم قوي عند supply ⇒ SELL واضح
+                    elif box_rejection_side == "sell":
+                        allow_sell = True
+                        allow_buy = False  # ما تشتريش عند السقف
+
+            if box_strong_enough:
+                v_pos   = vwap_ctx.get("position", "none")
+                v_slope = vwap_ctx.get("slope_bps", 0.0)
+
+                # SELL من بوكس supply قوي + السعر فوق/عنده + VWAP مش طالع جامد
+                if box_ctx["dir"] == "sell":
+                    if v_pos in ("above", "at") and v_slope <= 5.0:
+                        allow_sell = True
+                        entry_reasons.append(
+                            f"BOX_STRONG_SELL(vol={box_vol.get('vol_ratio')},rej={box_vol.get('rejects')},vwap_pos={v_pos})"
+                        )
+
+                # BUY من بوكس demand قوي + السعر تحت/عنده + VWAP مش نازل جامد
+                if box_ctx["dir"] == "buy":
+                    if v_pos in ("below", "at") and v_slope >= -5.0:
+                        allow_buy = True
+                        entry_reasons.append(
+                            f"BOX_STRONG_BUY(vol={box_vol.get('vol_ratio')},rej={box_vol.get('rejects')},vwap_pos={v_pos})"
+                        )
+
             # ---- Volume Final Gate ----
             if not vol_ok:
                 allow_buy = False
@@ -4165,124 +4742,180 @@ def trade_loop_enhanced_with_smart_patch():
             if rf_sell and not allow_sell and not STATE["open"]:
                 signal_logger.log_missed_signal("SELL", close_price, " | ".join(entry_reasons))
             
+            # ================= BOX REJECTION SMART ENTRY =================
+            box_reject_short = evaluate_box_rejection_for_entry(df, box_ctx, vwap_ctx.get("vwap"), side="short")
+            box_reject_long  = evaluate_box_rejection_for_entry(df, box_ctx, vwap_ctx.get("vwap"), side="long")
+
+            box_entry_signal = None
+            box_entry_reason = None
+
+            # SELL من رفض بوكس supply
+            if box_reject_short["ok"]:
+                box_entry_signal = "short"
+                box_entry_reason = box_reject_short["reason"]
+                log_y(f"📦 BOX REJECTION SELL: {box_entry_reason} "
+                      f"| tier={box_reject_short['quality']['tier']} "
+                      f"| score={box_reject_short['quality']['score']}")
+            
+            # BUY من رفض بوكس demand
+            if box_reject_long["ok"]:
+                # لو كان فيه كمان إشارة Golden Bottom أو Stop Hunt Bullish بنزود الثقة
+                box_entry_signal = "long"
+                box_entry_reason = box_reject_long["reason"]
+                log_y(f"📦 BOX REJECTION BUY: {box_entry_reason} "
+                      f"| tier={box_reject_long['quality']['tier']} "
+                      f"| score={box_reject_long['quality']['score']}")
+
             # ============================================
-            #  MEGA COUNCIL (ONE DECISION)
+            #  FINAL ENTRY EXECUTION LAYER
             # ============================================
 
             council_data = council_votes_pro_enhanced(df)
+            final_signal   = None
+            entry_source   = None  # "RF+SMC" أو "COUNCIL_STRONG" أو "BOX+VWAP"
 
-            # watcher + crosses
-            w = STATE.get("watcher", {"regime":"CHOP","side":"flat"})
-            cx = cross_engine(ind)
-
-            # zone-backed rule
-            zone_ok = bool(gb or gt or buy_liquidity or sell_liquidity or ob_signal or fvg_signal)
-
-            # HARD VETO gates (صياد محترف)
-            veto = []
-            if not zone_ok:
-                veto.append("NO_ZONE")
-            if not vol_ok:
-                veto.append("WEAK_VOLUME")
-
-            # regime veto (علمي)
-            if w["regime"] == "CHOP":
-                veto.append("CHOP")
-            if w["regime"] == "TREND_DOWN" and not gb:
-                # لا BUY ضد ترند هابط قوي إلا لو Golden Bottom
-                pass
-            if w["regime"] == "TREND_UP" and not gt:
-                # لا SELL ضد ترند صاعد قوي إلا لو Golden Top
-                pass
-
-            # Scoring
-            buy_score = 0.0
-            sell_score = 0.0
-            reasons = []
-
-            # Zones
-            if gb and adx_ok and trend_ctx.trend != "down": 
-                buy_score += 4.0; reasons.append("GB")
-            if gt and adx_ok and trend_ctx.trend != "up":   
-                sell_score += 4.0; reasons.append("GT")
-
-            if fvg_signal and fvg_signal[0] == "bullish": 
-                buy_score += 2.0; reasons.append("FVG_BULL")
-            if fvg_signal and fvg_signal[0] == "bearish": 
-                sell_score += 2.0; reasons.append("FVG_BEAR")
-
-            if ob_signal and ob_signal[0] == "bullish": 
-                buy_score += 2.0; reasons.append("OB_BULL")
-            if ob_signal and ob_signal[0] == "bearish": 
-                sell_score += 2.0; reasons.append("OB_BEAR")
-
-            if buy_liquidity:  
-                buy_score += 2.0; reasons.append("LIQ_BUY")
-            if sell_liquidity: 
-                sell_score += 2.0; reasons.append("LIQ_SELL")
-
-            # RF trigger (ليس المخ)
-            rf_buy = info.get("long", False)
-            rf_sell = info.get("short", False)
-            if rf_buy:  
-                buy_score += 1.5; reasons.append("RF_BUY")
-            if rf_sell: 
-                sell_score += 1.5; reasons.append("RF_SELL")
-
-            # Cross engine boost (تقاطع "علمي")
-            buy_score += cx["buy"]; sell_score += cx["sell"]
-            reasons.extend(cx["tags"])
-
-            # Council amplification (ثقة المجلس تضاعف القرار ولا تعمل مسار مستقل)
+            # ---- تلخيص مجلس الإدارة ----
+            cb   = int(council_data.get("b", 0))
+            cs   = int(council_data.get("s", 0))
+            sb   = float(council_data.get("score_b", 0.0))
+            ss   = float(council_data.get("score_s", 0.0))
             conf = float(council_data.get("confidence", 0.0))
-            sb = float(council_data.get("score_b", 0.0))
-            ss = float(council_data.get("score_s", 0.0))
-            if conf > 0:
-                buy_score  += (conf * 2.0) * (1.0 if sb >= ss else 0.5)
-                sell_score += (conf * 2.0) * (1.0 if ss >= sb else 0.5)
-                reasons.append(f"CONF({conf:.2f})")
+            total_score = sb + ss
 
-            # regime alignment scaling (يمنع بيع متأخر/شراء متأخر)
-            if w["regime"] == "TREND_DOWN":
-                buy_score *= 0.70; reasons.append("REGIME_DOWN")
-            elif w["regime"] == "TREND_UP":
-                sell_score *= 0.70; reasons.append("REGIME_UP")
-            elif w["regime"] in ("COMPRESSION","PULLBACK"):
-                reasons.append(f"REGIME_{w['regime']}")
+            # ===== BOX ENGINE BOOST =====
+            if box_ctx["ctx"] != "none":
+                if box_ctx["dir"] == "buy":
+                    cb += 3
+                    sb += 1.5
+                    log_i(f"📦 BOX BOOST: +3 votes BUY | score +1.5")
+                elif box_ctx["dir"] == "sell":
+                    cs += 3
+                    ss += 1.5
+                    log_i(f"📦 BOX BOOST: +3 votes SELL | score +1.5")
+            
+            council_side = None
+            if COUNCIL_STRONG_ENTRY and conf >= COUNCIL_STRONG_CONF and total_score >= COUNCIL_STRONG_SCORE:
+                if cb >= COUNCIL_STRONG_VOTES and sb > ss:
+                    council_side = "buy"
+                elif cs >= COUNCIL_STRONG_VOTES and ss > sb:
+                    council_side = "sell"
 
-            final_signal = None
-            entry_source = "MEGA_COUNCIL"
+                if council_side:
+                    log_i(
+                        f"🏛 COUNCIL STRONG SIDE → {council_side.upper()} | "
+                        f"votes={cb}/{cs} score={sb:.1f}/{ss:.1f} conf={conf:.2f}"
+                    )
 
-            if veto:
+            # ===== المسار الأساسي: RF + SMC / GOLDEN =====
+            if rf_buy and allow_buy:
+                final_signal = "buy"
+                entry_source = "RF+SMC"
+            elif rf_sell and allow_sell:
+                final_signal = "sell"
+                entry_source = "RF+SMC"
+
+            # ===== المسار الذكي: دخول مجلس الإدارة القوي =====
+            if final_signal is None and council_side is not None:
+                safe_to_enter = True
+
+                if COUNCIL_BLOCK_STRONG_TREND and trend_ctx.is_strong_trend():
+                    # لو الترند قوي عكس اتجاه المجلس ومافيش Golden في نفس اتجاه المجلس → بلوك
+                    if council_side == "buy" and trend_ctx.trend == "down" and not gb:
+                        safe_to_enter = False
+                    if council_side == "sell" and trend_ctx.trend == "up" and not gt:
+                        safe_to_enter = False
+
+                if safe_to_enter:
+                    final_signal = council_side
+                    entry_source = "COUNCIL_STRONG"
+                    entry_reasons.append("COUNCIL_STRONG_ENTRY")
+                    log_g(
+                        f"🏛 COUNCIL STRONG ENTRY → {final_signal.upper()} | "
+                        f"votes={cb}/{cs} score={sb:.1f}/{ss:.1f} conf={conf:.2f}"
+                    )
+                else:
+                    log_i("🏛 COUNCIL STRONG ENTRY blocked by opposite strong trend")
+
+            # ===== دمج BOX REJECTION مع باقي الاستراتيجيات =====
+            if final_signal is None and box_entry_signal:
+                final_signal = box_entry_signal
+                entry_source = "BOX_REJECTION"
+                entry_reasons.append(box_entry_reason)
+
+            # ===== فلتر BALANCED MODE =====
+            combined_score = total_score + box_ctx.get("score", 0.0)
+
+            if combined_score < BALANCED_MIN_SCORE or box_ctx.get("tier") == "weak":
+                # لا سكالب ضعيف
+                if council_side or allow_buy or allow_sell:
+                    log_y(f"⚠️ BALANCED FILTER: skipped weak setup | combined_score={combined_score:.2f} "
+                          f"| box_tier={box_ctx.get('tier')} | ctx={box_ctx.get('ctx')}")
+                council_side = None
+                allow_buy = False
+                allow_sell = False
                 final_signal = None
-                entry_reasons.append(" | ".join(reasons + [f"VETO:{'|'.join(veto)}"]))
-            else:
-                # thresholds للصياد
-                if buy_score >= 6.5 and buy_score > sell_score + 0.8:
-                    final_signal = "buy"
-                elif sell_score >= 6.5 and sell_score > buy_score + 0.8:
-                    final_signal = "sell"
-
-                entry_reasons.append(f"SCORE buy={buy_score:.2f} sell={sell_score:.2f}")
-                entry_reasons.extend(reasons)
 
             # ===== تنفيذ الدخول إن وجد إشارة نهائية =====
             if final_signal and not STATE["open"]:
                 allow_wait, wait_reason = wait_gate_allow(df, info)
 
-                if not allow_wait:
+                # نحسب قوة المجلس هنا
+                max_score = max(council_data.get("score_b", 0.0), council_data.get("score_s", 0.0))
+                max_votes = max(council_data.get("b", 0), council_data.get("s", 0))
+                conf = council_data.get("confidence", 0.0)
+
+                strong_council = (
+                    conf >= COUNCIL_STRONG_ENTRY_CONF and
+                    max_score >= COUNCIL_STRONG_ENTRY_SCORE and
+                    max_votes >= COUNCIL_STRONG_MIN_VOTES
+                )
+
+                # هل إشارة الـ RF الحالية في نفس اتجاه الانتظار؟
+                rf_side = "buy" if info.get("long") else ("sell" if info.get("short") else None)
+                wait_side = wait_for_next_signal_side
+
+                override_wait = False
+                if not allow_wait and strong_council and rf_side and wait_side and rf_side == wait_side:
+                    override_wait = True
+                    log_i(f"🏆 COUNCIL STRONG ENTRY override wait-for-next-RF({wait_side}) "
+                          f"| score={max_score:.1f} votes={max_votes} conf={conf:.2f}")
+
+                if not allow_wait and not override_wait:
                     log_i(f"⏳ Waiting: {wait_reason}")
                 else:
                     qty = compute_size(bal, px or info["price"])
                     if qty > 0:
+                        # حفظ مصدر الدخول للأغراض اللوج
+                        if box_strong_enough:
+                            entry_source = "BOX+VWAP"
+                        elif override_wait:
+                            entry_source = "COUNCIL_STRONG"
+                        else:
+                            entry_source = "RF+SMC"
+                            
                         STATE["last_entry_source"] = entry_source
                         STATE["last_entry_reasons"] = " | ".join(entry_reasons) if entry_reasons else ""
                         STATE["last_balance"] = float(bal or 0.0)
 
+                        # تحديد قوة الإشارة وملف TP
+                        signal_strength = "weak"
+                        tp_profile = "SCALP_1"
+
+                        if box_ctx["tier"] == "strong" and trend_ctx.trend == "trend":
+                            signal_strength = "strong"
+                            tp_profile = "TREND_3"
+                        elif box_ctx["tier"] in ("mid", "strong"):
+                            signal_strength = "mid"
+                            tp_profile = "MID_2"
+
+                        STATE["signal_strength"] = signal_strength
+                        STATE["tp_profile"] = tp_profile
+
                         ok = open_market_enhanced(final_signal, qty, px or info["price"])
                         if ok:
                             wait_for_next_signal_side = None
-                            log_i(f"🎯 MEGA EXECUTION: {final_signal.upper()} | src={entry_source} | Reasons: {' | '.join(entry_reasons)}")
+                            log_i(f"🎯 SMART EXECUTION: {final_signal.upper()} | src={entry_source} | "
+                                  f"Reasons: {' | '.join(entry_reasons)} | Strength: {signal_strength} | TP: {tp_profile}")
                             if SCALP_MODE:
                                 zero_scalper.record_trade(current_time, True)
                     else:
@@ -4368,12 +5001,12 @@ def pretty_snapshot(bal, info, ind, spread_bps, reason=None, df=None):
     if LOG_LEGACY:
         left_s = time_to_candle_close(df) if df is not None else 0
         print(colored("─"*100,"cyan"))
-        print(colored(f"📊 {SYMBOL} {INTERVAL} • {EXCHANGE_NAME.upper()} • {'LIVE' if MODE_LIVE else 'PAPER'} • {datetime.utcnow().strftime('%Y-%m-d %H:%M:%S')} UTC","cyan"))
+        print(colored(f"📊 {SYMBOL} {INTERVAL} • {EXCHANGE_NAME.upper()} • {'LIVE' if MODE_LIVE else 'PAPER'} • {datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S')} UTC","cyan"))
         print(colored("─"*100,"cyan"))
         print("📈 INDICATORS & RF")
         print(f"   💲 Price {fmt(info.get('price'))} | RF filt={fmt(info.get('filter'))}  hi={fmt(info.get('hi'))} lo={fmt(info.get('lo'))}")
         print(f"   🧮 RSI={fmt(safe_get(ind, 'rsi'))}  +DI={fmt(safe_get(ind, 'plus_di'))}  -DI={fmt(safe_get(ind, 'minus_di'))}  ADX={fmt(safe_get(ind, 'adx'))}  ATR={fmt(safe_get(ind, 'atr'))}")
-        print(f"   🎯 ENTRY: SUPER COUNCIL AI + GOLDEN ENTRY + SUPER SCALP + SMART PROFIT AI + TP PROFILE + MEGA COUNCIL PATCH V2.0 |  spread_bps={fmt(spread_bps,2)}")
+        print(f"   🎯 ENTRY: SUPER COUNCIL AI + GOLDEN ENTRY + SUPER SCALP + SMART PROFIT AI + TP PROFILE + COUNCIL STRONG ENTRY + BOX ENGINE + VOLUME ANALYSIS + VWAP INTEGRATION + NEW INTELLIGENT PATCH + FVG REAL vs FAKE + BOX REJECTION PRO |  spread_bps={fmt(spread_bps,2)}")
         print(f"   ⏱️ closes_in ≈ {left_s}s")
         print("\n🧭 POSITION")
         bal_line = f"Balance={fmt(bal,2)}  Risk={int(RISK_ALLOC*100)}%×{LEVERAGE}x  CompoundPnL={fmt(compound_pnl)}  Eq~{fmt((bal or 0)+compound_pnl,2)}"
@@ -4382,18 +5015,11 @@ def pretty_snapshot(bal, info, ind, spread_bps, reason=None, df=None):
             lamp='🟩 LONG' if STATE['side']=='long' else '🟥 SHORT'
             print(f"   {lamp}  Entry={fmt(STATE['entry'])}  Qty={fmt(STATE['qty'],4)}  Bars={STATE['bars']}  Trail={fmt(STATE['trail'])}  BE={fmt(STATE['breakeven'])}")
             print(f"   🎯 TP_done={STATE['profit_targets_achieved']}  HP={fmt(STATE['highest_profit_pct'],2)}%")
-            print(f"   🎯 MODE={STATE.get('mode', 'trend')}  TP_PROFILE={STATE.get('tp_profile', 'none')}")
-            if HARD_SL_ON and STATE.get("hard_sl_price"):
-                print(f"   🛡️ IRON SL: {STATE['hard_sl_price']:.6f} ({STATE['hard_sl_ticks']} ticks)")
+            print(f"   🎯 MODE={STATE.get('mode', 'trend')}  TP_PROFILE={STATE.get('tp_profile', 'none')}  SIGNAL_STRENGTH={STATE.get('signal_strength', 'none')}")
         else:
             print("   ⚪ FLAT")
-            # عرض حالة التبريد بعد آخر صفقة
-            if last_trade_close_ts > 0:
-                remaining = TRADE_COOLDOWN_SEC - (time.time() - last_trade_close_ts)
-                if remaining > 0:
-                    mins = int(remaining // 60)
-                    secs = int(remaining % 60)
-                    print(colored(f"   ⏳ COOLDOWN ACTIVE: {mins:02d}:{secs:02d} min remaining", "cyan"))
+            if wait_for_next_signal_side:
+                print(colored(f"   ⏳ Waiting for opposite RF: {wait_for_next_signal_side.upper()}", "cyan"))
         if reason: print(colored(f"   ℹ️ reason: {reason}", "white"))
         print(colored("─"*100,"cyan"))
 
@@ -4412,7 +5038,7 @@ def mark_position(color):
 @app.route("/")
 def home():
     mode='LIVE' if MODE_LIVE else 'PAPER'
-    return f"✅ SUI ULTRA PRO AI Bot — {EXCHANGE_NAME.upper()} — {SYMBOL} {INTERVAL} — {mode} — Super Council AI + Intelligent Trend Riding + Smart Profit AI + TP Profile System + Council Strong Entry + PATCH V2.0"
+    return f"✅ SUI ULTRA PRO AI Bot — {EXCHANGE_NAME.upper()} — {SYMBOL} {INTERVAL} — {mode} — Super Council AI + Intelligent Trend Riding + Smart Profit AI + TP Profile System + Council Strong Entry + BOX ENGINE + VOLUME ANALYSIS + VWAP INTEGRATION + NEW INTELLIGENT PATCH + FVG REAL vs FAKE + BOX REJECTION PRO"
 
 @app.route("/metrics")
 def metrics():
@@ -4421,9 +5047,8 @@ def metrics():
         "symbol": SYMBOL, "interval": INTERVAL, "mode": "live" if MODE_LIVE else "paper",
         "leverage": LEVERAGE, "risk_alloc": RISK_ALLOC, "price": price_now(),
         "state": STATE, "compound_pnl": compound_pnl,
-        "entry_mode": "SUPER_COUNCIL_AI_GOLDEN_SCALP_SMART_PROFIT_TP_PROFILE_COUNCIL_STRONG_MEGA_COUNCIL_V2", 
+        "entry_mode": "SUPER_COUNCIL_AI_GOLDEN_SCALP_SMART_PROFIT_TP_PROFILE_COUNCIL_STRONG_BOX_ENGINE_VOLUME_VWAP_NEW_INTELLIGENT_PATCH_FVG_REAL_vs_FAKE_BOX_REJECTION_PRO", 
         "wait_for_next_signal": wait_for_next_signal_side,
-        "cooldown_remaining_sec": max(0, int(TRADE_COOLDOWN_SEC - (time.time() - last_trade_close_ts))) if last_trade_close_ts > 0 else 0,
         "guards": {"max_spread_bps": MAX_SPREAD_BPS, "final_chunk_qty": FINAL_CHUNK_QTY},
         "scalp_mode": SCALP_MODE,
         "super_council_ai": COUNCIL_AI_MODE,
@@ -4431,13 +5056,12 @@ def metrics():
         "smart_profit_ai": True,
         "tp_profile_system": True,
         "council_strong_entry": COUNCIL_STRONG_ENTRY,
-        "patch_v2": {
-            "iron_sl": HARD_SL_ON,
-            "iron_sl_ticks": HARD_SL_TICKS,
-            "regime_watcher": WATCHER_ON,
-            "trend_exit_engine": True,
-            "mega_council": True
-        }
+        "box_engine": True,
+        "volume_analysis": True,
+        "vwap_integration": True,
+        "new_intelligent_patch": True,
+        "fvg_real_vs_fake": True,
+        "box_rejection_pro": True
     })
 
 @app.route("/health")
@@ -4446,19 +5070,19 @@ def health():
         "ok": True, "exchange": EXCHANGE_NAME, "mode": "live" if MODE_LIVE else "paper",
         "open": STATE["open"], "side": STATE["side"], "qty": STATE["qty"],
         "compound_pnl": compound_pnl, "timestamp": datetime.utcnow().isoformat(),
-        "entry_mode": "SUPER_COUNCIL_AI_GOLDEN_SCALP_SMART_PROFIT_TP_PROFILE_COUNCIL_STRONG_MEGA_COUNCIL_V2", 
+        "entry_mode": "SUPER_COUNCIL_AI_GOLDEN_SCALP_SMART_PROFIT_TP_PROFILE_COUNCIL_STRONG_BOX_ENGINE_VOLUME_VWAP_NEW_INTELLIGENT_PATCH_FVG_REAL_vs_FAKE_BOX_REJECTION_PRO", 
         "wait_for_next_signal": wait_for_next_signal_side,
-        "cooldown_remaining_sec": max(0, int(TRADE_COOLDOWN_SEC - (time.time() - last_trade_close_ts))) if last_trade_close_ts > 0 else 0,
         "scalp_mode": SCALP_MODE,
         "super_council_ai": COUNCIL_AI_MODE,
         "smart_profit_ai": True,
         "tp_profile_system": True,
         "council_strong_entry": COUNCIL_STRONG_ENTRY,
-        "patch_v2": {
-            "iron_sl": HARD_SL_ON,
-            "regime_watcher": WATCHER_ON,
-            "trend_exit_engine": True
-        }
+        "box_engine": True,
+        "volume_analysis": True,
+        "vwap_integration": True,
+        "new_intelligent_patch": True,
+        "fvg_real_vs_fake": True,
+        "box_rejection_pro": True
     }), 200
 
 # ============================================
@@ -4497,13 +5121,30 @@ def smart_stats():
             "active": COUNCIL_STRONG_ENTRY,
             "current_trade": STATE.get("council_controlled", False)
         },
-        "patch_v2": {
-            "iron_sl": HARD_SL_ON,
-            "iron_sl_ticks": HARD_SL_TICKS,
-            "regime_watcher": WATCHER_ON,
-            "trend_exit_engine": True,
-            "mega_council": True,
-            "current_watcher": STATE.get("watcher", {})
+        "box_engine": {
+            "active": True,
+            "version": "1.0",
+            "features": ["demand_supply_boxes", "breakout_retest", "strong_reversal"]
+        },
+        "volume_analysis": {
+            "active": True,
+            "features": ["volume_rejection", "volume_breakouts", "volume_quality"]
+        },
+        "vwap_integration": {
+            "active": True,
+            "features": ["price_vs_vwap", "vwap_slope", "vwap_position"]
+        },
+        "new_intelligent_patch": {
+            "active": True,
+            "features": ["liquidity_analysis", "momentum_detection", "volatility_regime", "position_monitoring", "market_regime"]
+        },
+        "fvg_real_vs_fake": {
+            "active": True,
+            "features": ["real_fvg_detection", "fake_fvg_filtering", "stop_hunt_detection"]
+        },
+        "box_rejection_pro": {
+            "active": True,
+            "features": ["box_quality_evaluation", "rejection_entry_signals", "box_safety_protection"]
         }
     })
 
@@ -4516,12 +5157,17 @@ def market_context():
     fvg = detect_fvg(df)
     golden = golden_zone_check(df)
     liquidity = smc_detector.detect_liquidity_zones(current_price or 0)
+    boxes = build_sr_boxes(df)
+    box_ctx = analyze_box_context(df, boxes)
+    vwap = compute_vwap(df)
     
     return jsonify({
         "order_block": ob,
         "fair_value_gap": fvg,
         "golden_zone": golden,
         "liquidity_zones": liquidity,
+        "box_context": box_ctx,
+        "vwap": vwap,
         "current_price": current_price,
         "timestamp": datetime.utcnow().isoformat()
     })
@@ -4545,12 +5191,8 @@ def verify_execution_environment():
     print(f"🔧 EXCHANGE: {EXCHANGE_NAME.upper()} | SYMBOL: {SYMBOL}", flush=True)
     print(f"🔧 EXECUTE_ORDERS: {EXECUTE_ORDERS} | DRY_RUN: {DRY_RUN}", flush=True)
     print(f"🎯 GOLDEN ENTRY: score={GOLDEN_ENTRY_SCORE} | ADX={GOLDEN_ENTRY_ADX}", flush=True)
-    print(f"🚀 SMART PATCH: OB/FVG + SMC + Golden Zones + Volume Confirmation + SMART PROFIT AI + TP PROFILE + COUNCIL STRONG ENTRY", flush=True)
-    print(f"🧠 SMART PROFIT AI: Scalp + Trend + Volume Analysis + TP Profile (1→2→3) + Council Strong Entry Activated", flush=True)
-    print(f"🛡️ IRON SL: {'ON' if HARD_SL_ON else 'OFF'} (ticks={HARD_SL_TICKS})", flush=True)
-    print(f"🧭 REGIME WATCHER: {'ON' if WATCHER_ON else 'OFF'} (ADX gate={REGIME_ADX_GATE})", flush=True)
-    print(f"🧠 TREND EXIT ENGINE: (ADX gate={EXIT_ADX_GATE}, weakness votes={EXIT_WEAKNESS_VOTES})", flush=True)
-    print(f"🎯 MEGA COUNCIL: One Decision System (threshold=6.5, edge=0.8)", flush=True)
+    print(f"🚀 SMART PATCH: OB/FVG + SMC + Golden Zones + Volume Confirmation + SMART PROFIT AI + TP PROFILE + COUNCIL STRONG ENTRY + BOX ENGINE + VOLUME ANALYSIS + VWAP INTEGRATION + NEW INTELLIGENT PATCH + FVG REAL vs FAKE + BOX REJECTION PRO", flush=True)
+    print(f"🧠 SMART PROFIT AI: Scalp + Trend + Volume Analysis + TP Profile (1→2→3) + Council Strong Entry + Box Engine + Volume Analysis + VWAP Integration + Advanced Market Analysis + FVG Real vs Fake + Box Rejection Pro Activated", flush=True)
 
 if __name__ == "__main__":
     verify_execution_environment()
@@ -4561,7 +5203,6 @@ if __name__ == "__main__":
     
     log_i(f"🚀 SUI ULTRA PRO AI BOT STARTED - {BOT_VERSION}")
     log_i(f"🎯 SYMBOL: {SYMBOL} | INTERVAL: {INTERVAL} | LEVERAGE: {LEVERAGE}x")
-    log_i(f"💡 SMART PATCH ACTIVATED: Golden Zones + SMC + OB/FVG + Zero Reversal Scalping + SMART PROFIT AI + TP PROFILE + COUNCIL STRONG ENTRY")
-    log_i(f"🛡️ PATCH V2.0 ACTIVATED: Iron SL + Regime Watcher + Cross Engine + Mega Council + Trend Exit Engine")
+    log_i(f"💡 SMART PATCH ACTIVATED: Golden Zones + SMC + OB/FVG + Zero Reversal Scalping + SMART PROFIT AI + TP PROFILE + COUNCIL STRONG ENTRY + BOX ENGINE + VOLUME ANALYSIS + VWAP INTEGRATION + NEW INTELLIGENT PATCH + FVG REAL vs FAKE + BOX REJECTION PRO")
     
     app.run(host="0.0.0.0", port=PORT, debug=False)
