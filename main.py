@@ -1566,7 +1566,7 @@ COUNCIL_STRONG_VOTES   = 10      # عدد أصوات BUY أو SELL في اتجا
 COUNCIL_BLOCK_STRONG_TREND = True
 
 # ===== COUNCIL PROFIT PROFILE (DYNAMIC TP) =====
-# تصنيف قوة الصفقة حسب قوة مجلس الإدارة + المناطق الذكية
+# تصنيف قوة الصفقة حسب قوة مجلس الإدارة + المناطق الذهبية
 
 COUNCIL_STRONG_CONF      = 0.75   # ثقة عالية جدًا
 COUNCIL_MEDIUM_CONF      = 0.55   # ثقة متوسطة  
@@ -1648,7 +1648,7 @@ def save_state(state: dict):
     try:
         state["ts"] = int(time.time())
         with open(STATE_PATH, "w", encoding="utf-8") as f:
-            json.dump(state, f, ensure_ascii=False, indent=2)
+            json.dump(state, f, ensure_asci=False, indent=2)
         log_i(f"state saved → {STATE_PATH}")
     except Exception as e:
         log_w(f"state save failed: {e}")
@@ -4058,7 +4058,17 @@ def open_market_enhanced(side, qty, price):
     log_i(f"🎛 TRADE MODE DECISION: {mode.upper()} | profile={profit_profile['label']} | {why_mode}")
 
     # تنفيذ الأمر
-    success = execute_trade_decision(side, price, qty, mode, council_data, golden_zone_check(df, ind))
+    try:
+        if MODE_LIVE and EXECUTE_ORDERS and not DRY_RUN:
+            params = exchange_specific_params(side)
+            ex.create_order(SYMBOL, "market", side, qty, None, params)
+            log_g(f"✅ MARKET {side.upper()} {qty:.4f} @ {price:.6f}")
+        else:
+            log_i(f"[PAPER] MARKET {side.upper()} {qty:.4f} @ {price:.6f}")
+        success = True
+    except Exception as e:
+        log_e(f"❌ MARKET ORDER FAILED: {e}")
+        success = False
 
     if success:
         trade_side = "long" if side.lower().startswith("b") else "short"
@@ -4108,7 +4118,7 @@ def open_market_enhanced(side, qty, price):
         
         print_position_snapshot(reason=f"OPEN - {mode.upper()}[{profit_profile['label']}]")
         return True
-
+    
     return False
 
 open_market = open_market_enhanced
