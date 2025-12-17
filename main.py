@@ -919,9 +919,16 @@ def analyze_comprehensive_strength(df, ind, council_data, entry_zones):
             total_score += 2
             reasons.append("rsi_extreme")
         
-        # 4. قوة الحجم
+        # 4. قوة الحجم - التصحيح هنا
         volume_profile = compute_volume_profile(df)
-        if volume_profile.get('volume_spike'):
+        volume_spike = volume_profile.get('volume_spike', False)
+        
+        # تحويل volume_spike إلى boolean إذا كانت Series
+        if hasattr(volume_spike, '__iter__'):
+            # إذا كانت Series، خذ آخر قيمة
+            volume_spike = bool(volume_spike.iloc[-1] if not volume_spike.empty else False)
+        
+        if volume_spike:
             total_score += 1
             reasons.append("volume_spike")
         
@@ -1641,7 +1648,7 @@ def save_state(state: dict):
     try:
         state["ts"] = int(time.time())
         with open(STATE_PATH, "w", encoding="utf-8") as f:
-            json.dump(state, f, ensure_asci=False, indent=2)
+            json.dump(state, f, ensure_ascii=False, indent=2)
         log_i(f"state saved → {STATE_PATH}")
     except Exception as e:
         log_w(f"state save failed: {e}")
@@ -2471,9 +2478,16 @@ def compute_volume_profile(df, period=20):
     price_range = high - low
     volume_per_price = volume / (price_range.replace(0, 1e-12))
     
+    # حساب volume_ma باستخدام sma
+    volume_ma = sma(volume, period)
+    
+    # التأكد من أن volume_spike هي قيمة منطقية (boolean) وليست Series
+    volume_spike_series = volume > volume_ma * 1.5
+    volume_spike = bool(volume_spike_series.iloc[-1]) if not volume_spike_series.empty else False
+    
     return {
-        'volume_ma': sma(volume, period),
-        'volume_spike': volume > sma(volume, period) * 1.5,
+        'volume_ma': volume_ma,
+        'volume_spike': volume_spike,  # الآن boolean وليست Series
         'volume_trend': 'up' if volume.iloc[-1] > volume.iloc[-2] else 'down'
     }
 
