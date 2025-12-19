@@ -169,6 +169,11 @@ TREND_FAST_PERIOD = 10
 TREND_SLOW_PERIOD = 20
 TREND_SIGNAL_PERIOD = 9
 
+# ==== ENHANCED RISK MANAGEMENT ====
+MAX_LOSS_PER_TRADE = 0.02  # 2% خسارة كحد أقصى لكل صفقة
+SAFE_MODE = True  # تفعيل وضع الأمان المتقدم
+CONFIRMATION_CANDLES = 1  # عدد الشمعات للتأكيد
+
 # =================== PROFESSIONAL LOGGING ===================
 def log_i(msg): print(f"ℹ️ {msg}", flush=True)
 def log_g(msg): print(f"✅ {msg}", flush=True)
@@ -365,6 +370,7 @@ def verify_execution_environment():
     print(f"📈 ADVANCED INDICATORS: Volume Momentum + Stochastic RSI + Dynamic Pivots", flush=True)
     print(f"👣 FOOTPRINT ANALYSIS: Volume Analysis + Absorption + Real Momentum", flush=True)
     print(f"⚡ RF SETTINGS: period={RF_PERIOD} | mult={RF_MULT} (SUI Optimized)", flush=True)
+    print(f"🛡️ RISK MANAGEMENT: Safe Mode={SAFE_MODE} | Max Loss={MAX_LOSS_PER_TRADE*100}%", flush=True)
     
     if not EXECUTE_ORDERS:
         print("🟡 WARNING: EXECUTE_ORDERS=False - البوت في وضع التحليل فقط!", flush=True)
@@ -1091,14 +1097,16 @@ def ultimate_council_voting_with_footprint(df):
         
         # 7. ADX والاتجاه
         if ind.get('adx', 0) > 25:
+            # حساب DI Spread بشكل صحيح
+            di_spread = abs(ind.get('plus_di', 0) - ind.get('minus_di', 0))
             if ind.get('plus_di', 0) > ind.get('minus_di', 0):
                 votes_buy += 2
                 confidence_buy += 1.5
-                detailed_logs.append(f"📊 اتجاه صاعد قوي")
+                detailed_logs.append(f"📊 اتجاه صاعد قوي (DI+:{ind.get('plus_di', 0):.1f} > DI-:{ind.get('minus_di', 0):.1f})")
             else:
                 votes_sell += 2
                 confidence_sell += 1.5
-                detailed_logs.append(f"📊 اتجاه هابط قوي")
+                detailed_logs.append(f"📊 اتجاه هابط قوي (DI-:{ind.get('minus_di', 0):.1f} > DI+:{ind.get('plus_di', 0):.1f})")
         
         # 8. RSI مع المتوسط
         if rsi_ctx["cross"] == "bull" and rsi_ctx["rsi"] < 65:
@@ -1141,6 +1149,7 @@ def ultimate_council_voting_with_footprint(df):
                 detailed_logs.append("🔄 ترجيح إشارة البيع (ثقة أعلى)")
         
         # تحديث المؤشرات بالإضافات الجديدة
+        di_spread = abs(ind.get('plus_di', 0) - ind.get('minus_di', 0))
         ind.update({
             "volume_momentum": volume_momentum,
             "stoch_rsi": stoch_rsi,
@@ -1150,7 +1159,8 @@ def ultimate_council_voting_with_footprint(df):
             "ultimate_votes_buy": votes_buy,
             "ultimate_votes_sell": votes_sell,
             "ultimate_confidence_buy": confidence_buy,
-            "ultimate_confidence_sell": confidence_sell
+            "ultimate_confidence_sell": confidence_sell,
+            "di_spread": di_spread
         })
         
         return {
@@ -1384,7 +1394,7 @@ def compute_flow_metrics(df):
     except Exception as e:
         return {"ok": False, "why": str(e)}
 
-# ========= Unified snapshot emitter =========
+# ========= Enhanced Dashboard with DI Spread =========
 def emit_snapshots_with_footprint(exchange, symbol, df, balance_fn=None, pnl_fn=None):
     """لوحة تحكم محسنة مع عرض Footprint"""
     try:
@@ -1435,10 +1445,16 @@ def emit_snapshots_with_footprint(exchange, symbol, df, balance_fn=None, pnl_fn=
             fl_note = f"Flow: N/A ({flow.get('why')})"
 
         side_hint = "BUY" if cv["b"]>=cv["s"] else "SELL"
+        
+        # حساب DI Spread بشكل صحيح للعرض
+        di_spread_display = cv["ind"].get("di_spread", 0)
+        di_plus_display = cv["ind"].get("plus_di", 0)
+        di_minus_display = cv["ind"].get("minus_di", 0)
+        
         dash = (f"DASH → hint-{side_hint} | Council BUY({cv['b']},{cv['score_b']:.1f}) "
                 f"SELL({cv['s']},{cv['score_s']:.1f}) | "
                 f"RSI={cv['ind'].get('rsi',0):.1f} ADX={cv['ind'].get('adx',0):.1f} "
-                f"DI={cv['ind'].get('di_spread',0):.1f}{footprint_note}")
+                f"DI+={di_plus_display:.1f} DI-={di_minus_display:.1f} Spread={di_spread_display:.1f}{footprint_note}")
 
         strat_icon = "⚡" if mode["mode"]=="scalp" else "📈" if mode["mode"]=="trend" else "ℹ️"
         strat = f"Strategy: {strat_icon} {mode['mode'].upper()}"
@@ -1457,12 +1473,12 @@ def emit_snapshots_with_footprint(exchange, symbol, df, balance_fn=None, pnl_fn=
             print(f"📊 {dash}{gz_note}", flush=True)
             print(f"{strat}{(' | ' + wallet) if wallet else ''}", flush=True)
             
-            # تحديث السناك شوت النهائي
+            # تحديث السناك شوت النهائي مع DI Spread
             flow_z = flow['delta_z'] if flow and flow.get('ok') else 0.0
             bm_imb = bm['imbalance'] if bm and bm.get('ok') else 1.0
             
             print(f"🧠 SNAP ULTIMATE | {side_hint} | votes={cv['b']}/{cv['s']} score={cv['score_b']:.1f}/{cv['score_s']:.1f} "
-                  f"| ADX={cv['ind'].get('adx',0):.1f} DI={cv['ind'].get('di_spread',0):.1f} | "
+                  f"| ADX={cv['ind'].get('adx',0):.1f} DI+={di_plus_display:.1f} DI-={di_minus_display:.1f} Spread={di_spread_display:.1f} | "
                   f"z={flow_z:.2f} | imb={bm_imb:.2f}{footprint_note}{gz_note}", 
                   flush=True)
             
@@ -1532,7 +1548,9 @@ def setup_trade_management(mode):
             "be_activate_pct": SCALP_BE_AFTER / 100.0,
             "trail_activate_pct": 0.8 / 100.0,
             "atr_trail_mult": SCALP_ATR_MULT,
-            "close_aggression": "high"
+            "close_aggression": "high",
+            "initial_sl_pct": 0.5,  # وقف خسارة أولي 0.5%
+            "safe_mode": SAFE_MODE
         }
     else:
         return {
@@ -1540,7 +1558,9 @@ def setup_trade_management(mode):
             "be_activate_pct": TREND_BE_AFTER / 100.0,
             "trail_activate_pct": 1.2 / 100.0,
             "atr_trail_mult": TREND_ATR_MULT,
-            "close_aggression": "medium"
+            "close_aggression": "medium",
+            "initial_sl_pct": 0.8,  # وقف خسارة أولي 0.8%
+            "safe_mode": SAFE_MODE
         }
 
 # =================== ENHANCED TRADE EXECUTION ===================
@@ -1567,6 +1587,13 @@ def open_market_enhanced(side, qty, price):
     success = execute_trade_decision_with_footprint(side, price, qty, mode, votes, gz)
     
     if success:
+        # حساب وقف الخسارة الأولي
+        initial_sl_pct = management_config.get("initial_sl_pct", 0.5)
+        if side == "buy":
+            initial_sl = price * (1 - initial_sl_pct / 100)
+        else:
+            initial_sl = price * (1 + initial_sl_pct / 100)
+        
         STATE.update({
             "open": True, 
             "side": "long" if side=="buy" else "short", 
@@ -1580,7 +1607,9 @@ def open_market_enhanced(side, qty, price):
             "highest_profit_pct": 0.0, 
             "profit_targets_achieved": 0,
             "mode": mode,
-            "management": management_config
+            "management": management_config,
+            "initial_sl": initial_sl,
+            "max_loss_pct": MAX_LOSS_PER_TRADE
         })
         
         save_state({
@@ -1598,9 +1627,11 @@ def open_market_enhanced(side, qty, price):
             "breakeven_armed": False,
             "trail_active": False,
             "trail_tightened": False,
+            "initial_sl": initial_sl,
+            "max_loss_pct": MAX_LOSS_PER_TRADE
         })
         
-        log_g(f"✅ POSITION OPENED: {side.upper()} | mode={mode}")
+        log_g(f"✅ POSITION OPENED: {side.upper()} | mode={mode} | Initial SL: {initial_sl:.6f}")
         return True
     
     return False
@@ -1614,27 +1645,50 @@ def wilder_ema(s: pd.Series, n: int):
 def compute_indicators(df: pd.DataFrame):
     if len(df) < max(ATR_LEN, RSI_LEN, ADX_LEN) + 2:
         return {"rsi":50.0,"plus_di":0.0,"minus_di":0.0,"dx":0.0,"adx":0.0,"atr":0.0}
-    c,h,l = df["close"].astype(float), df["high"].astype(float), df["low"].astype(float)
+    
+    c = df["close"].astype(float)
+    h = df["high"].astype(float)
+    l = df["low"].astype(float)
+    
+    # حساب ATR
     tr = pd.concat([(h-l).abs(), (h-c.shift(1)).abs(), (l-c.shift(1)).abs()], axis=1).max(axis=1)
     atr = wilder_ema(tr, ATR_LEN)
 
-    delta=c.diff(); up=delta.clip(lower=0.0); dn=(-delta).clip(lower=0.0)
+    # حساب RSI
+    delta = c.diff()
+    up = delta.clip(lower=0.0)
+    dn = (-delta).clip(lower=0.0)
     rs = wilder_ema(up, RSI_LEN) / wilder_ema(dn, RSI_LEN).replace(0,1e-12)
     rsi = 100 - (100/(1+rs))
 
-    up_move=h.diff(); down_move=l.shift(1)-l
-    plus_dm=up_move.where((up_move>down_move)&(up_move>0),0.0)
-    minus_dm=down_move.where((down_move>up_move)&(down_move>0),0.0)
-    plus_di=100*(wilder_ema(plus_dm, ADX_LEN)/atr.replace(0,1e-12))
-    minus_di=100*(wilder_ema(minus_dm, ADX_LEN)/atr.replace(0,1e-12))
-    dx=(100*(plus_di-minus_di).abs()/(plus_di+minus_di).replace(0,1e-12)).fillna(0.0)
-    adx=wilder_ema(dx, ADX_LEN)
+    # حساب +DI و -DI بشكل صحيح
+    up_move = h.diff()
+    down_move = l.shift(1) - l
+    
+    plus_dm = up_move.where((up_move > down_move) & (up_move > 0), 0.0)
+    minus_dm = (-down_move).where((down_move > up_move) & (down_move > 0), 0.0)
+    
+    plus_di = 100 * (wilder_ema(plus_dm, ADX_LEN) / atr.replace(0,1e-12))
+    minus_di = 100 * (wilder_ema(minus_dm, ADX_LEN) / atr.replace(0,1e-12))
+    
+    # حساب DX وADX
+    di_sum = plus_di + minus_di
+    di_sum = di_sum.replace(0, 1e-12)
+    dx = 100 * (abs(plus_di - minus_di) / di_sum)
+    adx = wilder_ema(dx, ADX_LEN)
 
-    i=len(df)-1
+    # حساب DI Spread
+    di_spread = abs(plus_di.iloc[-1] - minus_di.iloc[-1])
+
+    i = len(df)-1
     return {
-        "rsi": float(rsi.iloc[i]), "plus_di": float(plus_di.iloc[i]),
-        "minus_di": float(minus_di.iloc[i]), "dx": float(dx.iloc[i]),
-        "adx": float(adx.iloc[i]), "atr": float(atr.iloc[i])
+        "rsi": float(rsi.iloc[i]), 
+        "plus_di": float(plus_di.iloc[i]),
+        "minus_di": float(minus_di.iloc[i]), 
+        "dx": float(dx.iloc[i]),
+        "adx": float(adx.iloc[i]), 
+        "atr": float(atr.iloc[i]),
+        "di_spread": di_spread
     }
 
 # =================== RANGE FILTER ===================
@@ -1773,7 +1827,8 @@ def _reset_after_close(reason, prev_side=None):
         "open": False, "side": None, "entry": None, "qty": 0.0,
         "pnl": 0.0, "bars": 0, "trail": None, "breakeven": None,
         "tp1_done": False, "highest_profit_pct": 0.0, "profit_targets_achieved": 0,
-        "trail_tightened": False, "partial_taken": False
+        "trail_tightened": False, "partial_taken": False,
+        "initial_sl": None, "max_loss_pct": MAX_LOSS_PER_TRADE
     })
     save_state({"in_position": False, "position_qty": 0})
     
@@ -1790,6 +1845,25 @@ def advanced_trade_management(df, state, current_price):
     entry = state["entry"]
     side = state["side"]
     unrealized_pnl_pct = (current_price - entry) / entry * 100 * (1 if side == "long" else -1)
+    
+    # التحقق من وقف الخسارة الأولي
+    if state.get("initial_sl"):
+        if (side == "long" and current_price <= state["initial_sl"]) or \
+           (side == "short" and current_price >= state["initial_sl"]):
+            return {
+                "action": "close", 
+                "reason": "وقف خسارة أولي",
+                "sl_price": state["initial_sl"]
+            }
+    
+    # التحقق من الحد الأقصى للخسارة
+    max_loss_pct = state.get("max_loss_pct", MAX_LOSS_PER_TRADE)
+    if unrealized_pnl_pct <= -max_loss_pct * 100:
+        return {
+            "action": "close", 
+            "reason": f"تجاوز الحد الأقصى للخسارة ({max_loss_pct*100}%)",
+            "pnl_pct": unrealized_pnl_pct
+        }
     
     # حساب التقلب الحالي
     atr = compute_indicators(df).get('atr', 0.001)
@@ -2147,6 +2221,62 @@ def log_ultimate_decision(council_data, decision):
     
     print("─" * 80, flush=True)
 
+# =================== ENHANCED ENTRY CONDITIONS ===================
+def check_enhanced_entry_conditions(df, council_data, decision):
+    """فحص شروط الدخول المحسنة"""
+    if not SAFE_MODE:
+        return True, ""
+    
+    ind = council_data["ind"]
+    advanced = council_data.get("advanced_indicators", {})
+    footprint = advanced.get("footprint", {})
+    
+    conditions = []
+    
+    # 1. شرط Footprint قوي
+    if decision == "BUY":
+        fp_score = footprint.get("footprint_score_bull", 0)
+        if fp_score >= 2.5:
+            conditions.append(f"Footprint قوي ({fp_score:.1f})")
+    else:
+        fp_score = footprint.get("footprint_score_bear", 0)
+        if fp_score >= 2.5:
+            conditions.append(f"Footprint قوي ({fp_score:.1f})")
+    
+    # 2. شرط ADX مرتفع
+    adx = ind.get("adx", 0)
+    if adx >= 25:
+        conditions.append(f"ADX مرتفع ({adx:.1f})")
+    
+    # 3. شرط DI Spread واضح
+    di_plus = ind.get("plus_di", 0)
+    di_minus = ind.get("minus_di", 0)
+    di_spread = abs(di_plus - di_minus)
+    
+    if decision == "BUY" and di_plus > di_minus and di_spread >= 10:
+        conditions.append(f"DI+ أقوى ({di_plus:.1f} > {di_minus:.1f})")
+    elif decision == "SELL" and di_minus > di_plus and di_spread >= 10:
+        conditions.append(f"DI- أقوى ({di_minus:.1f} > {di_plus:.1f})")
+    
+    # 4. شرط الزخم الحجمي
+    volume_momentum = advanced.get("volume_momentum", {})
+    if volume_momentum.get("trend") == ("bull" if decision == "BUY" else "bear"):
+        conditions.append("زخم حجمي مؤكد")
+    
+    # 5. انتظار تأكيد شمعات
+    if CONFIRMATION_CANDLES > 0:
+        candles = compute_candles(df)
+        if decision == "BUY" and candles.get("score_buy", 0) > 1.0:
+            conditions.append("تأكيد شموع شراء")
+        elif decision == "SELL" and candles.get("score_sell", 0) > 1.0:
+            conditions.append("تأكيد شموع بيع")
+    
+    # تقييم الشروط
+    if len(conditions) >= 3:  # على الأقل 3 شروط من 5
+        return True, f"شروط كافية: {', '.join(conditions[:3])}"
+    else:
+        return False, f"شروط غير كافية ({len(conditions)}/3): {', '.join(conditions)}"
+
 # =================== ULTIMATE TRADE LOOP (FIXED) ===================
 def trade_loop_ultimate_with_footprint_fixed():
     """حلقة تداول نهائية مع Footprint Analysis - إصدار مصحح"""
@@ -2216,6 +2346,13 @@ def trade_loop_ultimate_with_footprint_fixed():
                     fp_score = (footprint.get("footprint_score_bull", 0) if decision == "BUY" 
                                else footprint.get("footprint_score_bear", 0))
                     print(f"🎯 FOOTPRINT CONFIRMATION: {decision} | score={fp_score:.1f}", flush=True)
+                
+                # فحص شروط الدخول المحسنة
+                entry_allowed, entry_reason = check_enhanced_entry_conditions(df, council_data, decision)
+                if not entry_allowed and SAFE_MODE:
+                    decision = None
+                    reason = entry_reason
+                    print(f"🛑 ENTRY BLOCKED: {entry_reason}", flush=True)
             
             if not STATE["open"] and decision and reason is None:
                 # التحقق من سياسة الانتظار
@@ -2256,7 +2393,8 @@ def metrics():
         "leverage": LEVERAGE, "risk_alloc": RISK_ALLOC, "price": price_now(),
         "state": STATE, "compound_pnl": compound_pnl,
         "entry_mode": "ULTIMATE_COUNCIL_WITH_FOOTPRINT", "wait_for_next_signal": wait_for_next_signal_side,
-        "guards": {"max_spread_bps": MAX_SPREAD_BPS, "final_chunk_qty": FINAL_CHUNK_QTY}
+        "guards": {"max_spread_bps": MAX_SPREAD_BPS, "final_chunk_qty": FINAL_CHUNK_QTY},
+        "risk_management": {"safe_mode": SAFE_MODE, "max_loss_per_trade": MAX_LOSS_PER_TRADE}
     })
 
 @app.route("/health")
@@ -2312,6 +2450,7 @@ if __name__ == "__main__":
     print(colored(f"📊 ADVANCED INDICATORS: Volume Momentum + Stochastic RSI + Dynamic Pivots", "yellow"))
     print(colored(f"👣 FOOTPRINT ANALYSIS: Volume Analysis + Absorption + Real Momentum + Stop Hunts", "yellow"))
     print(colored(f"📈 DYNAMIC TREND INDICATOR: Fast={TREND_FAST_PERIOD} Slow={TREND_SLOW_PERIOD}", "yellow"))
+    print(colored(f"🛡️ RISK MANAGEMENT: Safe Mode={SAFE_MODE} • Max Loss={MAX_LOSS_PER_TRADE*100}% • Confirmation Candles={CONFIRMATION_CANDLES}", "green"))
     print(colored(f"🚀 EXECUTION: {'ACTIVE' if EXECUTE_ORDERS and not DRY_RUN else 'SIMULATION'}", "yellow"))
     
     logging.info("service starting…")
