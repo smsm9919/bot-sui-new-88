@@ -894,7 +894,7 @@ def golden_zone_check(df, ind=None, side_hint=None):
         rsi_last = float(rsi_series.iloc[-1])
         rsi_ma_last = float(rsi_ma_series.iloc[-1])
         
-        # ADX من المؤشرات المحسوبة مسبقاً
+        # ADX من المؤشرات المحسنة مسبقاً
         adx = ind.get('adx', 0) if ind else 0
         
         # اندفاع السعر
@@ -1841,45 +1841,141 @@ def advanced_trade_management(df, state, current_price):
     
     return {"action": "hold", "reason": "الاستمرار في الصفقة"}
 
-# =================== ULTIMATE TRADE MANAGEMENT ===================
-def manage_after_entry_ultimate(df, ind, info):
-    """الإدارة النهائية للصفقات مع النظام المتقدم"""
-    if not STATE["open"] or STATE["qty"] <= 0:
-        return
+# =================== SMART EXIT GUARD ORIGINAL ===================
+def smart_exit_guard_original(state, df, ind, flow, bm, now_price, pnl_pct, mode, side, entry_price, gz=None):
+    """النسخة الأصلية لخروج ذكي"""
+    atr = ind.get('atr', 0.0)
+    adx = ind.get('adx', 0.0)
+    rsi = ind.get('rsi', 50.0)
+    rsi_ma = ind.get('rsi_ma', 50.0)
+    
+    if len(df) >= 3:
+        adx_slope = adx - ind.get('adx_prev', adx)
+    else:
+        adx_slope = 0.0
 
-    current_price = info["price"]
+    # حساب الفتائل
+    wick_signal = False
+    if len(df) > 0:
+        c = df.iloc[-1]
+        wick_up = float(c['high']) - max(float(c['close']), float(c['open']))
+        wick_down = min(float(c['close']), float(c['open'])) - float(c['low'])
+        wick_signal = (wick_up >= WICK_ATR_MULT * atr) if side == "long" else (wick_down >= WICK_ATR_MULT * atr)
+
+    rsi_cross_down = (rsi < rsi_ma) if side == "long" else (rsi > rsi_ma)
+    adx_falling = (adx_slope < 0)
+    cvd_down = (flow and flow.get('ok') and flow.get('cvd_trend') == 'down')
+    evx_spike = False
+
+    bm_wall_close = False
+    if bm and bm.get('ok'):
+        if side == "long":
+            sell_walls = bm.get('sell_walls', [])
+            if sell_walls:
+                best_ask = min([p for p, _ in sell_walls])
+                bps = abs((best_ask - now_price) / now_price) * 10000.0
+                bm_wall_close = (bps <= BM_WALL_PROX_BPS)
+        else:
+            buy_walls = bm.get('buy_walls', [])
+            if buy_walls:
+                best_bid = max([p for p, _ in buy_walls])
+                bps = abs((best_bid - now_price) / now_price) * 10000.0
+                bm_wall_close = (bps <= BM_WALL_PROX_BPS)
+
+    # --- Golden Reversal بعد TP1 ---
+    if state.get('tp1_done') and (gz and gz.get('ok')):
+        # إغلاق صارم لو تقاطع Golden عكس اتجاهي بعد TP1
+        opp = (gz['zone']['type']=='golden_top' and side=='long') or (gz['zone']['type']=='golden_bottom' and side=='short')
+        if opp and gz.get('score',0) >= GOLDEN_REVERSAL_SCORE:
+            return {
+                "action": "close", 
+                "why": "golden_reversal",
+                "log": f"🔴 CLOSE STRONG | golden reversal after TP1 | score={gz['score']:.1f}"
+            }
+
+    tp1_target = TP1_SCALP_PCT if mode == 'scalp' else TP1_TREND_PCT
+    if pnl_pct >= tp1_target and not state.get('tp1_done'):
+        qty_pct = 0.35 if mode == 'scalp' else 0.25
+        return {
+            "action": "partial", 
+            "why": f"TP1 hit {tp1_target*100:.2f}%",
+            "qty_pct": qty_pct,
+            "log": f"💰 TP1 جزئي {tp1_target*100:.2f}% | pnl={pnl_pct*100:.2f}% | mode={mode}"
+        }
+
+    # --- Wick exhaustion + Tighten عند إجهاد/تدفق/جدار ---
+    if pnl_pct > 0:
+        if wick_signal or evx_spike or bm_wall_close or cvd_down:
+            return {
+                "action": "tighten", 
+                "why": "exhaustion/flow/wall",
+                "trail_mult": TRAIL_TIGHT_MULT,
+                "log": f"🛡️ Tighten | wick={int(bool(wick_signal))} evx={int(bool(evx_spike))} wall={bm_wall_close} cvd_down={cvd_down}"
+            }
+
+    bearish_signals = [rsi_cross_down, adx_falling, cvd_down, evx_spike, bm_wall_close]
+    bearish_count = sum(bearish_signals)
     
-    # الإدارة المتقدمة
-    management_signal = advanced_trade_management(df, STATE, current_price)
-    
-    if management_signal["action"] == "partial_close":
-        close_fraction = management_signal["close_fraction"]
-        close_qty = safe_qty(STATE["qty"] * close_fraction)
+    if pnl_pct >= HARD_CLOSE_PNL_PCT and bearish_count >= 2:
+        reasons = []
+        if rsi_cross_down: reasons.append("rsi↓")
+        if adx_falling: reasons.append("adx↓")
+        if cvd_down: reasons.append("cvd↓")
+        if evx_spike: reasons.append("evx")
+        if bm_wall_close: reasons.append("wall")
         
-        if close_qty > 0:
-            close_side = "sell" if STATE["side"] == "long" else "buy"
-            if MODE_LIVE and EXECUTE_ORDERS and not DRY_RUN:
-                try:
-                    params = exchange_specific_params(close_side, is_close=True)
-                    ex.create_order(SYMBOL, "market", close_side, close_qty, None, params)
-                    log_g(f"✅ جني أرباح: {close_fraction*100}% عند {management_signal['tp_level']:.2f}%")
-                    STATE["qty"] = safe_qty(STATE["qty"] - close_qty)
-                    STATE["profit_targets_achieved"] += 1
-                except Exception as e:
-                    log_e(f"❌ فشل جني الأرباح: {e}")
-            else:
-                log_i(f"DRY_RUN: جني أرباح {close_qty:.4f}")
-    
-    elif management_signal["action"] == "close":
-        log_w(f"🚨 إغلاق بالوقف المتحرك: {management_signal['reason']}")
-        close_market_strict(f"advanced_trail_{management_signal['reason']}")
-        return
-    
-    # الاستمرار في الإدارة الأساسية المحسنة
-    manage_after_entry_enhanced(df, ind, info)
+        return {
+            "action": "close", 
+            "why": "hard_close_signal",
+            "log": f"🔴 CLOSE STRONG | pnl={pnl_pct*100:.2f}% | {', '.join(reasons)}"
+        }
 
-def manage_after_entry_enhanced(df, ind, info):
-    """إدارة محسنة للمركز مع خروج ذكي حسب النمط"""
+    return {
+        "action": "hold", 
+        "why": "keep_riding", 
+        "log": None
+    }
+
+# =================== SMART EXIT GUARD WITH FOOTPRINT (FIXED) ===================
+def smart_exit_guard_with_footprint_fixed(state, df, ind, flow, bm, now_price, pnl_pct, mode, side, entry_price, gz=None):
+    """إصدار مصحح لخروج ذكي مع تحليل Footprint"""
+    # التحليل الأساسي باستخدام الدالة الأصلية
+    basic_exit = smart_exit_guard_original(state, df, ind, flow, bm, now_price, pnl_pct, mode, side, entry_price, gz)
+    
+    # إضافة تحليل Footprint للخروج
+    footprint = ind.get('footprint_analysis', {})
+    
+    if footprint.get("ok"):
+        # اكتشاف انعكاس مبكر عبر Footprint
+        if side == "long" and footprint.get("absorption_bearish"):
+            return {
+                "action": "close", 
+                "why": "footprint_absorption_bearish",
+                "log": f"🔴 خروج Footprint | امتصاص هابط مثير للشك | pnl={pnl_pct*100:.2f}%"
+            }
+        
+        if side == "short" and footprint.get("absorption_bullish"):
+            return {
+                "action": "close", 
+                "why": "footprint_absorption_bullish",
+                "log": f"🔴 خروج Footprint | امتصاص صاعد مثير للشك | pnl={pnl_pct*100:.2f}%"
+            }
+        
+        # اكتشاف فقدان الزخم عبر Footprint
+        current_candle = footprint.get("current_candle", {})
+        if current_candle.get('volume_ratio', 0) < 0.5 and pnl_pct > 0.5:
+            return {
+                "action": "partial",
+                "why": "footprint_low_volume",
+                "qty_pct": 0.4,
+                "log": f"🟡 خروج جزئي | حجم منخفض مع ربح | pnl={pnl_pct*100:.2f}%"
+            }
+    
+    return basic_exit
+
+# =================== MANAGE AFTER ENTRY ENHANCED (FIXED) ===================
+def manage_after_entry_enhanced_fixed(df, ind, info):
+    """إصدار مصحح لإدارة محسنة للمركز"""
     if not STATE["open"] or STATE["qty"] <= 0:
         return
 
@@ -1899,7 +1995,8 @@ def manage_after_entry_enhanced(df, ind, info):
     snap = emit_snapshots_with_footprint(ex, SYMBOL, df)
     gz = snap["gz"]
     
-    exit_signal = smart_exit_guard_with_footprint(STATE, df, ind, snap["flow"], snap["bm"], 
+    # استخدام الإصدار المصحح
+    exit_signal = smart_exit_guard_with_footprint_fixed(STATE, df, ind, snap["flow"], snap["bm"],
                                  px, pnl_pct/100, mode, side, entry, gz)
     
     if exit_signal["log"]:
@@ -1987,138 +2084,42 @@ def manage_after_entry_enhanced(df, ind, info):
         log_w(f"DUST GUARD: qty {STATE['qty']} <= {FINAL_CHUNK_QTY}, closing...")
         close_market_strict("dust_guard")
 
-# استبدال إدارة الصفقات بالنظام المتقدم
-manage_after_entry = manage_after_entry_ultimate
+# =================== MANAGE AFTER ENTRY ULTIMATE (FIXED) ===================
+def manage_after_entry_ultimate_fixed(df, ind, info):
+    """الإدارة النهائية للصفقات مع النظام المتقدم - إصدار مصحح"""
+    if not STATE["open"] or STATE["qty"] <= 0:
+        return
 
-def smart_exit_guard_with_footprint(state, df, ind, flow, bm, now_price, pnl_pct, mode, side, entry_price, gz=None):
-    """خروج ذكي مع تحليل Footprint المتقدم"""
-    # التحليل الأساسي
-    basic_exit = smart_exit_guard(state, df, ind, flow, bm, now_price, pnl_pct, mode, side, entry_price, gz)
+    current_price = info["price"]
     
-    # إضافة تحليل Footprint للخروج
-    footprint = ind.get('footprint_analysis', {})
+    # الإدارة المتقدمة
+    management_signal = advanced_trade_management(df, STATE, current_price)
     
-    if footprint.get("ok"):
-        # اكتشاف انعكاس مبكر عبر Footprint
-        if side == "long" and footprint.get("absorption_bearish"):
-            return {
-                "action": "close", 
-                "why": "footprint_absorption_bearish",
-                "log": f"🔴 خروج Footprint | امتصاص هابط مثير للشك | pnl={pnl_pct*100:.2f}%"
-            }
+    if management_signal["action"] == "partial_close":
+        close_fraction = management_signal["close_fraction"]
+        close_qty = safe_qty(STATE["qty"] * close_fraction)
         
-        if side == "short" and footprint.get("absorption_bullish"):
-            return {
-                "action": "close", 
-                "why": "footprint_absorption_bullish",
-                "log": f"🔴 خروج Footprint | امتصاص صاعد مثير للشك | pnl={pnl_pct*100:.2f}%"
-            }
-        
-        # اكتشاف فقدان الزخم عبر Footprint
-        current_candle = footprint.get("current_candle", {})
-        if current_candle.get('volume_ratio', 0) < 0.5 and pnl_pct > 0.5:
-            return {
-                "action": "partial",
-                "why": "footprint_low_volume",
-                "qty_pct": 0.4,
-                "log": f"🟡 خروج جزئي | حجم منخفض مع ربح | pnl={pnl_pct*100:.2f}%"
-            }
+        if close_qty > 0:
+            close_side = "sell" if STATE["side"] == "long" else "buy"
+            if MODE_LIVE and EXECUTE_ORDERS and not DRY_RUN:
+                try:
+                    params = exchange_specific_params(close_side, is_close=True)
+                    ex.create_order(SYMBOL, "market", close_side, close_qty, None, params)
+                    log_g(f"✅ جني أرباح: {close_fraction*100}% عند {management_signal['tp_level']:.2f}%")
+                    STATE["qty"] = safe_qty(STATE["qty"] - close_qty)
+                    STATE["profit_targets_achieved"] += 1
+                except Exception as e:
+                    log_e(f"❌ فشل جني الأرباح: {e}")
+            else:
+                log_i(f"DRY_RUN: جني أرباح {close_qty:.4f}")
     
-    return basic_exit
-
-def smart_exit_guard(state, df, ind, flow, bm, now_price, pnl_pct, mode, side, entry_price, gz=None):
-    """يقرر: Partial / Tighten / Strict Close مع لوج واضح."""
-    atr = ind.get('atr', 0.0)
-    adx = ind.get('adx', 0.0)
-    rsi = ind.get('rsi', 50.0)
-    rsi_ma = ind.get('rsi_ma', 50.0)
+    elif management_signal["action"] == "close":
+        log_w(f"🚨 إغلاق بالوقف المتحرك: {management_signal['reason']}")
+        close_market_strict(f"advanced_trail_{management_signal['reason']}")
+        return
     
-    if len(df) >= 3:
-        adx_slope = adx - ind.get('adx_prev', adx)
-    else:
-        adx_slope = 0.0
-
-    # حساب الفتائل
-    wick_signal = False
-    if len(df) > 0:
-        c = df.iloc[-1]
-        wick_up = float(c['high']) - max(float(c['close']), float(c['open']))
-        wick_down = min(float(c['close']), float(c['open'])) - float(c['low'])
-        wick_signal = (wick_up >= WICK_ATR_MULT * atr) if side == "long" else (wick_down >= WICK_ATR_MULT * atr)
-
-    rsi_cross_down = (rsi < rsi_ma) if side == "long" else (rsi > rsi_ma)
-    adx_falling = (adx_slope < 0)
-    cvd_down = (flow and flow.get('ok') and flow.get('cvd_trend') == 'down')
-    evx_spike = False  # يمكن إضافة حساب EVX لاحقًا
-    
-    bm_wall_close = False
-    if bm and bm.get('ok'):
-        if side == "long":
-            sell_walls = bm.get('sell_walls', [])
-            if sell_walls:
-                best_ask = min([p for p, _ in sell_walls])
-                bps = abs((best_ask - now_price) / now_price) * 10000.0
-                bm_wall_close = (bps <= BM_WALL_PROX_BPS)
-        else:
-            buy_walls = bm.get('buy_walls', [])
-            if buy_walls:
-                best_bid = max([p for p, _ in buy_walls])
-                bps = abs((best_bid - now_price) / now_price) * 10000.0
-                bm_wall_close = (bps <= BM_WALL_PROX_BPS)
-
-    # --- Golden Reversal بعد TP1 ---
-    if state.get('tp1_done') and (gz and gz.get('ok')):
-        # إغلاق صارم لو تقاطع Golden عكس اتجاهي بعد TP1
-        opp = (gz['zone']['type']=='golden_top' and side=='long') or (gz['zone']['type']=='golden_bottom' and side=='short')
-        if opp and gz.get('score',0) >= GOLDEN_REVERSAL_SCORE:
-            return {
-                "action": "close", 
-                "why": "golden_reversal",
-                "log": f"🔴 CLOSE STRONG | golden reversal after TP1 | score={gz['score']:.1f}"
-            }
-
-    tp1_target = TP1_SCALP_PCT if mode == 'scalp' else TP1_TREND_PCT
-    if pnl_pct >= tp1_target and not state.get('tp1_done'):
-        qty_pct = 0.35 if mode == 'scalp' else 0.25
-        return {
-            "action": "partial", 
-            "why": f"TP1 hit {tp1_target*100:.2f}%",
-            "qty_pct": qty_pct,
-            "log": f"💰 TP1 جزئي {tp1_target*100:.2f}% | pnl={pnl_pct*100:.2f}% | mode={mode}"
-        }
-
-    # --- Wick exhaustion + Tighten عند إجهاد/تدفق/جدار ---
-    if pnl_pct > 0:
-        if wick_signal or evx_spike or bm_wall_close or cvd_down:
-            return {
-                "action": "tighten", 
-                "why": "exhaustion/flow/wall",
-                "trail_mult": TRAIL_TIGHT_MULT,
-                "log": f"🛡️ Tighten | wick={int(bool(wick_signal))} evx={int(bool(evx_spike))} wall={bm_wall_close} cvd_down={cvd_down}"
-            }
-
-    bearish_signals = [rsi_cross_down, adx_falling, cvd_down, evx_spike, bm_wall_close]
-    bearish_count = sum(bearish_signals)
-    
-    if pnl_pct >= HARD_CLOSE_PNL_PCT and bearish_count >= 2:
-        reasons = []
-        if rsi_cross_down: reasons.append("rsi↓")
-        if adx_falling: reasons.append("adx↓")
-        if cvd_down: reasons.append("cvd↓")
-        if evx_spike: reasons.append("evx")
-        if bm_wall_close: reasons.append("wall")
-        
-        return {
-            "action": "close", 
-            "why": "hard_close_signal",
-            "log": f"🔴 CLOSE STRONG | pnl={pnl_pct*100:.2f}% | {', '.join(reasons)}"
-        }
-
-    return {
-        "action": "hold", 
-        "why": "keep_riding", 
-        "log": None
-    }
+    # الاستمرار في الإدارة الأساسية المحسنة
+    manage_after_entry_enhanced_fixed(df, ind, info)
 
 # =================== ULTIMATE DECISION LOGGING ===================
 def log_ultimate_decision(council_data, decision):
@@ -2146,9 +2147,9 @@ def log_ultimate_decision(council_data, decision):
     
     print("─" * 80, flush=True)
 
-# =================== ULTIMATE TRADE LOOP ===================
-def trade_loop_ultimate_with_footprint():
-    """حلقة تداول نهائية مع Footprint Analysis"""
+# =================== ULTIMATE TRADE LOOP (FIXED) ===================
+def trade_loop_ultimate_with_footprint_fixed():
+    """حلقة تداول نهائية مع Footprint Analysis - إصدار مصحح"""
     global wait_for_next_signal_side
     loop_i = 0
     
@@ -2173,7 +2174,7 @@ def trade_loop_ultimate_with_footprint():
             
             # إدارة الصفقة المفتوحة مع Footprint
             if STATE["open"]:
-                manage_after_entry_ultimate(df, ind, {
+                manage_after_entry_ultimate_fixed(df, ind, {
                     "price": px or info["price"], 
                     "bm": snap["bm"],
                     "flow": snap["flow"],
@@ -2240,9 +2241,6 @@ def trade_loop_ultimate_with_footprint():
             logging.error(f"trade_loop error: {e}\n{traceback.format_exc()}")
             time.sleep(BASE_SLEEP)
 
-# استبدال حلقة التداول النهائية
-trade_loop = trade_loop_ultimate_with_footprint
-
 # =================== API / KEEPALIVE ===================
 app = Flask(__name__)
 @app.route("/")
@@ -2284,11 +2282,15 @@ def keepalive_loop():
         time.sleep(50)
 
 # =================== INTEGRATION ===================
-# استبدال الدوال الأساسية بالإصدارات المحسنة
+# تحديث الدوال بالإصدارات المصححة
 ultimate_council_voting = ultimate_council_voting_with_footprint
-smart_exit_guard = smart_exit_guard_with_footprint
+smart_exit_guard = smart_exit_guard_with_footprint_fixed
 execute_trade_decision = execute_trade_decision_with_footprint
 emit_snapshots = emit_snapshots_with_footprint
+manage_after_entry_enhanced = manage_after_entry_enhanced_fixed
+manage_after_entry_ultimate = manage_after_entry_ultimate_fixed
+manage_after_entry = manage_after_entry_ultimate_fixed
+trade_loop = trade_loop_ultimate_with_footprint_fixed
 
 # =================== BOOT ===================
 if __name__ == "__main__":
