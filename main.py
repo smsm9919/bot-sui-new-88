@@ -159,7 +159,7 @@ def detect_ob(candles):
     
     # Bearish OB
     if b['close'] > b['open'] and c['close'] < c['open']:
-        return ("bearish", b['open'], b['close"])
+        return ("bearish", b['open'], b['close'])
     
     return None
 
