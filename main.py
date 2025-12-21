@@ -12,7 +12,6 @@ SUI ULTRA PRO AI BOT - الإصدار الذكي المتقدم المتكامل
 • TP PROFILE SYSTEM - نظام جني الأرباح الذكي (1→2→3 مرات)
 • COUNCIL STRONG ENTRY - دخول ذكي من مجلس الإدارة في المناطق القوية
 • PATCH V2.0: Iron SL + Regime Watcher + Mega Council + Smart Trend Exit
-• SB HARD GATE V3.0: نظام البوابة الصارمة - دخول من مناطق قوية فقط
 """
 
 import os, time, math, random, signal, sys, traceback, logging, json
@@ -160,7 +159,7 @@ def detect_ob(candles):
     
     # Bearish OB
     if b['close'] > b['open'] and c['close'] < c['open']:
-        return ("bearish", b['open'], b['close'])
+        return ("bearish", b['open'], b['close"])
     
     return None
 
@@ -187,7 +186,7 @@ def detect_fvg(candles):
 
     # Bullish FVG
     if a['high'] < c['low']:
-        return ("bullish", a['high"], c['low'])
+        return ("bullish", a['high'], c['low'])
 
     # Bearish FVG
     if a['low'] > c['high']:
@@ -238,94 +237,6 @@ class SignalLogger:
         
     def get_recent_missed(self, count=10):
         return list(self.missed_signals)[-count:]
-
-# =================== SB HARD GATE (ENTRY) ===================
-SB_GATE_ON = True
-
-# عتبات بسيطة (تقدر تزودها لاحقًا)
-SB_MIN_TOTAL_SCORE = 6.0          # حد أدنى لسكور القرار النهائي
-SB_MIN_CONF = 0.20                # حد أدنى لثقة المجلس
-SB_REQ_ADX = 18.0                 # Gate عام لتجنب chop
-SB_REQ_DISP_ATR = 1.2             # اندفاع نسبي (تقريبي)
-
-def _sb_displacement_ok(df, ind):
-    """
-    قياس اندفاع بسيط: جسم الشمعة الأخيرة نسبة إلى ATR
-    (لو عندك displacement engine جاهز استخدمه بدل ده)
-    """
-    try:
-        if df is None or len(df) < 3:
-            return False, "no_df"
-        atr = float(safe_get(ind, "atr", 0.0))
-        if atr <= 0:
-            return False, "atr<=0"
-        o = float(df["open"].iloc[-2])
-        c = float(df["close"].iloc[-2])
-        body = abs(c - o)
-        disp = body / atr
-        return (disp >= SB_REQ_DISP_ATR), f"disp={disp:.2f}xATR"
-    except Exception as e:
-        return False, f"disp_err:{e}"
-
-def sb_hard_gate(side, info, council_data, trend_ctx, gz, ob_signal, fvg_signal, buy_liquidity, sell_liquidity, df, ind):
-    """
-    يرجع: (ok: bool, reason: str)
-    side: "buy" or "sell"
-    """
-    if not SB_GATE_ON:
-        return True, "sb_gate_off"
-
-    adx = float(safe_get(ind, "adx", 0.0))
-    conf = float(council_data.get("confidence", 0.0))
-    sb = float(council_data.get("score_b", 0.0))
-    ss = float(council_data.get("score_s", 0.0))
-
-    # score الخاص بالاتجاه المطلوب
-    total_score = sb if side == "buy" else ss
-
-    # 0) حارس أساسي: لو السوق ميت (ADX ضعيف) نرفض إلا Golden قوي
-    gb = bool(gz and gz.get("ok") and gz.get("zone", {}).get("type") == "bottom")
-    gt = bool(gz and gz.get("ok") and gz.get("zone", {}).get("type") == "top")
-    is_golden = (gb if side == "buy" else gt)
-
-    if adx < SB_REQ_ADX and not is_golden:
-        return False, f"SB_GATE:adx_low({adx:.1f})"
-
-    # 1) لازم يكون عندك “منطقة” واضحة: Golden أو OB أو FVG
-    has_zone = is_golden or (ob_signal and ob_signal[0] in ("bullish","bearish")) or (fvg_signal and fvg_signal[0] in ("bullish","bearish"))
-    if not has_zone:
-        return False, "SB_GATE:no_zone(GB/GT/OB/FVG)"
-
-    # 2) لازم Liquidity على نفس الاتجاه (أو Golden قوي يعتبر بديل)
-    liq_ok = (buy_liquidity if side == "buy" else sell_liquidity)
-    if not liq_ok and not is_golden:
-        return False, "SB_GATE:no_liquidity"
-
-    # 3) Confirmation / Displacement
-    disp_ok, disp_note = _sb_displacement_ok(df, ind)
-    if not disp_ok and not is_golden:
-        return False, f"SB_GATE:no_displacement({disp_note})"
-
-    # 4) ثقة المجلس/سكور القرار (حتى لا ندخل على “ضوضاء”)
-    if conf < SB_MIN_CONF and not is_golden:
-        return False, f"SB_GATE:low_conf({conf:.2f})"
-    if total_score < SB_MIN_TOTAL_SCORE and not is_golden:
-        return False, f"SB_GATE:low_score({total_score:.1f})"
-
-    # 5) توافق اتجاه ترندCtx إن كان متاح (بدون تشدد قاتل)
-    # trend_ctx.trend: "up/down/flat" (حسب ما عندك)
-    try:
-        if trend_ctx:
-            t = getattr(trend_ctx, "trend", None) or getattr(trend_ctx, "direction", None)
-            if side == "buy" and t in ("down","bear") and not is_golden:
-                return False, f"SB_GATE:trend_against({t})"
-            if side == "sell" and t in ("up","bull") and not is_golden:
-                return False, f"SB_GATE:trend_against({t})"
-    except Exception:
-        pass
-
-    # Golden override (لو وصلنا هنا فهو OK)
-    return True, "SB_GATE:OK" + ("|GOLDEN_OVERRIDE" if is_golden else "")
 
 # =============================
 #  SMART PROFIT AI - نظام جني الأرباح الذكي
@@ -530,7 +441,7 @@ SHADOW_MODE_DASHBOARD = False
 DRY_RUN = False
 
 # ==== Addon: Logging + Recovery Settings ====
-BOT_VERSION = f"SUI ULTRA PRO AI v7.0 — {EXCHANGE_NAME.upper()} - SMART PROFIT AI + TP PROFILE + COUNCIL STRONG ENTRY + PATCH V2.0 + SB HARD GATE V3.0"
+BOT_VERSION = f"SUI ULTRA PRO AI v7.0 — {EXCHANGE_NAME.upper()} - SMART PROFIT AI + TP PROFILE + COUNCIL STRONG ENTRY + PATCH V2.0"
 print("🚀 Booting:", BOT_VERSION, flush=True)
 
 STATE_PATH = "./bot_state.json"
@@ -655,27 +566,6 @@ SCALP_RESPECT_WAIT    = False
 SCALP_TP_SINGLE_PCT   = 0.35
 SCALP_BE_AFTER_PCT    = 0.15
 SCALP_ATR_TRAIL_MULT  = 1.0
-
-# ===== SB SCALP ENHANCEMENTS =====
-SB_GATE_ON = True
-SB_MIN_TOTAL_SCORE = 6.0
-SB_MIN_CONF = 0.20
-SB_REQ_ADX = 18.0
-SB_REQ_DISP_ATR = 1.2
-
-# أهداف السكالب المحسنة
-SCALP_MIN_PCT = 0.06   # 0.6% (6-7 نقاط)
-SCALP_MAX_PCT = 0.10   # 1.0% (10 نقاط)
-
-# التحول التلقائي من Scalp إلى Trend
-SCALP_TO_TREND_TRIGGER = 0.45  # 0.45%
-
-# Early Exit الذكي
-EARLY_FAIL_BARS = 3
-EARLY_FAIL_PNL_PCT = -0.15
-
-# Displacement شرط إجباري
-DISPLACEMENT_ATR_MULT = 1.6
 
 # ===== SUPER COUNCIL ENHANCEMENTS =====
 COUNCIL_AI_MODE = True
@@ -3188,25 +3078,6 @@ def open_market_enhanced(side, qty, price):
               f"flow={pro_info.get('flow_bias')} | "
               f"adx={pro_info.get('adx', 0):.1f}")
 
-    # ✅ SB HARD GATE CHECK - إضافة البوابة الصارمة
-    golden_data = golden_zone_check(df, ind)
-    ob_signal = detect_ob(df)
-    fvg_signal = detect_fvg(df)
-    liquidity_zones = smc_detector.detect_liquidity_zones(price)
-    buy_liquidity = any(zone[0] == "buy_liquidity" for zone in liquidity_zones)
-    sell_liquidity = any(zone[0] == "sell_liquidity" for zone in liquidity_zones)
-    
-    # تطبيق البوابة الصارمة
-    ok_gate, gate_reason = sb_hard_gate(
-        side, {"price": price}, council_data, trend_ctx,
-        golden_data, ob_signal, fvg_signal,
-        buy_liquidity, sell_liquidity, df, ind
-    )
-    
-    if not ok_gate:
-        log_i(f"🛑 SB HARD GATE BLOCKED: {gate_reason}")
-        return False
-
     # ✅ نحدد Profit Profile المناسب
     profit_profile = classify_profit_profile(df, ind, council_data, trend_info, mode)
 
@@ -3247,8 +3118,7 @@ def open_market_enhanced(side, qty, price):
             "highest_profit_pct": 0.0,
             "profit_targets_achieved": 0,
             "profit_profile": profit_profile["label"],
-            "council_controlled": STATE.get("last_entry_source") == "COUNCIL_STRONG",
-            "last_adx": safe_get(ind, "adx", 0.0)  # لحفظ ADX للتحقق من الاتجاه
+            "council_controlled": STATE.get("last_entry_source") == "COUNCIL_STRONG"
         })
         
         # 🧱 IRON SL (Bybit ticks)
@@ -3283,7 +3153,7 @@ def open_market_enhanced(side, qty, price):
             f"{f' → {profit_profile["tp3_pct"]}%' if profit_profile['tp3_pct'] else ''}"
         )
         
-        print_position_snapshot(reason=f"OPEN - {mode.upper()}[{profit_profile['label']}] | SB GATE: {gate_reason}")
+        print_position_snapshot(reason=f"OPEN - {mode.upper()}[{profit_profile['label']}]")
         return True
 
     return False
@@ -3478,8 +3348,7 @@ def _reset_after_close(reason, prev_side=None):
         "pnl": 0.0, "bars": 0, "trail": None, "breakeven": None,
         "tp1_done": False, "highest_profit_pct": 0.0, "profit_targets_achieved": 0,
         "trail_tightened": False, "partial_taken": False,
-        "peak_pnl_pct": 0.0,
-        "last_adx": None  # إعادة تعيين ADX المحفوظ
+        "peak_pnl_pct": 0.0
     })
     save_state({"in_position": False, "position_qty": 0})
     
@@ -3487,81 +3356,10 @@ def _reset_after_close(reason, prev_side=None):
     logging.info(f"AFTER_CLOSE waiting_for={wait_for_next_signal_side}")
 
 # =================== ENHANCED TRADE MANAGEMENT ===================
-def manage_scalp_to_trend_conversion(df, ind, current_price):
-    """التحول التلقائي من Scalp إلى Trend Mode"""
-    if not STATE["open"] or STATE.get("mode") != "scalp":
-        return
-    
-    entry = STATE["entry"]
-    side = STATE["side"]
-    pnl_pct = STATE.get("pnl", 0)
-    
-    if pnl_pct >= SCALP_TO_TREND_TRIGGER:
-        # شروط التحول
-        adx = safe_get(ind, "adx", 0)
-        plus_di = safe_get(ind, "plus_di", 0)
-        minus_di = safe_get(ind, "minus_di", 0)
-        
-        di_ok = (side == "long" and plus_di > minus_di) or (side == "short" and minus_di > plus_di)
-        adx_rising = adx > STATE.get("last_adx", 0) if STATE.get("last_adx") else True
-        
-        if di_ok and adx_rising and adx > 20:
-            # التحول إلى Trend Mode
-            STATE["mode"] = "trend"
-            STATE["trail_active"] = True
-            STATE["trail"] = entry * (1.01 if side == "long" else 0.99)
-            STATE["management"] = setup_trade_management("trend")
-            
-            log_g(f"🚀 AUTO CONVERSION: Scalp → Trend | PnL: {pnl_pct:.2f}% | ADX: {adx:.1f}")
-            
-            # تحديث إعدادات TP للترند
-            STATE["profit_profile"] = "TREND_MEDIUM"
-            tp_profile = PROFIT_PROFILE_CONFIG["TREND_MEDIUM"]
-            STATE["management"].update({
-                "tp1_pct": tp_profile["tp1_pct"],
-                "tp2_pct": tp_profile["tp2_pct"],
-                "tp3_pct": tp_profile["tp3_pct"],
-                "trail_activate_pct": tp_profile["trail_start_pct"]
-            })
-    
-    # تحديث ADX الأخير للمقارنة
-    STATE["last_adx"] = safe_get(ind, "adx", 0)
-
-def check_early_exit(df, ind, current_price):
-    """فحص Early Exit الذكي"""
-    if not STATE["open"] or STATE.get("bars", 0) < EARLY_FAIL_BARS:
-        return False
-    
-    pnl_pct = STATE.get("pnl", 0)
-    
-    if pnl_pct <= EARLY_FAIL_PNL_PCT:
-        # شروط Early Exit الإضافية
-        adx = safe_get(ind, "adx", 0)
-        trend_against = False
-        
-        if STATE["side"] == "long":
-            trend_against = safe_get(ind, "minus_di", 0) > safe_get(ind, "plus_di", 0) + 5
-        else:
-            trend_against = safe_get(ind, "plus_di", 0) > safe_get(ind, "minus_di", 0) + 5
-        
-        if trend_against or adx < 15:
-            log_w(f"🔄 EARLY EXIT: Failed trade after {STATE['bars']} bars | PnL: {pnl_pct:.2f}%")
-            close_market_strict("early_exit_failed_trade")
-            return True
-    
-    return False
-
 def manage_trade_by_profile(df, ind, info):
     """إدارة الصفقة حسب التصنيف المحدد من المجلس"""
     if not STATE["open"] or STATE["qty"] <= 0:
         return
-
-    # التحقق من Early Exit الذكي
-    if check_early_exit(df, ind, info.get("price")):
-        return
-
-    # التحقق من التحول من Scalp إلى Trend
-    manage_scalp_to_trend_conversion(df, ind, info.get("price"))
 
     px = info["price"]
     entry = STATE["entry"]
@@ -3645,13 +3443,6 @@ def manage_after_entry_enhanced(df, ind, info):
     """إدارة محسنة للصفقات بناءً على نوعها"""
     if not STATE["open"] or STATE["qty"] <= 0:
         return
-
-    # التحقق من Early Exit الذكي
-    if check_early_exit(df, ind, info.get("price")):
-        return
-
-    # التحقق من التحول من Scalp إلى Trend
-    manage_scalp_to_trend_conversion(df, ind, info.get("price"))
 
     px = info["price"]
     entry = STATE["entry"]
@@ -4004,14 +3795,6 @@ def cross_engine(ind):
 def manage_after_entry_enhanced_with_smart_patch(df, ind, info, performance_stats):
     if not STATE["open"] or STATE["qty"] <= 0:
         return
-
-    # التحقق من Early Exit الذكي
-    if check_early_exit(df, ind, info.get("price")):
-        performance_stats["total_trades"] += 1
-        return
-
-    # التحقق من التحول من Scalp إلى Trend
-    manage_scalp_to_trend_conversion(df, ind, info.get("price"))
 
     px = info["price"]
     entry = STATE["entry"]
@@ -4483,20 +4266,6 @@ def trade_loop_enhanced_with_smart_patch():
                 entry_reasons.append(f"SCORE buy={buy_score:.2f} sell={sell_score:.2f}")
                 entry_reasons.extend(reasons)
 
-            # ===== SB HARD GATE CHECK =====
-            if final_signal and not STATE["open"]:
-                # تطبيق البوابة الصارمة
-                ok_gate, gate_reason = sb_hard_gate(
-                    final_signal, info, council_data, trend_ctx,
-                    golden_data, ob_signal, fvg_signal,
-                    buy_liquidity, sell_liquidity, df, ind
-                )
-                
-                if not ok_gate:
-                    final_signal = None
-                    entry_reasons.append(f"SB_GATE_BLOCKED: {gate_reason}")
-                    log_i(f"🛑 SB HARD GATE BLOCKED: {gate_reason}")
-
             # ===== تنفيذ الدخول إن وجد إشارة نهائية =====
             if final_signal and not STATE["open"]:
                 allow_wait, wait_reason = wait_gate_allow(df, info)
@@ -4604,7 +4373,7 @@ def pretty_snapshot(bal, info, ind, spread_bps, reason=None, df=None):
         print("📈 INDICATORS & RF")
         print(f"   💲 Price {fmt(info.get('price'))} | RF filt={fmt(info.get('filter'))}  hi={fmt(info.get('hi'))} lo={fmt(info.get('lo'))}")
         print(f"   🧮 RSI={fmt(safe_get(ind, 'rsi'))}  +DI={fmt(safe_get(ind, 'plus_di'))}  -DI={fmt(safe_get(ind, 'minus_di'))}  ADX={fmt(safe_get(ind, 'adx'))}  ATR={fmt(safe_get(ind, 'atr'))}")
-        print(f"   🎯 ENTRY: SUPER COUNCIL AI + GOLDEN ENTRY + SUPER SCALP + SMART PROFIT AI + TP PROFILE + MEGA COUNCIL PATCH V2.0 + SB HARD GATE V3.0 |  spread_bps={fmt(spread_bps,2)}")
+        print(f"   🎯 ENTRY: SUPER COUNCIL AI + GOLDEN ENTRY + SUPER SCALP + SMART PROFIT AI + TP PROFILE + MEGA COUNCIL PATCH V2.0 |  spread_bps={fmt(spread_bps,2)}")
         print(f"   ⏱️ closes_in ≈ {left_s}s")
         print("\n🧭 POSITION")
         bal_line = f"Balance={fmt(bal,2)}  Risk={int(RISK_ALLOC*100)}%×{LEVERAGE}x  CompoundPnL={fmt(compound_pnl)}  Eq~{fmt((bal or 0)+compound_pnl,2)}"
@@ -4643,7 +4412,7 @@ def mark_position(color):
 @app.route("/")
 def home():
     mode='LIVE' if MODE_LIVE else 'PAPER'
-    return f"✅ SUI ULTRA PRO AI Bot — {EXCHANGE_NAME.upper()} — {SYMBOL} {INTERVAL} — {mode} — Super Council AI + Intelligent Trend Riding + Smart Profit AI + TP Profile System + Council Strong Entry + PATCH V2.0 + SB HARD GATE V3.0"
+    return f"✅ SUI ULTRA PRO AI Bot — {EXCHANGE_NAME.upper()} — {SYMBOL} {INTERVAL} — {mode} — Super Council AI + Intelligent Trend Riding + Smart Profit AI + TP Profile System + Council Strong Entry + PATCH V2.0"
 
 @app.route("/metrics")
 def metrics():
@@ -4652,7 +4421,7 @@ def metrics():
         "symbol": SYMBOL, "interval": INTERVAL, "mode": "live" if MODE_LIVE else "paper",
         "leverage": LEVERAGE, "risk_alloc": RISK_ALLOC, "price": price_now(),
         "state": STATE, "compound_pnl": compound_pnl,
-        "entry_mode": "SUPER_COUNCIL_AI_GOLDEN_SCALP_SMART_PROFIT_TP_PROFILE_COUNCIL_STRONG_MEGA_COUNCIL_V2_SB_HARD_GATE_V3", 
+        "entry_mode": "SUPER_COUNCIL_AI_GOLDEN_SCALP_SMART_PROFIT_TP_PROFILE_COUNCIL_STRONG_MEGA_COUNCIL_V2", 
         "wait_for_next_signal": wait_for_next_signal_side,
         "cooldown_remaining_sec": max(0, int(TRADE_COOLDOWN_SEC - (time.time() - last_trade_close_ts))) if last_trade_close_ts > 0 else 0,
         "guards": {"max_spread_bps": MAX_SPREAD_BPS, "final_chunk_qty": FINAL_CHUNK_QTY},
@@ -4668,13 +4437,6 @@ def metrics():
             "regime_watcher": WATCHER_ON,
             "trend_exit_engine": True,
             "mega_council": True
-        },
-        "sb_hard_gate": {
-            "active": SB_GATE_ON,
-            "min_score": SB_MIN_TOTAL_SCORE,
-            "min_conf": SB_MIN_CONF,
-            "req_adx": SB_REQ_ADX,
-            "req_disp_atr": SB_REQ_DISP_ATR
         }
     })
 
@@ -4684,7 +4446,7 @@ def health():
         "ok": True, "exchange": EXCHANGE_NAME, "mode": "live" if MODE_LIVE else "paper",
         "open": STATE["open"], "side": STATE["side"], "qty": STATE["qty"],
         "compound_pnl": compound_pnl, "timestamp": datetime.utcnow().isoformat(),
-        "entry_mode": "SUPER_COUNCIL_AI_GOLDEN_SCALP_SMART_PROFIT_TP_PROFILE_COUNCIL_STRONG_MEGA_COUNCIL_V2_SB_HARD_GATE_V3", 
+        "entry_mode": "SUPER_COUNCIL_AI_GOLDEN_SCALP_SMART_PROFIT_TP_PROFILE_COUNCIL_STRONG_MEGA_COUNCIL_V2", 
         "wait_for_next_signal": wait_for_next_signal_side,
         "cooldown_remaining_sec": max(0, int(TRADE_COOLDOWN_SEC - (time.time() - last_trade_close_ts))) if last_trade_close_ts > 0 else 0,
         "scalp_mode": SCALP_MODE,
@@ -4696,8 +4458,7 @@ def health():
             "iron_sl": HARD_SL_ON,
             "regime_watcher": WATCHER_ON,
             "trend_exit_engine": True
-        },
-        "sb_hard_gate": SB_GATE_ON
+        }
     }), 200
 
 # ============================================
@@ -4743,19 +4504,6 @@ def smart_stats():
             "trend_exit_engine": True,
             "mega_council": True,
             "current_watcher": STATE.get("watcher", {})
-        },
-        "sb_hard_gate": {
-            "active": SB_GATE_ON,
-            "min_score": SB_MIN_TOTAL_SCORE,
-            "min_conf": SB_MIN_CONF,
-            "req_adx": SB_REQ_ADX,
-            "req_disp_atr": SB_REQ_DISP_ATR,
-            "scalp_min_pct": SCALP_MIN_PCT,
-            "scalp_max_pct": SCALP_MAX_PCT,
-            "scalp_to_trend_trigger": SCALP_TO_TREND_TRIGGER,
-            "early_fail_bars": EARLY_FAIL_BARS,
-            "early_fail_pnl_pct": EARLY_FAIL_PNL_PCT,
-            "displacement_atr_mult": DISPLACEMENT_ATR_MULT
         }
     })
 
@@ -4797,16 +4545,12 @@ def verify_execution_environment():
     print(f"🔧 EXCHANGE: {EXCHANGE_NAME.upper()} | SYMBOL: {SYMBOL}", flush=True)
     print(f"🔧 EXECUTE_ORDERS: {EXECUTE_ORDERS} | DRY_RUN: {DRY_RUN}", flush=True)
     print(f"🎯 GOLDEN ENTRY: score={GOLDEN_ENTRY_SCORE} | ADX={GOLDEN_ENTRY_ADX}", flush=True)
-    print(f"🚀 SMART PATCH: OB/FVG + SMC + Golden Zones + Volume Confirmation + SMART PROFIT AI + TP PROFILE + COUNCIL STRONG ENTRY + SB HARD GATE V3.0", flush=True)
+    print(f"🚀 SMART PATCH: OB/FVG + SMC + Golden Zones + Volume Confirmation + SMART PROFIT AI + TP PROFILE + COUNCIL STRONG ENTRY", flush=True)
     print(f"🧠 SMART PROFIT AI: Scalp + Trend + Volume Analysis + TP Profile (1→2→3) + Council Strong Entry Activated", flush=True)
     print(f"🛡️ IRON SL: {'ON' if HARD_SL_ON else 'OFF'} (ticks={HARD_SL_TICKS})", flush=True)
     print(f"🧭 REGIME WATCHER: {'ON' if WATCHER_ON else 'OFF'} (ADX gate={REGIME_ADX_GATE})", flush=True)
     print(f"🧠 TREND EXIT ENGINE: (ADX gate={EXIT_ADX_GATE}, weakness votes={EXIT_WEAKNESS_VOTES})", flush=True)
     print(f"🎯 MEGA COUNCIL: One Decision System (threshold=6.5, edge=0.8)", flush=True)
-    print(f"🔐 SB HARD GATE V3.0: دخول من مناطق قوية فقط", flush=True)
-    print(f"🎯 أهداف السكالب: {SCALP_MIN_PCT*100:.1f}% - {SCALP_MAX_PCT*100:.1f}% (6-10 نقاط)", flush=True)
-    print(f"🔄 التحول التلقائي: Scalp → Trend عند {SCALP_TO_TREND_TRIGGER*100:.2f}% ربح", flush=True)
-    print(f"🛡️ Early Exit: بعد {EARLY_FAIL_BARS} شمعات إذا لم تتحرك الصفقة", flush=True)
 
 if __name__ == "__main__":
     verify_execution_environment()
@@ -4817,13 +4561,7 @@ if __name__ == "__main__":
     
     log_i(f"🚀 SUI ULTRA PRO AI BOT STARTED - {BOT_VERSION}")
     log_i(f"🎯 SYMBOL: {SYMBOL} | INTERVAL: {INTERVAL} | LEVERAGE: {LEVERAGE}x")
-    log_i(f"💡 SMART PATCH ACTIVATED: Golden Zones + SMC + OB/FVG + Zero Reversal Scalping + SMART PROFIT AI + TP PROFILE + COUNCIL STRONG ENTRY + SB HARD GATE V3.0")
+    log_i(f"💡 SMART PATCH ACTIVATED: Golden Zones + SMC + OB/FVG + Zero Reversal Scalping + SMART PROFIT AI + TP PROFILE + COUNCIL STRONG ENTRY")
     log_i(f"🛡️ PATCH V2.0 ACTIVATED: Iron SL + Regime Watcher + Cross Engine + Mega Council + Trend Exit Engine")
-    log_i(f"🎯 القواعد الذهبية الجديدة:")
-    log_i(f"   ✅ 1) الدخول فقط من مناطق قوية (Demand/Supply + Order Block + FVG)")
-    log_i(f"   ✅ 2) Displacement شرط إجباري (آخر شمعة range ≥ {DISPLACEMENT_ATR_MULT} × ATR)")
-    log_i(f"   ✅ 3) سكالب = أهداف أكبر ({SCALP_MIN_PCT*100:.1f}% إلى {SCALP_MAX_PCT*100:.1f}%)")
-    log_i(f"   ✅ 4) Early Exit ذكي (بعد {EARLY_FAIL_BARS} شمعات إذا لم تتحرك الصفقة)")
-    log_i(f"   ✅ 5) التحول التلقائي من Scalp → Trend (عند {SCALP_TO_TREND_TRIGGER*100:.2f}% ربح)")
     
     app.run(host="0.0.0.0", port=PORT, debug=False)
