@@ -6,9 +6,10 @@ RF Futures Bot — RF-LIVE ONLY (Multi-Exchange: BingX & Bybit)
 • Dynamic TP ladder + ATR-trailing + Volume Momentum + Liquidity Analysis
 • Professional Logging & Dashboard + Multi-Exchange Support
 • Enhanced with MA Stack + HTF Analysis + Professional Trade Plans
+• Advanced Post-Closure Analysis Brain with 4 Trading Strategies
 """
 
-import os, time, math, random, signal, sys, traceback, logging, json
+import os, time, math, random, signal, sys, traceback, logging, json, threading
 from logging.handlers import RotatingFileHandler
 from datetime import datetime
 import pandas as pd
@@ -216,6 +217,12 @@ FOOTPRINT_VOLUME_THRESHOLD = 2.0
 DELTA_THRESHOLD = 1.5
 ABSORPTION_RATIO = 0.65
 EFFICIENCY_THRESHOLD = 0.85
+
+# =================== POST-CLOSURE ANALYSIS SETTINGS ===================
+POST_CLOSURE_ANALYSIS_ENABLED = True
+POST_ANALYSIS_DURATION_CANDLES = 5  # عدد الشموع التي نتابعها بعد الإغلاق
+ANALYSIS_COOLDOWN_SECONDS = 60  # ثواني بين تحليلات ما بعد الإغلاق
+POST_CLOSE_TRADE_SIZE_RATIO = 0.5  # حجم صفقات ما بعد الإغلاق (نسبة من الحجم العادي)
 
 # =================== SETTINGS ===================
 SYMBOL     = os.getenv("SYMBOL", "SUI/USDT:USDT")
@@ -563,6 +570,7 @@ def verify_execution_environment():
     print(f"{C['w']}📈 ADVANCED INDICATORS: SMC + MA Stack + HTF + Volume Momentum{C['rst']}", flush=True)
     print(f"{C['w']}👣 SMART MONEY CONCEPTS: BOS + Order Blocks + FVG + Liquidity Analysis{C['rst']}", flush=True)
     print(f"{C['w']}⚡ RF SETTINGS: period={RF_PERIOD} | mult={RF_MULT} (SUI Optimized){C['rst']}", flush=True)
+    print(f"{C['w']}🧠 POST-CLOSURE ANALYSIS: {'ENABLED' if POST_CLOSURE_ANALYSIS_ENABLED else 'DISABLED'}{C['rst']}", flush=True)
     
     if not EXECUTE_ORDERS:
         print(f"{C['y']}🟡 WARNING: EXECUTE_ORDERS=False - البوت في وضع التحليل فقط!{C['rst']}", flush=True)
@@ -2872,6 +2880,803 @@ def resume_open_position(exchange, symbol: str, state: dict) -> dict:
     log_g(f"RESUME: {state['side']} qty={state['position_qty']} @ {state['entry_price']:.6f} lev={state['leverage']}x")
     return state
 
+# =================== POST-CLOSURE ANALYSIS BRAIN ===================
+def advanced_post_closure_analysis(df, closed_trade_info, market_context):
+    """
+    عقل تحليل متقدم لما بعد إغلاق الصفقة
+    
+    closed_trade_info: {
+        "side": "long"/"short",
+        "entry": price,
+        "exit": price,
+        "pnl_pct": percentage,
+        "close_reason": "tp"/"sl"/"trail"/"signal",
+        "closed_at": timestamp,
+        "trade_duration_minutes": minutes
+    }
+    
+    market_context: {
+        "current_price": price,
+        "indicators": {...},
+        "htf_trend": {...},
+        "liquidity_zones": {...},
+        "order_blocks": {...}
+    }
+    
+    Returns: {
+        "action": "enter_scalp" | "enter_reversal" | "wait_correction" | "observe" | "do_nothing",
+        "side": "buy" | "sell",
+        "confidence": 0.0-10.0,
+        "reason": "text",
+        "entry_price": suggested_price,
+        "stop_loss": sl_price,
+        "take_profit": tp_price
+    }
+    """
+    
+    if not POST_CLOSURE_ANALYSIS_ENABLED:
+        return {"action": "do_nothing", "confidence": 0.0, "reason": "post_analysis_disabled"}
+    
+    # منع التحليل المتكرر
+    current_time = time.time()
+    last_analysis = getattr(advanced_post_closure_analysis, 'last_analysis_time', 0)
+    if current_time - last_analysis < ANALYSIS_COOLDOWN_SECONDS:
+        return {"action": "do_nothing", "confidence": 0.0, "reason": "analysis_cooldown"}
+    
+    advanced_post_closure_analysis.last_analysis_time = current_time
+    
+    # استخراج البيانات
+    closed_side = closed_trade_info.get("side")
+    pnl_pct = closed_trade_info.get("pnl_pct", 0)
+    close_reason = closed_trade_info.get("close_reason", "")
+    
+    # الحصول على بيانات السوق الحالية
+    current_price = market_context.get("current_price")
+    indicators = market_context.get("indicators", {})
+    htf_trend = market_context.get("htf_trend", {})
+    liquidity_zones = market_context.get("liquidity_zones", {})
+    order_blocks = market_context.get("order_blocks", {})
+    
+    # 1. تحليل رد فعل السعر بعد الإغلاق
+    price_reaction = analyze_price_reaction_post_close(df, closed_side, closed_trade_info)
+    
+    # 2. تحليل قوة الرفض (Rejection Strength)
+    rejection_strength = analyze_rejection_strength(df, closed_side, current_price)
+    
+    # 3. تحليل عمق التصحيح (Correction Depth)
+    correction_analysis = analyze_correction_depth(df, closed_side, closed_trade_info)
+    
+    # 4. تحليل توافق المؤشرات بعد الإغلاق
+    indicator_alignment = analyze_indicator_alignment_post_close(indicators, closed_side)
+    
+    # 5. تحليل مناطق السيولة بعد الإغلاق
+    liquidity_analysis = analyze_post_close_liquidity(liquidity_zones, order_blocks, current_price, closed_side)
+    
+    # 6. تحديد قرار متقدم بناءً على جميع التحليلات
+    decision = make_advanced_post_closure_decision(
+        closed_trade_info=closed_trade_info,
+        price_reaction=price_reaction,
+        rejection_strength=rejection_strength,
+        correction_analysis=correction_analysis,
+        indicator_alignment=indicator_alignment,
+        liquidity_analysis=liquidity_analysis,
+        htf_trend=htf_trend,
+        current_price=current_price
+    )
+    
+    # تسجيل التحليل
+    if LOG_ADDONS and decision["confidence"] >= 5.0:
+        log_i(f"🧠 POST-CLOSE ANALYSIS | Previous: {closed_side} | PnL: {pnl_pct:.2f}% | Decision: {decision['action']} | Reason: {decision['reason']}")
+    
+    return decision
+
+
+def analyze_price_reaction_post_close(df, closed_side, closed_trade_info):
+    """
+    تحليل رد فعل السعر بعد إغلاق الصفقة
+    """
+    if len(df) < 3:
+        return {"strength": 0.0, "reaction": "neutral", "candles": []}
+    
+    # الحصول على آخر 3 شموع بعد الإغلاق
+    last_candles = df.iloc[-3:].copy()
+    
+    reactions = []
+    strength_score = 0.0
+    
+    for idx, candle in last_candles.iterrows():
+        o, h, l, c, v = candle["open"], candle["high"], candle["low"], candle["close"], candle["volume"]
+        
+        # تحليل الشمعة
+        body_size = abs(c - o)
+        total_range = h - l
+        body_ratio = body_size / total_range if total_range > 0 else 0
+        
+        # تحديد اتجاه الشمعة
+        candle_dir = "bullish" if c > o else "bearish" if c < o else "neutral"
+        
+        # تحليل الرفض
+        upper_wick = h - max(o, c)
+        lower_wick = min(o, c) - l
+        wick_ratio_upper = upper_wick / total_range if total_range > 0 else 0
+        wick_ratio_lower = lower_wick / total_range if total_range > 0 else 0
+        
+        # تقييم رد الفعل حسب اتجاه الصفقة المغلقة
+        if closed_side == "long":
+            # بعد إغلاق صفقة شراء، نبحث عن رفض قمة أو تصحيح
+            if wick_ratio_upper > 0.3 and candle_dir == "bearish":
+                # قمة مرفوضة - إشارة بيع قوية
+                reactions.append("strong_rejection_top")
+                strength_score += 2.0
+            elif body_ratio > 0.7 and candle_dir == "bearish":
+                # شمعة هابطة قوية - تصحيح عميق
+                reactions.append("deep_correction")
+                strength_score += 1.5
+        
+        elif closed_side == "short":
+            # بعد إغلاق صفقة بيع، نبحث عن رفض قاع أو ارتداد
+            if wick_ratio_lower > 0.3 and candle_dir == "bullish":
+                # قاع مرفوض - إشارة شراء قوية
+                reactions.append("strong_rejection_bottom")
+                strength_score += 2.0
+            elif body_ratio > 0.7 and candle_dir == "bullish":
+                # شمعة صاعدة قوية - ارتداد قوي
+                reactions.append("strong_bounce")
+                strength_score += 1.5
+    
+    return {
+        "strength": min(strength_score, 5.0),
+        "reaction": reactions[0] if reactions else "neutral",
+        "candles": reactions,
+        "score": strength_score
+    }
+
+
+def analyze_rejection_strength(df, closed_side, current_price):
+    """
+    تحليل قوة الرفض بعد الإغلاق
+    """
+    if len(df) < 5:
+        return {"rejection": False, "strength": 0.0, "level": None}
+    
+    # البحث عن قمم أو قيعان محلية
+    highs = df["high"].astype(float).tail(10)
+    lows = df["low"].astype(float).tail(10)
+    
+    rejection_level = None
+    strength = 0.0
+    
+    if closed_side == "long":
+        # البحث عن قمة مرفوضة
+        recent_high = highs.max()
+        if abs(current_price - recent_high) / recent_high < 0.02:  # قرب 2%
+            # تحليل حجم التداول عند القمة
+            high_idx = highs.idxmax()
+            volume_at_high = df.loc[high_idx, "volume"]
+            avg_volume = df["volume"].tail(10).mean()
+            
+            if volume_at_high > avg_volume * 1.5:
+                # حجم عالٍ عند القمة - توزيع
+                rejection_level = recent_high
+                strength = 2.0
+            else:
+                # حجم طبيعي - رفض بسيط
+                rejection_level = recent_high
+                strength = 1.0
+    
+    elif closed_side == "short":
+        # البحث عن قاع مرفوض
+        recent_low = lows.min()
+        if abs(current_price - recent_low) / recent_low < 0.02:  # قرب 2%
+            # تحليل حجم التداول عند القاع
+            low_idx = lows.idxmin()
+            volume_at_low = df.loc[low_idx, "volume"]
+            avg_volume = df["volume"].tail(10).mean()
+            
+            if volume_at_low > avg_volume * 1.5:
+                # حجم عالٍ عند القاع - تجميع
+                rejection_level = recent_low
+                strength = 2.0
+            else:
+                # حجم طبيعي - رفض بسيط
+                rejection_level = recent_low
+                strength = 1.0
+    
+    return {
+        "rejection": rejection_level is not None,
+        "strength": strength,
+        "level": rejection_level,
+        "type": "top_rejection" if closed_side == "long" else "bottom_rejection"
+    }
+
+
+def analyze_correction_depth(df, closed_side, closed_trade_info):
+    """
+    تحليل عمق التصحيح بعد إغلاق الصفقة
+    """
+    if len(df) < 10:
+        return {"correction": False, "depth": 0.0, "healthy": False, "retracement_level": 0.0}
+    
+    exit_price = closed_trade_info.get("exit")
+    if not exit_price:
+        return {"correction": False, "depth": 0.0, "healthy": False, "retracement_level": 0.0}
+    
+    # تحديد حركة السعر بعد الإغلاق
+    prices = df["close"].astype(float).tail(5)
+    current_price = prices.iloc[-1]
+    
+    if closed_side == "long":
+        # بعد صفقة شراء، التصحيح الهبوطي
+        move_high = prices.max()
+        move_low = prices.min()
+        correction_depth = (move_high - current_price) / (move_high - move_low) if (move_high - move_low) > 0 else 0
+        
+        # مستويات فيبوناتشي للتصحيح
+        fib_levels = {
+            0.236: move_high - (move_high - move_low) * 0.236,
+            0.382: move_high - (move_high - move_low) * 0.382,
+            0.5: move_high - (move_high - move_low) * 0.5,
+            0.618: move_high - (move_high - move_low) * 0.618,
+            0.786: move_high - (move_high - move_low) * 0.786
+        }
+        
+        # تحديد مستوى التصحيح الحالي
+        current_fib_level = None
+        for level, price in fib_levels.items():
+            if abs(current_price - price) / price < 0.01:  # ضمن 1%
+                current_fib_level = level
+                break
+        
+        # تقييم صحة التصحيح
+        healthy_correction = False
+        if 0.382 <= correction_depth <= 0.618:
+            healthy_correction = True
+        
+        return {
+            "correction": correction_depth > 0.1,
+            "depth": correction_depth,
+            "healthy": healthy_correction,
+            "retracement_level": current_fib_level,
+            "fib_levels": fib_levels
+        }
+    
+    elif closed_side == "short":
+        # بعد صفقة بيع، التصحيح الصعودي
+        move_low = prices.min()
+        move_high = prices.max()
+        correction_depth = (current_price - move_low) / (move_high - move_low) if (move_high - move_low) > 0 else 0
+        
+        # مستويات فيبوناتشي للتصحيح
+        fib_levels = {
+            0.236: move_low + (move_high - move_low) * 0.236,
+            0.382: move_low + (move_high - move_low) * 0.382,
+            0.5: move_low + (move_high - move_low) * 0.5,
+            0.618: move_low + (move_high - move_low) * 0.618,
+            0.786: move_low + (move_high - move_low) * 0.786
+        }
+        
+        # تحديد مستوى التصحيح الحالي
+        current_fib_level = None
+        for level, price in fib_levels.items():
+            if abs(current_price - price) / price < 0.01:  # ضمن 1%
+                current_fib_level = level
+                break
+        
+        # تقييم صحة التصحيح
+        healthy_correction = False
+        if 0.382 <= correction_depth <= 0.618:
+            healthy_correction = True
+        
+        return {
+            "correction": correction_depth > 0.1,
+            "depth": correction_depth,
+            "healthy": healthy_correction,
+            "retracement_level": current_fib_level,
+            "fib_levels": fib_levels
+        }
+    
+    return {"correction": False, "depth": 0.0, "healthy": False, "retracement_level": 0.0}
+
+
+def analyze_indicator_alignment_post_close(indicators, closed_side):
+    """
+    تحليل توافق المؤشرات بعد الإغلاق
+    """
+    alignment_score = 0.0
+    reasons = []
+    
+    # RSI تحليل
+    rsi = indicators.get("rsi", 50)
+    rsi_ma = indicators.get("rsi_ma", 50)
+    
+    if closed_side == "long":
+        # بعد صفقة شراء، نبحث عن:
+        # 1. RSI فوق المتوسط وتحسن
+        if rsi > rsi_ma:
+            alignment_score += 1.5
+            reasons.append("RSI_above_MA")
+        
+        # 2. RSI لا يزال في منطقة قوية (ليست مفرطة الشراء)
+        if rsi < 70:
+            alignment_score += 1.0
+            reasons.append("RSI_not_overbought")
+    
+    elif closed_side == "short":
+        # بعد صفقة بيع، نبحث عن:
+        # 1. RSI تحت المتوسط وتدهور
+        if rsi < rsi_ma:
+            alignment_score += 1.5
+            reasons.append("RSI_below_MA")
+        
+        # 2. RSI لا يزال في منطقة قوية (ليست مفرطة البيع)
+        if rsi > 30:
+            alignment_score += 1.0
+            reasons.append("RSI_not_oversold")
+    
+    # ADX تحليل
+    adx = indicators.get("adx", 0)
+    if adx > 25:
+        alignment_score += 1.0
+        reasons.append("ADX_strong_trend")
+    
+    # MACD تحليل
+    macd = indicators.get("macd", {})
+    macd_line = macd.get("macd", 0)
+    signal_line = macd.get("signal", 0)
+    
+    if closed_side == "long":
+        if macd_line > signal_line:
+            alignment_score += 1.5
+            reasons.append("MACD_bullish")
+    elif closed_side == "short":
+        if macd_line < signal_line:
+            alignment_score += 1.5
+            reasons.append("MACD_bearish")
+    
+    return {
+        "score": min(alignment_score, 5.0),
+        "reasons": reasons,
+        "strong_alignment": alignment_score >= 3.0
+    }
+
+
+def analyze_post_close_liquidity(liquidity_zones, order_blocks, current_price, closed_side):
+    """
+    تحليل مناطق السيولة بعد الإغلاق
+    """
+    analysis = {
+        "near_support": False,
+        "near_resistance": False,
+        "order_block_nearby": False,
+        "fvg_nearby": False,
+        "liquidity_pool_near": False
+    }
+    
+    # تحقق من قرب مستوى دعم/مقاومة
+    if liquidity_zones:
+        buy_liquidity = liquidity_zones.get("buy_liquidity", [])
+        sell_liquidity = liquidity_zones.get("sell_liquidity", [])
+        
+        for zone in buy_liquidity:
+            zone_price = zone.get("price", 0)
+            if zone_price and abs(current_price - zone_price) / current_price < 0.01:  # ضمن 1%
+                analysis["near_support"] = True
+        
+        for zone in sell_liquidity:
+            zone_price = zone.get("price", 0)
+            if zone_price and abs(current_price - zone_price) / current_price < 0.01:  # ضمن 1%
+                analysis["near_resistance"] = True
+    
+    # تحقق من قرب Order Blocks
+    if order_blocks:
+        bullish_ob = order_blocks.get("bullish_ob", [])
+        bearish_ob = order_blocks.get("bearish_ob", [])
+        
+        for ob in bullish_ob:
+            low, high = ob.get("low", 0), ob.get("high", 0)
+            if low <= current_price <= high:
+                analysis["order_block_nearby"] = True
+        
+        for ob in bearish_ob:
+            low, high = ob.get("low", 0), ob.get("high", 0)
+            if low <= current_price <= high:
+                analysis["order_block_nearby"] = True
+    
+    return analysis
+
+
+def make_advanced_post_closure_decision(closed_trade_info, price_reaction, rejection_strength, 
+                                        correction_analysis, indicator_alignment, 
+                                        liquidity_analysis, htf_trend, current_price):
+    """
+    اتخاذ قرار متقدم بناءً على جميع التحليلات
+    """
+    closed_side = closed_trade_info.get("side")
+    pnl_pct = closed_trade_info.get("pnl_pct", 0)
+    close_reason = closed_trade_info.get("close_reason", "")
+    
+    # 1. تحليل جدوى الدخول السكالب
+    scalp_opportunity = False
+    scalp_side = None
+    scalp_reason = ""
+    
+    # شروط السكالب بعد صفقة ناجحة
+    if pnl_pct > 0.3:  # الصفقة كانت مربحة
+        if closed_side == "long":
+            # بعد صفقة شراء ناجحة:
+            # - إذا كان هناك رفض قمة قوي
+            # - المؤشرات لا تزال قوية
+            if (rejection_strength.get("strength", 0) >= 1.5 and 
+                price_reaction.get("strength", 0) >= 1.0):
+                scalp_opportunity = True
+                scalp_side = "sell"
+                scalp_reason = "top_rejection_after_successful_long"
+        
+        elif closed_side == "short":
+            # بعد صفقة بيع ناجحة:
+            # - إذا كان هناك رفض قاع قوي
+            # - المؤشرات لا تزال قوية
+            if (rejection_strength.get("strength", 0) >= 1.5 and 
+                price_reaction.get("strength", 0) >= 1.0):
+                scalp_opportunity = True
+                scalp_side = "buy"
+                scalp_reason = "bottom_rejection_after_successful_short"
+    
+    # 2. تحليل فرصة الدخول في تصحيح صحي
+    correction_entry = False
+    correction_side = None
+    correction_reason = ""
+    
+    if correction_analysis.get("healthy", False):
+        correction_depth = correction_analysis.get("depth", 0)
+        fib_level = correction_analysis.get("retracement_level", 0)
+        
+        # تصحيح صحي في مستوى فيبوناتشي جيد
+        if 0.382 <= correction_depth <= 0.618 and fib_level in [0.382, 0.5, 0.618]:
+            if closed_side == "long":
+                # بعد صفقة شراء، الدخول في التصحيح الهبوطي
+                correction_entry = True
+                correction_side = "buy"
+                correction_reason = f"healthy_correction_fib_{fib_level}_after_long"
+            elif closed_side == "short":
+                # بعد صفقة بيع، الدخول في التصحيح الصعودي
+                correction_entry = True
+                correction_side = "sell"
+                correction_reason = f"healthy_correction_fib_{fib_level}_after_short"
+    
+    # 3. تحليل فرصة الدخول العكسي (Reversal)
+    reversal_opportunity = False
+    reversal_side = None
+    reversal_reason = ""
+    
+    # شروط الانعكاس القوي
+    strong_rejection = rejection_strength.get("strength", 0) >= 2.0
+    strong_price_reaction = price_reaction.get("strength", 0) >= 2.0
+    indicator_divergence = indicator_alignment.get("score", 0) < 2.0
+    
+    if strong_rejection and strong_price_reaction and indicator_divergence:
+        if closed_side == "long":
+            # انعكاس هابط قوي بعد صفقة شراء
+            reversal_opportunity = True
+            reversal_side = "sell"
+            reversal_reason = "strong_reversal_after_long"
+        elif closed_side == "short":
+            # انعكاس صاعد قوي بعد صفقة بيع
+            reversal_opportunity = True
+            reversal_side = "buy"
+            reversal_reason = "strong_reversal_after_short"
+    
+    # 4. حساب الثقة النهائية
+    confidence = 0.0
+    final_action = "do_nothing"
+    final_side = None
+    final_reason = "no_clear_opportunity"
+    
+    # تحديد الفرصة الأعلى ثقة
+    opportunities = []
+    
+    if scalp_opportunity:
+        opportunities.append({
+            "type": "scalp",
+            "side": scalp_side,
+            "reason": scalp_reason,
+            "confidence": min(5.0 + pnl_pct * 2, 8.0)
+        })
+    
+    if correction_entry:
+        opportunities.append({
+            "type": "correction_entry",
+            "side": correction_side,
+            "reason": correction_reason,
+            "confidence": min(6.0 + correction_analysis.get("depth", 0) * 3, 9.0)
+        })
+    
+    if reversal_opportunity:
+        opportunities.append({
+            "type": "reversal",
+            "side": reversal_side,
+            "reason": reversal_reason,
+            "confidence": min(7.0 + rejection_strength.get("strength", 0) * 2, 9.5)
+        })
+    
+    # اختيار الفرصة الأعلى ثقة
+    if opportunities:
+        best_opportunity = max(opportunities, key=lambda x: x["confidence"])
+        
+        if best_opportunity["confidence"] >= 6.0:
+            confidence = best_opportunity["confidence"]
+            final_action = "enter_scalp" if best_opportunity["type"] == "scalp" else "enter_reversal"
+            final_side = best_opportunity["side"]
+            final_reason = best_opportunity["reason"]
+    
+    # 5. تحليل صفقة المراقبة (Observation)
+    if confidence < 6.0 and (rejection_strength.get("strength", 0) >= 1.0 or 
+                            correction_analysis.get("correction", False)):
+        final_action = "observe"
+        final_reason = "potential_opportunity_forming"
+        confidence = 4.0
+    
+    # حساب مستويات الدخول والخروج المقترحة
+    entry_price = current_price
+    stop_loss = 0.0
+    take_profit = 0.0
+    
+    if final_action in ["enter_scalp", "enter_reversal"] and final_side:
+        atr = indicators.get("atr", current_price * 0.01)
+        
+        if final_side == "buy":
+            # شراء سكالب/انعكاس
+            entry_price = current_price
+            stop_loss = entry_price - (atr * 1.5)
+            take_profit = entry_price + (atr * 2.0)
+        elif final_side == "sell":
+            # بيع سكالب/انعكاس
+            entry_price = current_price
+            stop_loss = entry_price + (atr * 1.5)
+            take_profit = entry_price - (atr * 2.0)
+    
+    return {
+        "action": final_action,
+        "side": final_side,
+        "confidence": confidence,
+        "reason": final_reason,
+        "entry_price": entry_price,
+        "stop_loss": stop_loss,
+        "take_profit": take_profit,
+        "analysis_summary": {
+            "scalp_opportunity": scalp_opportunity,
+            "correction_entry": correction_entry,
+            "reversal_opportunity": reversal_opportunity,
+            "rejection_strength": rejection_strength.get("strength", 0),
+            "correction_depth": correction_analysis.get("depth", 0)
+        }
+    }
+
+
+def execute_post_closure_decision(decision, df, balance):
+    """
+    تنفيذ قرار ما بعد الإغلاق
+    """
+    if decision["action"] in ["enter_scalp", "enter_reversal"]:
+        side = decision["side"]
+        entry_price = decision["entry_price"]
+        
+        # حساب حجم الصفقة (نسبة من الصفقة العادية للتداول بعد الإغلاق)
+        qty = compute_size(balance, entry_price) * POST_CLOSE_TRADE_SIZE_RATIO
+        
+        if qty > 0:
+            log_i(f"🧠 POST-CLOSE EXECUTION: {side.upper()} scalp at {entry_price:.6f} | Reason: {decision['reason']}")
+            
+            if EXECUTE_ORDERS and not DRY_RUN and MODE_LIVE:
+                try:
+                    params = exchange_specific_params(side, is_close=False)
+                    ex.create_order(SYMBOL, "market", side, qty, None, params)
+                    
+                    # تسجيل الصفقة الجديدة
+                    STATE.update({
+                        "open": True,
+                        "side": "long" if side == "buy" else "short",
+                        "entry": entry_price,
+                        "qty": qty,
+                        "pnl": 0.0,
+                        "bars": 0,
+                        "trail": None,
+                        "breakeven": None,
+                        "tp1_done": False,
+                        "highest_profit_pct": 0.0,
+                        "profit_targets_achieved": 0,
+                        "mode": "scalp",  # تأكيد أنها صفقة سكالب
+                        "is_post_close_trade": True,  # علامة أنها صفقة بعد الإغلاق
+                        "post_close_reason": decision["reason"]
+                    })
+                    
+                    log_g(f"✅ POST-CLOSE TRADE OPENED: {side.upper()} {qty:.4f} @ {entry_price:.6f}")
+                    return True
+                except Exception as e:
+                    log_e(f"❌ Post-close trade failed: {e}")
+            else:
+                log_i(f"DRY_RUN: Post-close {side} {qty:.4f} @ {entry_price:.6f}")
+    
+    elif decision["action"] == "observe":
+        log_i(f"👁️ POST-CLOSE OBSERVATION: {decision['reason']}")
+    
+    return False
+
+
+# =================== ENHANCED CLOSE FUNCTION WITH POST-ANALYSIS ===================
+def enhanced_close_market_strict(reason="STRICT"):
+    """
+    نسخة محسنة من close_market_strict مع تحليل ما بعد الإغلاق
+    """
+    global compound_pnl, wait_for_next_signal_side
+    
+    # الحصول على معلومات الصفقة قبل الإغلاق
+    pre_close_info = {
+        "side": STATE.get("side"),
+        "entry": STATE.get("entry"),
+        "qty": STATE.get("qty", 0),
+        "pnl_pct": STATE.get("pnl", 0),
+        "highest_profit_pct": STATE.get("highest_profit_pct", 0),
+        "profit_targets_achieved": STATE.get("profit_targets_achieved", 0)
+    }
+    
+    # الإغلاق الأساسي
+    exch_qty, exch_side, exch_entry = _read_position()
+    if exch_qty <= 0:
+        if STATE.get("open"):
+            _reset_after_close(reason)
+        return
+    
+    side_to_close = "sell" if (exch_side == "long") else "buy"
+    qty_to_close = safe_qty(exch_qty)
+    attempts = 0
+    last_error = None
+    
+    while attempts < CLOSE_RETRY_ATTEMPTS:
+        try:
+            if MODE_LIVE and EXECUTE_ORDERS and not DRY_RUN:
+                params = exchange_specific_params(side_to_close, is_close=True)
+                ex.create_order(SYMBOL, "market", side_to_close, qty_to_close, None, params)
+            
+            time.sleep(CLOSE_VERIFY_WAIT_S)
+            left_qty, _, _ = _read_position()
+            
+            if left_qty <= 0:
+                px = price_now() or STATE.get("entry")
+                entry_px = STATE.get("entry") or exch_entry or px
+                side = STATE.get("side") or exch_side or ("long" if side_to_close == "sell" else "short")
+                qty = exch_qty
+                pnl = (px - entry_px) * qty * (1 if side == "long" else -1)
+                compound_pnl += pnl
+                
+                # حساب نسبة الربح/الخسارة
+                pnl_pct = (pnl / (entry_px * qty)) * 100 if (entry_px * qty) > 0 else 0
+                
+                log_i(f"STRICT CLOSE {side} reason={reason} pnl={fmt(pnl)} total={fmt(compound_pnl)} pnl_pct={pnl_pct:.2f}%")
+                logging.info(f"STRICT_CLOSE {side} pnl={pnl} total={compound_pnl} pnl_pct={pnl_pct}")
+                
+                # جمع معلومات الصفقة المغلقة
+                closed_trade_info = {
+                    "side": side,
+                    "entry": entry_px,
+                    "exit": px,
+                    "pnl": pnl,
+                    "pnl_pct": pnl_pct,
+                    "close_reason": reason,
+                    "closed_at": time.time(),
+                    "trade_duration_minutes": (time.time() - STATE.get("opened_at", time.time())) / 60
+                }
+                
+                _reset_after_close(reason, prev_side=side, closed_trade_info=closed_trade_info)
+                
+                # تشغيل تحليل ما بعد الإغلاق إذا كان مفعلاً والصفقة كانت مهمة
+                if POST_CLOSURE_ANALYSIS_ENABLED and abs(pnl_pct) > 0.1:
+                    threading.Thread(
+                        target=run_post_closure_analysis,
+                        args=(closed_trade_info,),
+                        daemon=True
+                    ).start()
+                
+                return
+            
+            qty_to_close = safe_qty(left_qty)
+            attempts += 1
+            log_w(f"strict close retry {attempts}/{CLOSE_RETRY_ATTEMPTS} — residual={fmt(left_qty,4)}")
+            time.sleep(CLOSE_VERIFY_WAIT_S)
+        except Exception as e:
+            last_error = e
+            logging.error(f"close_market_strict attempt {attempts+1}: {e}")
+            attempts += 1
+            time.sleep(CLOSE_VERIFY_WAIT_S)
+    
+    log_e(f"STRICT CLOSE FAILED after {CLOSE_RETRY_ATTEMPTS} attempts — last error: {last_error}")
+    logging.critical(f"STRICT CLOSE FAILED — last_error={last_error}")
+
+
+def run_post_closure_analysis(closed_trade_info):
+    """
+    تشغيل تحليل ما بعد الإغلاق في خيط منفصل
+    """
+    try:
+        # انتظار قليل لجمع بيانات جديدة
+        time.sleep(2)
+        
+        # جمع بيانات السوق الحالية
+        df = fetch_ohlcv()
+        px = price_now()
+        
+        if df.empty or px is None:
+            return
+        
+        # حساب المؤشرات الحالية
+        ind = compute_indicators(df)
+        
+        # تحليل HTF
+        htf_context = compute_htf_context(ex, SYMBOL)
+        
+        # تحليل SMC
+        snap = emit_snapshots_with_smc(ex, SYMBOL, df)
+        smc_data = snap.get("cv", {}).get("advanced_indicators", {}).get("smc_analysis", {})
+        
+        # تجهيز سياق السوق
+        market_context = {
+            "current_price": px,
+            "indicators": ind,
+            "htf_trend": htf_context,
+            "liquidity_zones": smc_data.get("liquidity_zones", {}),
+            "order_blocks": smc_data.get("order_blocks", {})
+        }
+        
+        # تشغيل التحليل المتقدم
+        decision = advanced_post_closure_analysis(df, closed_trade_info, market_context)
+        
+        # إذا كان القرار تنفيذي وذو ثقة عالية
+        if decision["confidence"] >= 6.0:
+            bal = balance_usdt()
+            execute_post_closure_decision(decision, df, bal)
+        
+    except Exception as e:
+        log_w(f"Post-closure analysis error: {e}")
+
+
+def _reset_after_close(reason, prev_side=None, closed_trade_info=None):
+    """
+    نسخة محسنة مع دعم تحليل ما بعد الإغلاق
+    """
+    global wait_for_next_signal_side
+    
+    prev_side = prev_side or STATE.get("side")
+    
+    # حفظ معلومات الصفقة المغلقة إذا كانت متاحة
+    if closed_trade_info:
+        STATE["last_closed_trade"] = closed_trade_info
+    
+    STATE.update({
+        "open": False, "side": None, "entry": None, "qty": 0.0,
+        "pnl": 0.0, "bars": 0, "trail": None, "breakeven": None,
+        "tp1_done": False, "highest_profit_pct": 0.0, "profit_targets_achieved": 0,
+        "trail_tightened": False, "partial_taken": False,
+        "zone": None, "entry_reason": None,
+        "post_close_analysis_active": False,
+        "post_close_analysis_start": time.time() if POST_CLOSURE_ANALYSIS_ENABLED else None
+    })
+    
+    # بعد إغلاق الصفقة بالكامل فعّل تبريد 10 دقائق
+    now = time.time()
+    STATE["cooldown_until"] = now + COOLDOWN_SECONDS
+    
+    print(f"🧊 COOLDOWN ACTIVE for 10 minutes (until {STATE['cooldown_until']}) بسبب: {reason}", flush=True)
+    
+    save_state({"in_position": False, "position_qty": 0})
+    
+    # تفعيل انتظار الإشارة التالية
+    _arm_wait_after_close(prev_side)
+    logging.info(f"AFTER_CLOSE waiting_for={wait_for_next_signal_side}")
+    
+    # تسجيل إغلاق الصفقة
+    if closed_trade_info:
+        log_i(f"📊 TRADE CLOSED SUMMARY: Side={prev_side} | PnL={closed_trade_info.get('pnl_pct', 0):.2f}% | Duration={closed_trade_info.get('trade_duration_minutes', 0):.1f}min | Reason={reason}")
+
 # =================== LOGGING SETUP ===================
 def setup_file_logging():
     logger = logging.getLogger()
@@ -3265,7 +4070,10 @@ STATE = {
     "profit_targets_achieved": 0,
     "cooldown_until": None,  # إضافة متغير التبريد
     "zone": None,  # إضافة المنطقة التي دخل منها
-    "entry_reason": None  # إضافة سبب الدخول
+    "entry_reason": None,  # إضافة سبب الدخول
+    "post_close_analysis_active": False,  # تحليل ما بعد الإغلاق
+    "post_close_analysis_start": None,  # وقت بدء التحليل
+    "last_closed_trade": None  # آخر صفقة مغلقة
 }
 compound_pnl = 0.0
 wait_for_next_signal_side = None
@@ -3323,65 +4131,8 @@ def compute_size(balance, price):
     raw = max(0.0, capital / max(float(price or 0.0), 1e-9))
     return safe_qty(raw)
 
-def close_market_strict(reason="STRICT"):
-    global compound_pnl, wait_for_next_signal_side
-    exch_qty, exch_side, exch_entry = _read_position()
-    if exch_qty <= 0:
-        if STATE.get("open"):
-            _reset_after_close(reason)
-        return
-    side_to_close = "sell" if (exch_side=="long") else "buy"
-    qty_to_close  = safe_qty(exch_qty)
-    attempts=0; last_error=None
-    while attempts < CLOSE_RETRY_ATTEMPTS:
-        try:
-            if MODE_LIVE and EXECUTE_ORDERS and not DRY_RUN:
-                params = exchange_specific_params(side_to_close, is_close=True)
-                ex.create_order(SYMBOL,"market",side_to_close,qty_to_close,None,params)
-            time.sleep(CLOSE_VERIFY_WAIT_S)
-            left_qty, _, _ = _read_position()
-            if left_qty <= 0:
-                px = price_now() or STATE.get("entry")
-                entry_px = STATE.get("entry") or exch_entry or px
-                side = STATE.get("side") or exch_side or ("long" if side_to_close=="sell" else "short")
-                qty  = exch_qty
-                pnl  = (px - entry_px) * qty * (1 if side=="long" else -1)
-                compound_pnl += pnl
-                log_i(f"STRICT CLOSE {side} reason={reason} pnl={fmt(pnl)} total={fmt(compound_pnl)}")
-                logging.info(f"STRICT_CLOSE {side} pnl={pnl} total={compound_pnl}")
-                _reset_after_close(reason, prev_side=side)
-                return
-            qty_to_close = safe_qty(left_qty)
-            attempts += 1
-            log_w(f"strict close retry {attempts}/{CLOSE_RETRY_ATTEMPTS} — residual={fmt(left_qty,4)}")
-            time.sleep(CLOSE_VERIFY_WAIT_S)
-        except Exception as e:
-            last_error = e; logging.error(f"close_market_strict attempt {attempts+1}: {e}"); attempts += 1; time.sleep(CLOSE_VERIFY_WAIT_S)
-    log_e(f"STRICT CLOSE FAILED after {CLOSE_RETRY_ATTEMPTS} attempts — last error: {last_error}")
-    logging.critical(f"STRICT CLOSE FAILED — last_error={last_error}")
-
-def _reset_after_close(reason, prev_side=None):
-    """إعادة تعيين الحالة بعد الإغلاق"""
-    global wait_for_next_signal_side
-    prev_side = prev_side or STATE.get("side")
-    STATE.update({
-        "open": False, "side": None, "entry": None, "qty": 0.0,
-        "pnl": 0.0, "bars": 0, "trail": None, "breakeven": None,
-        "tp1_done": False, "highest_profit_pct": 0.0, "profit_targets_achieved": 0,
-        "trail_tightened": False, "partial_taken": False,
-        "zone": None, "entry_reason": None
-    })
-    
-    # بعد إغلاق الصفقة بالكامل فعّل تبريد 10 دقائق
-    now = time.time()
-    STATE["cooldown_until"] = now + COOLDOWN_SECONDS
-    print(f"🧊 COOLDOWN ACTIVE for 10 minutes (until {STATE['cooldown_until']}) بسبب: {reason}", flush=True)
-    
-    save_state({"in_position": False, "position_qty": 0})
-    
-    # تفعيل انتظار الإشارة التالية
-    _arm_wait_after_close(prev_side)
-    logging.info(f"AFTER_CLOSE waiting_for={wait_for_next_signal_side}")
+# استبدال دالة الإغلاق الأساسية بالمحسنة
+close_market_strict = enhanced_close_market_strict
 
 # =================== ENHANCED TRADE MANAGEMENT ===================
 def manage_after_entry_professional(df, ind, info):
@@ -3715,9 +4466,9 @@ def log_professional_decision(council_data, decision):
     
     print(f"{C['c']}{'─' * 80}{C['rst']}", flush=True)
 
-# =================== PROFESSIONAL TRADE LOOP ===================
-def trade_loop_professional_with_smc_enhanced():
-    """حلقة تداول محسنة مع المحرك الجديد"""
+# =================== ENHANCED TRADE LOOP WITH POST-ANALYSIS ===================
+def trade_loop_professional_with_smc_and_post_analysis():
+    """حلقة تداول محسنة مع تحليل ما بعد الإغلاق"""
     global wait_for_next_signal_side
     loop_i = 0
     last_htf_update = 0
@@ -3728,10 +4479,15 @@ def trade_loop_professional_with_smc_enhanced():
             bal = balance_usdt()
             px = price_now()
             df = fetch_ohlcv()
+            
+            if df.empty:
+                time.sleep(BASE_SLEEP)
+                continue
+                
             info = rf_signal_live(df)
             ind = compute_indicators(df)
             
-            # تحديث HTF كل 5 دقائق (لتجنب rate limit)
+            # تحديث HTF كل 5 دقائق
             current_time = time.time()
             htf_context = None
             if current_time - last_htf_update > 300:
@@ -3787,7 +4543,7 @@ def trade_loop_professional_with_smc_enhanced():
                             STATE["zone"] = override_decision["zone"]
                             STATE["entry_reason"] = override_decision["reason"]
                 
-                # 2. دخول عادي من Council (إذا لم يكن هناك override)
+                # 2. دخول عادي من Council
                 elif council["score_b"] >= ULTIMATE_MIN_CONFIDENCE and council["score_b"] > council["score_s"] + 2.0:
                     decision = "BUY"
                     qty = compute_size(bal, px or info["price"])
@@ -3801,6 +4557,17 @@ def trade_loop_professional_with_smc_enhanced():
                         open_market("sell", qty, px or info["price"])
             
             loop_i += 1
+            
+            # التحقق من وجود تحليل ما بعد الإغلاق نشط
+            if (STATE.get("post_close_analysis_start") and 
+                POST_CLOSURE_ANALYSIS_ENABLED and 
+                not STATE["open"]):
+                
+                analysis_duration = time.time() - STATE["post_close_analysis_start"]
+                if analysis_duration < 300:  # 5 دقائق كحد أقصى للتحليل
+                    # يمكن هنا إضافة أي منطق إضافي للتحليل المستمر
+                    pass
+            
             sleep_s = NEAR_CLOSE_S if time_to_candle_close(df) <= 10 else BASE_SLEEP
             time.sleep(sleep_s)
             
@@ -3808,15 +4575,16 @@ def trade_loop_professional_with_smc_enhanced():
             throttled_log("error", f"خطأ في الحلقة: {e}")
             time.sleep(BASE_SLEEP)
 
-# تحديث الحلقة الرئيسية
-trade_loop = trade_loop_professional_with_smc_enhanced
+# تحديث حلقة التداول الرئيسية
+trade_loop = trade_loop_professional_with_smc_and_post_analysis
 
 # =================== API / KEEPALIVE ===================
 app = Flask(__name__)
 @app.route("/")
 def home():
     mode='LIVE' if MODE_LIVE else 'PAPER'
-    return f"✅ SUI Council PROFESSIONAL Bot v8.0 — {EXCHANGE_NAME.upper()} — {SYMBOL} {INTERVAL} — {mode} — Multi-Exchange — Enhanced with MA Stack + HTF Analysis"
+    post_analysis = 'ENABLED' if POST_CLOSURE_ANALYSIS_ENABLED else 'DISABLED'
+    return f"✅ SUI Council PROFESSIONAL Bot v8.0 — {EXCHANGE_NAME.upper()} — {SYMBOL} {INTERVAL} — {mode} — Multi-Exchange — Enhanced with Post-Closure Analysis ({post_analysis})"
 
 @app.route("/metrics")
 def metrics():
@@ -3827,6 +4595,11 @@ def metrics():
         "state": STATE, "compound_pnl": compound_pnl,
         "entry_mode": "PROFESSIONAL_COUNCIL_WITH_SMC_AND_HTF", 
         "wait_for_next_signal": wait_for_next_signal_side,
+        "post_closure_analysis": {
+            "enabled": POST_CLOSURE_ANALYSIS_ENABLED,
+            "active": STATE.get("post_close_analysis_active", False),
+            "last_trade": STATE.get("last_closed_trade")
+        },
         "guards": {"max_spread_bps": MAX_SPREAD_BPS, "final_chunk_qty": FINAL_CHUNK_QTY}
     })
 
@@ -3837,7 +4610,11 @@ def health():
         "open": STATE["open"], "side": STATE["side"], "qty": STATE["qty"],
         "compound_pnl": compound_pnl, "timestamp": datetime.utcnow().isoformat(),
         "entry_mode": "PROFESSIONAL_COUNCIL_WITH_SMC_AND_HTF", 
-        "wait_for_next_signal": wait_for_next_signal_side
+        "wait_for_next_signal": wait_for_next_signal_side,
+        "post_closure_analysis": {
+            "enabled": POST_CLOSURE_ANALYSIS_ENABLED,
+            "active": STATE.get("post_close_analysis_active", False)
+        }
     }), 200
 
 def keepalive_loop():
@@ -3880,7 +4657,9 @@ if __name__ == "__main__":
     print(f"   • Daily Open Bias + Zone Engine (Golden/OB/FVG)")
     print(f"   • Professional Trade Plans (Scalp/Mid/Trend)")
     print(f"   • Fail-Fast Wrong Zone Detection")
+    print(f"   • Advanced Post-Closure Analysis Brain (4 Strategies)")
     print(f"   • Enhanced Logging with Throttle")
+    print(f"{C['g']}🧠 POST-CLOSURE ANALYSIS: {'✅ ENABLED' if POST_CLOSURE_ANALYSIS_ENABLED else '❌ DISABLED'}{C['rst']}")
     print(f"{C['g']}🚀 EXECUTION: {'ACTIVE' if EXECUTE_ORDERS and not DRY_RUN else 'SIMULATION'}{C['rst']}")
     
     # بدء الحلقة الرئيسية
