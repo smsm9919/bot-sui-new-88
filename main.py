@@ -7,6 +7,7 @@ SUI Trend Master Bot — MULTI-EXCHANGE (BingX & Bybit)
 • Smart Entry after Stop Hunts + Confirmation
 • Professional Logging with Trade Plans
 • Multi-Exchange Support: BingX & Bybit
+• Enhanced Liquidity + SMC + Explosion/Collapse Engine
 """
 
 import os, time, math, random, signal, sys, traceback, logging, json
@@ -17,6 +18,7 @@ import numpy as np
 import ccxt
 from flask import Flask, jsonify
 from decimal import Decimal, ROUND_DOWN, InvalidOperation
+from dataclasses import dataclass
 
 try:
     from termcolor import colored
@@ -50,7 +52,7 @@ SHADOW_MODE_DASHBOARD = False
 DRY_RUN = False
 
 # ==== Addon: Logging + Recovery Settings ====
-BOT_VERSION = f"SUI Trend Master v5.0 — {EXCHANGE_NAME.upper()} Multi-Exchange"
+BOT_VERSION = f"SUI Trend Master v6.0 — {EXCHANGE_NAME.upper()} Multi-Exchange"
 print("🔁 Booting:", BOT_VERSION, flush=True)
 
 STATE_PATH = "./bot_state.json"
@@ -190,6 +192,141 @@ def load_state() -> dict:
         log_w(f"state load failed: {e}")
     return {}
 
+# =================== LIQUIDITY SNAPSHOT BUILDER ===================
+@dataclass
+class LiquiditySnap:
+    side_hint: str              # "BUY" / "SELL" / "NEUTRAL"
+    sweep_high: bool
+    sweep_low: bool
+    sweep_price: float
+    sweep_ref: float
+    vol_spike_x: float
+    delta: float
+    cvd: float
+    imb: float
+    buy_walls: list             # [(price, qty), ...]
+    sell_walls: list
+    vwap_bias: str              # "Above" / "Below" / "Near"
+    htf_bias: str               # "UP" / "DOWN" / "MIX"
+    note: str                   # human reasons
+
+def _fmt_walls(walls, n=3):
+    if not walls:
+        return "[]"
+    cut = walls[:n]
+    return "[" + ", ".join([f"{p:.6f}@{int(q)}" for p, q in cut]) + "]"
+
+def build_liquidity_snapshot(ctx: dict) -> LiquiditySnap:
+    """
+    ctx: أي قاموس/هيكل عندك فيه نواتج:
+      - orderbook / bookmap: imb, buy_walls, sell_walls
+      - flow: delta, cvd, z, flow_side
+      - sweep: sweep_high/low, sweep_price, sweep_ref
+      - vwap bias
+      - htf bias
+      - volume spike x
+    """
+    sweep_high = bool(ctx.get("sweep_high", False))
+    sweep_low  = bool(ctx.get("sweep_low", False))
+    sweep_price = float(ctx.get("sweep_price", 0.0) or 0.0)
+    sweep_ref   = float(ctx.get("sweep_ref", 0.0) or 0.0)
+
+    delta = float(ctx.get("delta", 0.0) or 0.0)
+    cvd   = float(ctx.get("cvd", 0.0) or 0.0)
+    imb   = float(ctx.get("imb", 1.0) or 1.0)
+
+    buy_walls  = ctx.get("buy_walls", []) or []
+    sell_walls = ctx.get("sell_walls", []) or []
+
+    vol_spike_x = float(ctx.get("vol_spike_x", 0.0) or 0.0)
+    vwap_bias   = str(ctx.get("vwap_bias", "Near"))
+    htf_bias    = str(ctx.get("htf_bias", "MIX"))
+
+    # Side hint (سيولة + فلو + سويب)
+    hint = "NEUTRAL"
+    reasons = []
+
+    if sweep_low:
+        reasons.append("SweepLow")
+    if sweep_high:
+        reasons.append("SweepHigh")
+
+    # imbalance: >1 يعني ميول شراء، <1 ميول بيع (حسب تعريفك)
+    if imb >= 1.15:
+        reasons.append("ImbBuy")
+    elif imb <= 0.87:
+        reasons.append("ImbSell")
+
+    if delta > 0:
+        reasons.append("Δ+")
+    elif delta < 0:
+        reasons.append("Δ-")
+
+    if vol_spike_x >= 1.5:
+        reasons.append("VolSpike")
+
+    # قرار hint
+    buy_score = 0
+    sell_score = 0
+    if sweep_low: buy_score += 2
+    if sweep_high: sell_score += 2
+    if imb >= 1.15: buy_score += 1
+    if imb <= 0.87: sell_score += 1
+    if delta > 0: buy_score += 1
+    if delta < 0: sell_score += 1
+    if vwap_bias == "Above": buy_score += 1
+    if vwap_bias == "Below": sell_score += 1
+    if htf_bias == "UP": buy_score += 1
+    if htf_bias == "DOWN": sell_score += 1
+
+    if buy_score >= sell_score + 2:
+        hint = "BUY"
+    elif sell_score >= buy_score + 2:
+        hint = "SELL"
+
+    note = ",".join(reasons) if reasons else "-"
+
+    return LiquiditySnap(
+        side_hint=hint,
+        sweep_high=sweep_high,
+        sweep_low=sweep_low,
+        sweep_price=sweep_price,
+        sweep_ref=sweep_ref,
+        vol_spike_x=vol_spike_x,
+        delta=delta,
+        cvd=cvd,
+        imb=imb,
+        buy_walls=buy_walls,
+        sell_walls=sell_walls,
+        vwap_bias=vwap_bias,
+        htf_bias=htf_bias,
+        note=note
+    )
+
+def log_liquidity_snapshot(logger, snap: LiquiditySnap, symbol: str, price: float):
+    """لوج السيولة المحسّن"""
+    # Emoji + لون حسب hint
+    if snap.side_hint == "BUY":
+        tag = "🟢 LIQ"
+    elif snap.side_hint == "SELL":
+        tag = "🔴 LIQ"
+    else:
+        tag = "🟡 LIQ"
+
+    msg = (
+        f"{tag} {symbol} px={price:.6f} | hint={snap.side_hint} | "
+        f"Sweep(H={int(snap.sweep_high)} L={int(snap.sweep_low)} "
+        f"{snap.sweep_price:.6f}>{snap.sweep_ref:.6f}) | "
+        f"VolSpike×={snap.vol_spike_x:.2f} | "
+        f"Δ={snap.delta:.0f} CVD={snap.cvd:.0f} | "
+        f"Imb={snap.imb:.2f} | "
+        f"BuyWalls={_fmt_walls(snap.buy_walls)} | "
+        f"SellWalls={_fmt_walls(snap.sell_walls)} | "
+        f"VWAP={snap.vwap_bias} HTF={snap.htf_bias} | why={snap.note}"
+    )
+    logger.info(msg)
+    print(f"💧 {msg}", flush=True)
+
 # =================== EXCHANGE FACTORY ===================
 def make_ex():
     """Factory function for multi-exchange support"""
@@ -246,7 +383,7 @@ def load_market_specs():
         MARKET = ex.markets.get(SYMBOL, {})
         AMT_PREC = int((MARKET.get("precision", {}) or {}).get("amount", 0) or 0)
         LOT_STEP = (MARKET.get("limits", {}) or {}).get("amount", {}).get("step", None)
-        LOT_MIN  = (MARKET.get("limits", {}) or {}).get("amount", {}).get("min",  None)
+        LOT_MIN  = (MARKET.get("limits", {}) or {}).get("amount", {}).get("min", None)
         log_i(f"🎯 {SYMBOL} specs → precision={AMT_PREC}, step={LOT_STEP}, min={LOT_MIN}")
     except Exception as e:
         log_w(f"load_market_specs: {e}")
@@ -801,6 +938,271 @@ def _is_reversal(df, ind, side):
     except Exception:
         return False
 
+# =================== LIQUIDITY + SMC ENGINE (STEP 2) ===================
+def _sma(s: pd.Series, n: int):
+    return s.rolling(n).mean()
+
+def liquidity_ctx(df: pd.DataFrame, atr: float, lookback=60):
+    """
+    Liquidity read:
+    - Pools: recent swing highs/lows zones
+    - Sweep: wick breach + close back inside
+    - Accumulation/Distribution: ATR compression + volume behavior
+    """
+    if len(df) < max(lookback, 30):
+        return {"ok": False, "state": "NO_DATA"}
+
+    h = df["high"].astype(float)
+    l = df["low"].astype(float)
+    c = df["close"].astype(float)
+    o = df["open"].astype(float)
+    v = df["volume"].astype(float)
+
+    cur = float(c.iloc[-1])
+    prev_high = float(h.iloc[-lookback:-1].max())
+    prev_low  = float(l.iloc[-lookback:-1].min())
+
+    # wick ratios
+    last_h = float(h.iloc[-1]); last_l = float(l.iloc[-1])
+    last_o = float(o.iloc[-1]); last_c = float(c.iloc[-1])
+    rng = max(last_h - last_l, 1e-12)
+    upper_w = last_h - max(last_o, last_c)
+    lower_w = min(last_o, last_c) - last_l
+    upper_ratio = upper_w / rng
+    lower_ratio = lower_w / rng
+
+    vma = float(_sma(v, 20).iloc[-1]) if len(df) >= 20 else float(v.mean())
+    vol_ratio = (float(v.iloc[-1]) / max(vma, 1e-12))
+
+    # Sweep detection (stop-hunt)
+    sweep_down = (last_l < prev_low) and (last_c > prev_low) and (lower_ratio >= 0.55) and (vol_ratio >= 1.10)
+    sweep_up   = (last_h > prev_high) and (last_c < prev_high) and (upper_ratio >= 0.55) and (vol_ratio >= 1.10)
+
+    sweep = None
+    if sweep_down:
+        sweep = {"dir": "BUY", "level": prev_low, "wick_ratio": lower_ratio, "vol_ratio": vol_ratio}
+    elif sweep_up:
+        sweep = {"dir": "SELL", "level": prev_high, "wick_ratio": upper_ratio, "vol_ratio": vol_ratio}
+
+    # Compression (accumulation) vs expansion
+    # compression: ATR low vs its MA, candles small
+    atr_series = df["high"].astype(float).sub(df["low"].astype(float)).rolling(14).mean()
+    atr_ma = float(_sma(atr_series, 20).iloc[-1]) if len(df) >= 40 else float(atr_series.iloc[-1])
+    compression = (atr_ma > 0 and atr_series.iloc[-1] < 0.75 * atr_ma and vol_ratio < 1.2)
+
+    state = "NEUTRAL"
+    if sweep:
+        state = "SWEEP_" + sweep["dir"]
+    elif compression:
+        state = "ACCUMULATION"
+
+    return {
+        "ok": True,
+        "price": cur,
+        "prev_high": prev_high,
+        "prev_low": prev_low,
+        "vol_ratio": float(vol_ratio),
+        "upper_w_ratio": float(upper_ratio),
+        "lower_w_ratio": float(lower_ratio),
+        "sweep": sweep,
+        "state": state
+    }
+
+def smc_ctx(df: pd.DataFrame, atr: float):
+    """
+    Lightweight SMC:
+    - BOS: break recent high/low
+    - OB: last opposite candle before displacement
+    - FVG: simple 3-candle gap
+    """
+    out = {"ok": False}
+    if len(df) < 40:
+        return out
+
+    # BOS
+    bos_buy, bos_buy_meta = detect_structure_shift(df, "buy", lookback=30)
+    bos_sell, bos_sell_meta = detect_structure_shift(df, "sell", lookback=30)
+
+    # OB
+    ob_buy  = detect_order_block(df, "buy", window=6)
+    ob_sell = detect_order_block(df, "sell", window=6)
+
+    # FVG
+    fvg_buy  = detect_fvg(df, "buy")
+    fvg_sell = detect_fvg(df, "sell")
+
+    out.update({
+        "ok": True,
+        "bos": {"buy": bos_buy, "sell": bos_sell, "buy_meta": bos_buy_meta, "sell_meta": bos_sell_meta},
+        "ob": {"buy": ob_buy, "sell": ob_sell},
+        "fvg": {"buy": fvg_buy, "sell": fvg_sell},
+    })
+    return out
+
+def log_liquidity_ctx(liq: dict, smc: dict):
+    if not liq or not liq.get("ok"):
+        log_i("💧 Liquidity: n/a")
+        return
+
+    sweep = liq.get("sweep")
+    if sweep:
+        log_g(
+            f"💧 LIQ SWEEP {sweep['dir']} | level={sweep['level']:.6f} "
+            f"wick={sweep['wick_ratio']:.2f} vol×={sweep['vol_ratio']:.2f} | state={liq['state']}"
+        )
+    else:
+        log_i(
+            f"💧 Liquidity | state={liq['state']} "
+            f"| prevH={liq['prev_high']:.6f} prevL={liq['prev_low']:.6f} "
+            f"| vol×={liq['vol_ratio']:.2f} wickU={liq['upper_w_ratio']:.2f} wickD={liq['lower_w_ratio']:.2f}"
+        )
+
+    if smc and smc.get("ok"):
+        bos = smc.get("bos", {})
+        ob  = smc.get("ob", {})
+        fvg = smc.get("fvg", {})
+        log_i(
+            f"🧱 SMC | BOS(buy={bos.get('buy')}, sell={bos.get('sell')}) "
+            f"| OB(buy={'Y' if ob.get('buy') else 'n'}, sell={'Y' if ob.get('sell') else 'n'}) "
+            f"| FVG(buy={'Y' if fvg.get('buy') else 'n'}, sell={'Y' if fvg.get('sell') else 'n'})"
+        )
+
+# =================== EXPLOSION / COLLAPSE ENGINE (STEP 3) ===================
+def explosion_collapse_ctx(df: pd.DataFrame, atr: float, lookback=40):
+    if len(df) < lookback + 5:
+        return {"ok": False, "state": "NO_DATA"}
+
+    o = df["open"].astype(float)
+    h = df["high"].astype(float)
+    l = df["low"].astype(float)
+    c = df["close"].astype(float)
+    v = df["volume"].astype(float)
+
+    cur_o = float(o.iloc[-1]); cur_c = float(c.iloc[-1])
+    cur_h = float(h.iloc[-1]); cur_l = float(l.iloc[-1])
+    rng = max(cur_h - cur_l, 1e-12)
+    body = abs(cur_c - cur_o)
+
+    # volume spike
+    vma = float(v.rolling(20).mean().iloc[-1]) if len(df) >= 30 else float(v.mean())
+    vol_x = float(v.iloc[-1]) / max(vma, 1e-12)
+
+    # displacement = candle range big vs ATR
+    atr = float(atr or 0.0)
+    disp = (atr > 0 and rng >= 1.6 * atr and body >= 0.55 * rng and vol_x >= 1.4)
+
+    # breakout levels
+    prev_high = float(h.iloc[-lookback:-1].max())
+    prev_low  = float(l.iloc[-lookback:-1].min())
+
+    breakout_up   = disp and (cur_c > prev_high)
+    breakout_down = disp and (cur_c < prev_low)
+
+    # Liquidity drain (انهيار): كسر + إغلاق قرب القاع + حجم
+    drain_down = (cur_c < prev_low) and (body >= 0.6*rng) and (vol_x >= 1.6)
+    drain_up   = (cur_c > prev_high) and (body >= 0.6*rng) and (vol_x >= 1.6)
+
+    if breakout_up:
+        return {"ok": True, "state": "EXPLOSION_UP", "side": "BUY", "level": prev_high, "vol_x": vol_x, "disp": True}
+    if breakout_down:
+        return {"ok": True, "state": "EXPLOSION_DOWN", "side": "SELL", "level": prev_low, "vol_x": vol_x, "disp": True}
+
+    if drain_down:
+        return {"ok": True, "state": "DRAIN_DOWN", "side": "SELL", "level": prev_low, "vol_x": vol_x, "disp": False}
+    if drain_up:
+        return {"ok": True, "state": "DRAIN_UP", "side": "BUY", "level": prev_high, "vol_x": vol_x, "disp": False}
+
+    return {"ok": True, "state": "NONE", "vol_x": vol_x, "disp": bool(disp)}
+
+def log_explode(xc: dict):
+    if not xc or not xc.get("ok"):
+        return
+    st = xc.get("state")
+    if st and st != "NONE":
+        log_g(f"💥 STEP3 {st} | side={xc.get('side')} level={xc.get('level',0):.6f} vol×={xc.get('vol_x',0):.2f}")
+    else:
+        log_i(f"💥 STEP3 none | vol×={xc.get('vol_x',0):.2f} disp={xc.get('disp')}")
+
+# =================== ENTRY GATE FROM LIQUIDITY/SMC/STEP3 ===================
+def entry_gate_from_liq_smc_xc(snap: dict, desired: str, mode: str):
+    """
+    بوابة دخول تعتمد على Liquidity + SMC + Step3
+    desired: "buy" أو "sell"
+    mode: "MID_TREND" أو "BIG_TREND"
+    """
+    liq = snap.get("liq", {})
+    smc = snap.get("smc", {})
+    xc  = snap.get("xc", {})
+
+    score = 0
+    reasons = []
+
+    # 1) Sweep
+    sw = liq.get("sweep")
+    if sw and sw.get("dir") == ("BUY" if desired=="buy" else "SELL"):
+        score += 1; reasons.append("LIQ_SWEEP")
+
+    # 2) BOS
+    bos = smc.get("bos", {})
+    if desired=="buy" and bos.get("buy"):
+        score += 1; reasons.append("BOS_UP")
+    if desired=="sell" and bos.get("sell"):
+        score += 1; reasons.append("BOS_DOWN")
+
+    # 3) Step3 explosion/drain
+    if xc and xc.get("ok") and xc.get("side"):
+        if (desired=="buy" and xc["side"]=="BUY") or (desired=="sell" and xc["side"]=="SELL"):
+            score += 1; reasons.append(xc.get("state","STEP3"))
+
+    need = 2 if mode=="MID_TREND" else 3
+    ok = score >= need
+
+    return ok, score, reasons
+
+# =================== POSITION SYNC GUARD ===================
+def exchange_has_position():
+    """التحقق من وجود Position فعلي على Exchange"""
+    try:
+        if EXCHANGE_NAME == "bybit":
+            positions = ex.fetch_positions([SYMBOL])
+        else:
+            positions = ex.fetch_positions()
+        
+        for pos in positions:
+            symbol = pos.get('symbol') or pos.get('info', {}).get('symbol')
+            if symbol and SYMBOL in symbol:
+                contracts = float(pos.get('contracts') or pos.get('size') or 0)
+                if abs(contracts) > 0:
+                    side = "long" if contracts > 0 else "short"
+                    return True, side, abs(contracts)
+        return False, None, 0.0
+    except Exception as e:
+        log_w(f"position sync warn: {e}")
+        return None, None, 0.0  # unknown
+
+def sync_state_with_exchange():
+    """مزامنة حالة البوت مع الواقع على Exchange"""
+    has, side, qty = exchange_has_position()
+    
+    if has is True and not STATE.get("open"):
+        log_w(f"🔁 SYNC: exchange has position but STATE closed → repairing | {side} qty={qty}")
+        STATE["open"] = True
+        STATE["side"] = side
+        STATE["qty"] = qty
+        # محاولة جلب سعر الدخول
+        try:
+            ticker = ex.fetch_ticker(SYMBOL)
+            STATE["entry"] = ticker.get('last', 0)
+        except:
+            pass
+            
+    if has is False and STATE.get("open"):
+        log_w("🔁 SYNC: STATE open but exchange has no position → forcing STATE close")
+        STATE["open"] = False
+        STATE["side"] = None
+        STATE["qty"] = 0.0
+        STATE["entry"] = None
+
 # =================== ENHANCED COUNCIL VOTING ===================
 def council_votes_pro_enhanced(df):
     """مجلس تصويت محسّن مع RSI+MA والمناطق الذهبية + الشموع"""
@@ -1103,6 +1505,7 @@ def compute_flow_metrics(df):
 def emit_snapshots(exchange, symbol, df, balance_fn=None, pnl_fn=None):
     """
     يطبع Snapshot موحّد: Bookmap + Flow + Council + Strategy + Balance/PnL
+    + Liquidity + SMC + Step3 Engine
     """
     try:
         bm = bookmap_snapshot(exchange, symbol)
@@ -1110,7 +1513,17 @@ def emit_snapshots(exchange, symbol, df, balance_fn=None, pnl_fn=None):
         cv = council_votes_pro(df)
         mode = decide_strategy_mode(df)
         gz = golden_zone_check(df, {"adx": cv["ind"]["adx"]}, "buy" if cv["b"]>=cv["s"] else "sell")
-
+        
+        # حساب Indicators
+        ind = compute_indicators(df)
+        
+        # ===== STEP 2: Liquidity + SMC Engine =====
+        liq = liquidity_ctx(df, ind.get("atr", 0.0))
+        smc = smc_ctx(df, ind.get("atr", 0.0))
+        
+        # ===== STEP 3: Explosion/Collapse Engine =====
+        xc = explosion_collapse_ctx(df, ind.get("atr", 0.0))
+        
         bal = None; cpnl = None
         if callable(balance_fn):
             try: bal = balance_fn()
@@ -1155,6 +1568,37 @@ def emit_snapshots(exchange, symbol, df, balance_fn=None, pnl_fn=None):
             print(f"📊 {dash}{gz_note}", flush=True)
             print(f"{strat}{(' | ' + wallet) if wallet else ''}", flush=True)
             
+            # ===== Liquidity/SMC/Step3 Logs =====
+            log_liquidity_ctx(liq, smc)
+            log_explode(xc)
+            
+            # ===== Liquidity Snapshot بناءً على السياق =====
+            ctx = {
+                "imb": bm["imbalance"] if bm.get("ok") else 1.0,
+                "buy_walls": bm.get("buy_walls", []) if bm.get("ok") else [],
+                "sell_walls": bm.get("sell_walls", []) if bm.get("ok") else [],
+                "delta": flow.get("delta_last", 0) if flow.get("ok") else 0,
+                "cvd": flow.get("cvd_last", 0) if flow.get("ok") else 0,
+                "sweep_high": liq.get("sweep", {}).get("dir") == "SELL" if liq.get("sweep") else False,
+                "sweep_low": liq.get("sweep", {}).get("dir") == "BUY" if liq.get("sweep") else False,
+                "sweep_price": liq.get("sweep", {}).get("level", 0) if liq.get("sweep") else 0,
+                "sweep_ref": liq.get("prev_high", 0) if liq.get("sweep", {}).get("dir") == "SELL" else liq.get("prev_low", 0) if liq.get("sweep", {}).get("dir") == "BUY" else 0,
+                "vol_spike_x": liq.get("vol_ratio", 0),
+                "vwap_bias": "Near",  # يمكن حساب VWAP لاحقًا
+                "htf_bias": side_hint
+            }
+            
+            snap = build_liquidity_snapshot(ctx)
+            log_liquidity_snapshot(logging, snap, SYMBOL, price_now() or df["close"].iloc[-1])
+            
+            # ===== تحذير لو السيولة ضد المركز المفتوح =====
+            if STATE.get("open"):
+                position_side = STATE.get("side")
+                if position_side == "long" and snap.side_hint == "SELL":
+                    log_w("⚠️ LIQ AGAINST LONG: possible trap / reversal")
+                if position_side == "short" and snap.side_hint == "BUY":
+                    log_w("⚠️ LIQ AGAINST SHORT: possible trap / reversal")
+
             gz_snap_note = ""
             if gz and gz.get("ok"):
                 zone_type = gz["zone"]["type"]
@@ -1171,11 +1615,15 @@ def emit_snapshots(exchange, symbol, df, balance_fn=None, pnl_fn=None):
             
             print("✅ ADDONS LIVE", flush=True)
 
-        return {"bm": bm, "flow": flow, "cv": cv, "mode": mode, "gz": gz, "wallet": wallet}
+        return {
+            "bm": bm, "flow": flow, "cv": cv, "mode": mode, "gz": gz, 
+            "wallet": wallet, "ind": ind, "liq": liq, "smc": smc, "xc": xc
+        }
     except Exception as e:
         print(f"🟨 AddonLog error: {e}", flush=True)
         return {"bm": None, "flow": None, "cv": {"b":0,"s":0,"score_b":0.0,"score_s":0.0,"ind":{}},
-                "mode": {"mode":"n/a"}, "gz": None, "wallet": ""}
+                "mode": {"mode":"n/a"}, "gz": None, "wallet": "", 
+                "ind": {}, "liq": {}, "smc": {}, "xc": {}}
 
 # =================== EXECUTION MANAGER ===================
 def execute_trade_decision(side, price, qty, mode, council_data, gz_data):
@@ -1248,6 +1696,14 @@ def open_market_enhanced(side, qty, price):
     
     mode = mode_data["mode"]
     gz = snap["gz"]
+    
+    # ===== التحقق من بوابة الدخول =====
+    ok, score, reasons = entry_gate_from_liq_smc_xc(snap, side, mode)
+    if not ok:
+        log_w(f"⛔ ENTRY BLOCKED by LIQ/SMC/STEP3 | side={side} mode={mode} score={sc}/{2 if mode=='MID_TREND' else 3} reasons={rs}")
+        return False
+    else:
+        log_g(f"✅ ENTRY PASS LIQ/SMC/STEP3 | side={side} mode={mode} score={sc} reasons={rs}")
     
     management_config = setup_trade_management(mode)
     
@@ -1720,6 +2176,9 @@ def trade_loop_enhanced():
     
     while True:
         try:
+            # ===== Sync Position with Exchange =====
+            sync_state_with_exchange()
+            
             # جمع البيانات الأساسية
             bal = balance_usdt()
             px = price_now()
@@ -1840,52 +2299,62 @@ def trade_loop_enhanced():
                     final_signal = None
             
             if not STATE["open"] and final_signal and reason is None:
-                # التحقق من سياسة الانتظار
-                allow_wait, wait_reason = wait_gate_allow(df, info)
-                if not allow_wait:
-                    reason = wait_reason
+                # ===== بوابة الدخول من Liquidity/SMC/Step3 =====
+                mode = classify_trend_mode(ind)
+                ok, score, reasons = entry_gate_from_liq_smc_xc(snap, final_signal, mode)
+                if not ok:
+                    reason = f"LIQ/SMC/STEP3 gate blocked: score={score}"
+                    log_w(f"⛔ ENTRY BLOCKED by LIQ/SMC/STEP3 | side={final_signal} mode={mode} score={score}/{2 if mode=='MID_TREND' else 3}")
                 else:
-                    qty = compute_size(bal, px or info["price"])
-                    if qty > 0:
-                        ok = open_market(final_signal, qty, px or info["price"])
-                        if ok:
-                            # ✅ Verify position exists on exchange
-                            try:
-                                pos = fetch_live_position(ex, SYMBOL)
-                                if not pos.get("ok") or pos.get("qty", 0) <= 0:
-                                    log_e("❌ EXEC VERIFY FAILED: order reported ok but exchange position=0. Aborting state/open.")
-                                    # reset local state
-                                    STATE["open"] = False
-                                    STATE["side"] = None
-                                    STATE["qty"] = 0.0
-                                    STATE["entry"] = None
-                                    final_signal = None
-                                    TREND_STATE["phase"] = "WAIT"
-                                    # تخطي إدارة الصفقة
-                                    continue
-                            except Exception as _:
-                                log_w("⚠️ EXEC VERIFY WARNING: couldn't read position after open (will continue cautiously).")
-
-                            wait_for_next_signal_side = None
-                            # تحديث حالة الترند
-                            TREND_STATE["phase"] = "ENTRY"
-                            TREND_STATE["dir"] = final_signal
-                            # بناء خطة جني الأرباح
-                            mode = classify_trend_mode(ind)
-                            TREND_STATE["mode"] = mode
-                            plan = build_tp_plan(mode)
-                            TREND_STATE["plan"] = plan
-                            # تسجيل الصفقة
-                            color_tag = "🟢" if final_signal=="buy" else "🔴"
-                            log_y(
-                                f"{color_tag} TRADE OPEN | {final_signal.upper()} | MODE={mode} "
-                                f"| HTF={htf_bias} | TP={plan['tp_levels']} "
-                                f"| frac={plan['fracs']} | reasons={entry_reasons}"
-                            )
-                        else:
-                            log_w("❌ Open failed")
+                    log_g(f"✅ ENTRY PASS LIQ/SMC/STEP3 | side={final_signal} mode={mode} score={score} reasons={reasons}")
+                
+                if ok:
+                    # التحقق من سياسة الانتظار
+                    allow_wait, wait_reason = wait_gate_allow(df, info)
+                    if not allow_wait:
+                        reason = wait_reason
                     else:
-                        reason = "qty<=0"
+                        qty = compute_size(bal, px or info["price"])
+                        if qty > 0:
+                            ok_open = open_market(final_signal, qty, px or info["price"])
+                            if ok_open:
+                                # ✅ Verify position exists on exchange
+                                try:
+                                    pos = fetch_live_position(ex, SYMBOL)
+                                    if not pos.get("ok") or pos.get("qty", 0) <= 0:
+                                        log_e("❌ EXEC VERIFY FAILED: order reported ok but exchange position=0. Aborting state/open.")
+                                        # reset local state
+                                        STATE["open"] = False
+                                        STATE["side"] = None
+                                        STATE["qty"] = 0.0
+                                        STATE["entry"] = None
+                                        final_signal = None
+                                        TREND_STATE["phase"] = "WAIT"
+                                        # تخطي إدارة الصفقة
+                                        continue
+                                except Exception as _:
+                                    log_w("⚠️ EXEC VERIFY WARNING: couldn't read position after open (will continue cautiously).")
+
+                                wait_for_next_signal_side = None
+                                # تحديث حالة الترند
+                                TREND_STATE["phase"] = "ENTRY"
+                                TREND_STATE["dir"] = final_signal
+                                # بناء خطة جني الأرباح
+                                mode = classify_trend_mode(ind)
+                                TREND_STATE["mode"] = mode
+                                plan = build_tp_plan(mode)
+                                TREND_STATE["plan"] = plan
+                                # تسجيل الصفقة
+                                color_tag = "🟢" if final_signal=="buy" else "🔴"
+                                log_y(
+                                    f"{color_tag} TRADE OPEN | {final_signal.upper()} | MODE={mode} "
+                                    f"| HTF={htf_bias} | TP={plan['tp_levels']} "
+                                    f"| frac={plan['fracs']} | reasons={entry_reasons}"
+                                )
+                            else:
+                                log_w("❌ Open failed")
+                        else:
+                            reason = "qty<=0"
             
             # اللوج الاحترافي
             if LOG_LEGACY:
@@ -1992,6 +2461,7 @@ if __name__ == "__main__":
     print(colored(f"💰 TP PLANS: MID (2 levels) | BIG (3 levels)", "yellow"))
     print(colored(f"🛡️ SAFETY: NO SCALP | NO WEAK | HTF CONFIRMATION", "yellow"))
     print(colored(f"🚀 EXECUTION: {'ACTIVE' if EXECUTE_ORDERS and not DRY_RUN else 'SIMULATION'}", "yellow"))
+    print(colored(f"💧 LIQUIDITY ENGINE: STEP2 (Sweep/BOS/OB/FVG) + STEP3 (Explosion/Collapse)", "yellow"))
     
     logging.info("service starting…")
     signal.signal(signal.SIGTERM, lambda *_: sys.exit(0))
