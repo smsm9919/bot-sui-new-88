@@ -165,6 +165,14 @@ MAX_TRADES_PER_HOUR = 6
 COOLDOWN_SECS_AFTER_CLOSE = 60
 ADX_GATE = 17
 
+# =================== SAFE VALUE HELPER ===================
+def safe(v, default=0.0):
+    """تحويل قيمة إلى عدد عائم بأمان، وإرجاع القيمة الافتراضية إذا فشل."""
+    try:
+        return float(v)
+    except (TypeError, ValueError):
+        return default
+
 # =================== PROFESSIONAL LOGGING ===================
 def log_i(msg): print(f"ℹ️ {msg}", flush=True)
 def log_g(msg): print(f"✅ {msg}", flush=True)
@@ -228,17 +236,17 @@ def build_liquidity_snapshot(ctx: dict) -> LiquiditySnap:
     """
     sweep_high = bool(ctx.get("sweep_high", False))
     sweep_low  = bool(ctx.get("sweep_low", False))
-    sweep_price = float(ctx.get("sweep_price", 0.0) or 0.0)
-    sweep_ref   = float(ctx.get("sweep_ref", 0.0) or 0.0)
+    sweep_price = safe(ctx.get("sweep_price", 0.0))
+    sweep_ref   = safe(ctx.get("sweep_ref", 0.0))
 
-    delta = float(ctx.get("delta", 0.0) or 0.0)
-    cvd   = float(ctx.get("cvd", 0.0) or 0.0)
-    imb   = float(ctx.get("imb", 1.0) or 1.0)
+    delta = safe(ctx.get("delta", 0.0))
+    cvd   = safe(ctx.get("cvd", 0.0))
+    imb   = safe(ctx.get("imb", 1.0))
 
     buy_walls  = ctx.get("buy_walls", []) or []
     sell_walls = ctx.get("sell_walls", []) or []
 
-    vol_spike_x = float(ctx.get("vol_spike_x", 0.0) or 0.0)
+    vol_spike_x = safe(ctx.get("vol_spike_x", 0.0))
     vwap_bias   = str(ctx.get("vwap_bias", "Near"))
     htf_bias    = str(ctx.get("htf_bias", "MIX"))
 
@@ -316,10 +324,10 @@ def log_liquidity_snapshot(logger, snap: LiquiditySnap, symbol: str, price: floa
     msg = (
         f"{tag} {symbol} px={price:.6f} | hint={snap.side_hint} | "
         f"Sweep(H={int(snap.sweep_high)} L={int(snap.sweep_low)} "
-        f"{snap.sweep_price:.6f}>{snap.sweep_ref:.6f}) | "
-        f"VolSpike×={snap.vol_spike_x:.2f} | "
-        f"Δ={snap.delta:.0f} CVD={snap.cvd:.0f} | "
-        f"Imb={snap.imb:.2f} | "
+        f"{safe(snap.sweep_price):.6f}>{safe(snap.sweep_ref):.6f}) | "
+        f"VolSpike×={safe(snap.vol_spike_x, 1.0):.2f} | "
+        f"Δ={safe(snap.delta):.0f} CVD={safe(snap.cvd):.0f} | "
+        f"Imb={safe(snap.imb):.2f} | "
         f"BuyWalls={_fmt_walls(snap.buy_walls)} | "
         f"SellWalls={_fmt_walls(snap.sell_walls)} | "
         f"VWAP={snap.vwap_bias} HTF={snap.htf_bias} | why={snap.note}"
@@ -1073,14 +1081,14 @@ def log_liquidity_ctx(liq: dict, smc: dict):
     sweep = liq.get("sweep")
     if sweep:
         log_g(
-            f"💧 LIQ SWEEP {sweep['dir']} | level={sweep['level']:.6f} "
-            f"wick={sweep['wick_ratio']:.2f} vol×={sweep['vol_ratio']:.2f} | state={liq['state']}"
+            f"💧 LIQ SWEEP {sweep['dir']} | level={safe(sweep.get('level')):.6f} "
+            f"wick={safe(sweep.get('wick_ratio')):.2f} vol×={safe(sweep.get('vol_ratio'), 1.0):.2f} | state={liq.get('state')}"
         )
     else:
         log_i(
-            f"💧 Liquidity | state={liq['state']} "
-            f"| prevH={liq['prev_high']:.6f} prevL={liq['prev_low']:.6f} "
-            f"| vol×={liq['vol_ratio']:.2f} wickU={liq['upper_w_ratio']:.2f} wickD={liq['lower_w_ratio']:.2f}"
+            f"💧 Liquidity | state={liq.get('state')} "
+            f"| prevH={safe(liq.get('prev_high')):.6f} prevL={safe(liq.get('prev_low')):.6f} "
+            f"| vol×={safe(liq.get('vol_ratio'), 1.0):.2f} wickU={safe(liq.get('upper_w_ratio')):.2f} wickD={safe(liq.get('lower_w_ratio')):.2f}"
         )
 
     if smc and smc.get("ok"):
@@ -1115,7 +1123,7 @@ def detect_explosion_collapse(df, ind, flow, bookmap):
     bookmap = bookmap or {}
 
     # === Price action ===
-    atr = float(ind.get("atr", 0))
+    atr = safe(ind.get("atr", 0))
     o = float(df["open"].iloc[-1])
     h = float(df["high"].iloc[-1])
     l = float(df["low"].iloc[-1])
@@ -1130,12 +1138,12 @@ def detect_explosion_collapse(df, ind, flow, bookmap):
     vol_spike = vol_ma > 0 and vol >= vol_ma * 1.8
 
     # === Flow ===
-    delta = flow.get("delta_last", 0)
-    z = flow.get("delta_z", 0)
+    delta = safe(flow.get("delta_last", 0))
+    z = safe(flow.get("delta_z", 0))
     cvd_trend = flow.get("cvd_trend", "")
 
     # === Bookmap ===
-    imb = bookmap.get("imbalance", 1.0)
+    imb = safe(bookmap.get("imbalance", 1.0))
 
     # === Wick ratios ===
     upper = h - max(o, c)
@@ -1198,7 +1206,7 @@ def explosion_collapse_ctx(df: pd.DataFrame, atr: float, lookback=40):
     vol_x = float(v.iloc[-1]) / max(vma, 1e-12)
 
     # displacement = candle range big vs ATR
-    atr = float(atr or 0.0)
+    atr = safe(atr or 0.0)
     disp = (atr > 0 and rng >= 1.6 * atr and body >= 0.55 * rng and vol_x >= 1.4)
 
     # breakout levels
@@ -1229,9 +1237,9 @@ def log_explode(xc: dict):
         return
     st = xc.get("state")
     if st and st != "NONE":
-        log_g(f"💥 STEP3 {st} | side={xc.get('side')} level={xc.get('level',0):.6f} vol×={xc.get('vol_x',0):.2f}")
+        log_g(f"💥 STEP3 {st} | side={xc.get('side')} level={safe(xc.get('level')):.6f} vol×={safe(xc.get('vol_x'), 1.0):.2f}")
     else:
-        log_i(f"💥 STEP3 none | vol×={xc.get('vol_x',0):.2f} disp={xc.get('disp')}")
+        log_i(f"💥 STEP3 none | vol×={safe(xc.get('vol_x'), 1.0):.2f} disp={xc.get('disp')}")
 
 # =================== CONTEXT INDICATORS (VWAP + ICHIMOKU) ===================
 def compute_vwap(df):
@@ -1655,10 +1663,10 @@ def fmt_liq_dash(liq: dict):
     if not liq or not liq.get("ok"):
         return "Liquidity: n/a"
     return (
-        f"Liquidity | state={liq.get('state')} | "
+        f"Liquidity | state={liq.get('state','n/a')} | "
         f"sweepL={liq.get('sweep_low')} sweepH={liq.get('sweep_high')} | "
-        f"wickU={liq.get('wick_up'):.2f} wickD={liq.get('wick_dn'):.2f} | "
-        f"vol×={liq.get('vol_x'):.2f} | "
+        f"wickU={safe(liq.get('wick_up')):.2f} wickD={safe(liq.get('wick_dn')):.2f} | "
+        f"vol×={safe(liq.get('vol_x'), 1.0):.2f} | "
         f"drain={liq.get('drain')}"
     )
 
@@ -1703,33 +1711,33 @@ def emit_snapshots(exchange, symbol, df, balance_fn=None, pnl_fn=None):
 
         if bm.get("ok"):
             imb_tag = "🟢" if bm["imbalance"]>=IMBALANCE_ALERT else ("🔴" if bm["imbalance"]<=1/IMBALANCE_ALERT else "⚖️")
-            bm_note = f"Bookmap: {imb_tag} Imb={bm['imbalance']:.2f} | Buy[{fmt_walls(bm['buy_walls'])}] | Sell[{fmt_walls(bm['sell_walls'])}]"
+            bm_note = f"Bookmap: {imb_tag} Imb={safe(bm['imbalance']):.2f} | Buy[{fmt_walls(bm['buy_walls'])}] | Sell[{fmt_walls(bm['sell_walls'])}]"
         else:
             bm_note = f"Bookmap: N/A ({bm.get('why')})"
 
         if flow.get("ok"):
             dtag = "🟢Buy" if flow["delta_last"]>0 else ("🔴Sell" if flow["delta_last"]<0 else "⚖️Flat")
             spk = " ⚡Spike" if flow["spike"] else ""
-            fl_note = f"Flow: {dtag} Δ={flow['delta_last']:.0f} z={flow['delta_z']:.2f}{spk} | CVD {'↗️' if flow['cvd_trend']=='up' else '↘️'} {flow['cvd_last']:.0f}"
+            fl_note = f"Flow: {dtag} Δ={safe(flow['delta_last']):.0f} z={safe(flow['delta_z']):.2f}{spk} | CVD {'↗️' if flow['cvd_trend']=='up' else '↘️'} {safe(flow['cvd_last']):.0f}"
         else:
             fl_note = f"Flow: N/A ({flow.get('why')})"
 
         side_hint = "BUY" if cv["b"]>=cv["s"] else "SELL"
-        dash = (f"DASH → hint-{side_hint} | Council BUY({cv['b']},{cv['score_b']:.1f}) "
-                f"SELL({cv['s']},{cv['score_s']:.1f}) | "
-                f"RSI={cv['ind'].get('rsi',0):.1f} ADX={cv['ind'].get('adx',0):.1f} "
-                f"DI={cv['ind'].get('di_spread',0):.1f}")
+        dash = (f"DASH → hint-{side_hint} | Council BUY({cv['b']},{safe(cv['score_b']):.1f}) "
+                f"SELL({cv['s']},{safe(cv['score_s']):.1f}) | "
+                f"RSI={safe(cv['ind'].get('rsi')):.1f} ADX={safe(cv['ind'].get('adx')):.1f} "
+                f"DI={safe(cv['ind'].get('di_spread')):.1f}")
 
         strat_icon = "📈" if mode["mode"]=="BIG_TREND" else "↗️" if mode["mode"]=="MID_TREND" else "ℹ️"
         strat = f"Strategy: {strat_icon} {mode['mode']}"
 
-        bal_note = f"Balance={bal:.2f}" if bal is not None else ""
-        pnl_note = f"CompoundPnL={cpnl:.6f}" if cpnl is not None else ""
+        bal_note = f"Balance={safe(bal):.2f}" if bal is not None else ""
+        pnl_note = f"CompoundPnL={safe(cpnl):.6f}" if cpnl is not None else ""
         wallet = (" | ".join(x for x in [bal_note, pnl_note] if x)) or ""
 
         gz_note = ""
         if gz and gz.get("ok"):
-            gz_note = f" | 🟡 {gz['zone']['type']} s={gz['score']:.1f}"
+            gz_note = f" | 🟡 {gz['zone']['type']} s={safe(gz['score']):.1f}"
 
         if LOG_ADDONS:
             print(f"🧱 {bm_note}", flush=True)
@@ -1760,13 +1768,14 @@ def emit_snapshots(exchange, symbol, df, balance_fn=None, pnl_fn=None):
             if exp.get("state"):
                 icon = "🔥" if exp["state"] == "EXPLOSION" else "🧊"
                 print(
-                    f"{icon} {exp['state']} | dir={exp['dir'].upper()} | Δ={exp['delta']:.0f} z={exp['z']:.2f} imb={exp['imb']:.2f} | "
-                    f"reasons={','.join(exp['reasons'])}",
+                    f"{icon} {exp['state']} | dir={exp.get('dir', '').upper()} | "
+                    f"Δ={safe(exp.get('delta')):.0f} z={safe(exp.get('z')):.2f} imb={safe(exp.get('imb')):.2f} | "
+                    f"reasons={','.join(exp.get('reasons', []))}",
                     flush=True
                 )
             
             # ===== Context Logs =====
-            print(f"🌫️ Context | VWAP={vwap:.4f} bias={vw_bias} | Ichimoku={ichi}", flush=True)
+            print(f"🌫️ Context | VWAP={safe(vwap):.4f} bias={vw_bias} | Ichimoku={ichi}", flush=True)
             
             # ===== Liquidity Snapshot بناءً على السياق =====
             ctx = {
@@ -1799,14 +1808,14 @@ def emit_snapshots(exchange, symbol, df, balance_fn=None, pnl_fn=None):
             if gz and gz.get("ok"):
                 zone_type = gz["zone"]["type"]
                 zone_score = gz["score"]
-                gz_snap_note = f" | 🟡{zone_type} s={zone_score:.1f}"
+                gz_snap_note = f" | 🟡{zone_type} s={safe(zone_score):.1f}"
             
             flow_z = flow['delta_z'] if flow and flow.get('ok') else 0.0
             bm_imb = bm['imbalance'] if bm and bm.get('ok') else 1.0
             
-            print(f"🧠 SNAP | {side_hint} | votes={cv['b']}/{cv['s']} score={cv['score_b']:.1f}/{cv['score_s']:.1f} "
-                  f"| ADX={cv['ind'].get('adx',0):.1f} DI={cv['ind'].get('di_spread',0):.1f} | "
-                  f"z={flow_z:.2f} | imb={bm_imb:.2f}{gz_snap_note}", 
+            print(f"🧠 SNAP | {side_hint} | votes={cv['b']}/{cv['s']} score={safe(cv['score_b']):.1f}/{safe(cv['score_s']):.1f} "
+                  f"| ADX={safe(cv['ind'].get('adx')):.1f} DI={safe(cv['ind'].get('di_spread')):.1f} | "
+                  f"z={safe(flow_z):.2f} | imb={safe(bm_imb):.2f}{gz_snap_note}", 
                   flush=True)
             
             print("✅ ADDONS LIVE", flush=True)
@@ -1835,11 +1844,11 @@ def execute_trade_decision(side, price, qty, mode, council_data, gz_data):
 
     gz_note = ""
     if gz_data and gz_data.get("ok"):
-        gz_note = f" | 🟡 {gz_data['zone']['type']} s={gz_data['score']:.1f}"
+        gz_note = f" | 🟡 {gz_data['zone']['type']} s={safe(gz_data['score']):.1f}"
     
     votes = council_data
     print(f"🎯 EXECUTE: {side.upper()} {qty:.4f} @ {price:.6f} | "
-          f"mode={mode} | votes={votes['b']}/{votes['s']} score={votes['score_b']:.1f}/{votes['score_s']:.1f}"
+          f"mode={mode} | votes={votes['b']}/{votes['s']} score={safe(votes['score_b']):.1f}/{safe(votes['score_s']):.1f}"
           f"{gz_note}", flush=True)
 
     try:
@@ -2343,7 +2352,7 @@ def smart_exit_guard(state, df, ind, flow, bm, now_price, pnl_pct, mode, side, e
             return {
                 "action": "close", 
                 "why": "golden_reversal",
-                "log": f"🔴 CLOSE STRONG | golden reversal after TP1 | score={gz['score']:.1f}"
+                "log": f"🔴 CLOSE STRONG | golden reversal after TP1 | score={safe(gz['score']):.1f}"
             }
 
     # TP Targets حسب النمط
@@ -2487,19 +2496,19 @@ def trade_loop_enhanced():
             if not final_signal and (gz and gz.get("ok") and ind.get("adx",0) >= GOLDEN_ENTRY_ADX):
                 if gz["zone"]["type"]=="golden_bottom" and gz["score"]>=GOLDEN_ENTRY_SCORE:
                     final_signal = "buy"
-                    entry_reasons.append(f"GoldenBottom score={gz['score']:.1f}")
+                    entry_reasons.append(f"GoldenBottom score={safe(gz['score']):.1f}")
                 elif gz["zone"]["type"]=="golden_top" and gz["score"]>=GOLDEN_ENTRY_SCORE:
                     final_signal = "sell" 
-                    entry_reasons.append(f"GoldenTop score={gz['score']:.1f}")
+                    entry_reasons.append(f"GoldenTop score={safe(gz['score']):.1f}")
 
             # لو مفيش TBE ولا Golden ولا Explosion، استخدم السكور المعتاد
             if final_signal is None:
                 if council_data["score_b"] > council_data["score_s"] and council_data["score_b"] >= 8.0:
                     final_signal = "buy"
-                    entry_reasons.append(f"Council score={council_data['score_b']:.1f}")
+                    entry_reasons.append(f"Council score={safe(council_data['score_b']):.1f}")
                 elif council_data["score_s"] > council_data["score_b"] and council_data["score_s"] >= 8.0:
                     final_signal = "sell"
-                    entry_reasons.append(f"Council score={council_data['score_s']:.1f}")
+                    entry_reasons.append(f"Council score={safe(council_data['score_s']):.1f}")
             
             # =================== NO SCALP POLICY ===================
             signal_strength = None
