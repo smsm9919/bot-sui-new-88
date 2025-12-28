@@ -716,16 +716,42 @@ def classify_trend_mode(ind):
         return "MID_TREND"
     return "NONE"
 
-def build_tp_plan(mode):
+def build_tp_plan(mode, atr=None, price=None):
     """
-    Mid: 2 TP
-    Big: 3 TP
+    بناء خطة جني الأرباح حسب النمط
+    MID: 2 TP | BIG: 3 TP | مع تعزيز في حالة الانفجار
     """
-    if mode == "MID_TREND":
-        return {"tp_levels": [0.6, 1.2], "fracs": [0.5, 0.5]}
+    atr = max(float(atr or 0), 1e-9)
+    price = float(price or 0)
+    
     if mode == "BIG_TREND":
-        return {"tp_levels": [0.8, 1.8, 3.0], "fracs": [0.25, 0.35, 0.40]}
-    return {"tp_levels": [], "fracs": []}
+        # 3 مراحل للترند القوي
+        tp_pcts = [0.012, 0.025, 0.040]  # 1.2%، 2.5%، 4.0%
+        fractions = [0.30, 0.35, 0.35]
+        trail_mult = 1.6
+    elif mode == "MID_TREND":
+        # 2 مراحل للترند المتوسط
+        tp_pcts = [0.010, 0.022]  # 1.0%، 2.2%
+        fractions = [0.45, 0.55]
+        trail_mult = 1.4
+    else:
+        # نمط افتراضي
+        tp_pcts = [0.008, 0.015]
+        fractions = [0.50, 0.50]
+        trail_mult = 1.2
+    
+    # تحقق أن مجموع الكسور <= 1.0
+    if sum(fractions) > 1.0:
+        # تعديل الكسور لتناسب المجموع
+        total = sum(fractions)
+        fractions = [f/total for f in fractions]
+    
+    return {
+        "tp_pcts": tp_pcts,
+        "fractions": fractions,
+        "trail_mult": trail_mult,
+        "mode": mode
+    }
 
 # =================== LIQUIDITY + SMC (TBE) ===================
 def wick_ratio(df):
@@ -1068,6 +1094,90 @@ def log_liquidity_ctx(liq: dict, smc: dict):
         )
 
 # =================== EXPLOSION / COLLAPSE ENGINE (STEP 3) ===================
+def detect_explosion_collapse(df, ind, flow, bookmap):
+    """
+    Explosion:
+      - Range expansion
+      - Volume spike
+      - CVD confirm
+      - Liquidity walls eaten
+
+    Collapse:
+      - Long wicks
+      - Negative delta spike
+      - Liquidity drain
+    """
+    if len(df) < 30:
+        return {"state": None}
+    
+    # حماية من القيم None
+    flow = flow or {}
+    bookmap = bookmap or {}
+
+    # === Price action ===
+    atr = float(ind.get("atr", 0))
+    o = float(df["open"].iloc[-1])
+    h = float(df["high"].iloc[-1])
+    l = float(df["low"].iloc[-1])
+    c = float(df["close"].iloc[-1])
+
+    rng = max(h - l, 1e-9)
+    body = abs(c - o)
+
+    # === Volume ===
+    vol = float(df["volume"].iloc[-1])
+    vol_ma = float(df["volume"].rolling(20).mean().iloc[-1])
+    vol_spike = vol_ma > 0 and vol >= vol_ma * 1.8
+
+    # === Flow ===
+    delta = flow.get("delta_last", 0)
+    z = flow.get("delta_z", 0)
+    cvd_trend = flow.get("cvd_trend", "")
+
+    # === Bookmap ===
+    imb = bookmap.get("imbalance", 1.0)
+
+    # === Wick ratios ===
+    upper = h - max(o, c)
+    lower = min(o, c) - l
+
+    # ================== EXPLOSION ==================
+    if (
+        body >= 1.2 * atr and
+        vol_spike and
+        abs(z) >= 1.6 and
+        ((delta > 0 and cvd_trend == "up") or (delta < 0 and cvd_trend == "down")) and
+        (imb >= 1.3 or imb <= 0.77)
+    ):
+        return {
+            "state": "EXPLOSION",
+            "dir": "buy" if delta > 0 else "sell",
+            "reasons": ["ATR_EXPAND", "VOL_SPIKE", "CVD_CONFIRM", "LIQ_EATEN"],
+            "atr": atr,
+            "delta": delta,
+            "z": z,
+            "imb": imb
+        }
+
+    # ================== COLLAPSE ==================
+    if (
+        rng >= 1.5 * atr and
+        (upper >= 0.45 * rng or lower >= 0.45 * rng) and
+        vol_spike and
+        abs(z) >= 1.6
+    ):
+        return {
+            "state": "COLLAPSE",
+            "dir": "sell" if upper > lower else "buy",
+            "reasons": ["LIQ_DRAIN", "LONG_WICK", "VOL_SPIKE"],
+            "atr": atr,
+            "delta": delta,
+            "z": z,
+            "imb": imb
+        }
+
+    return {"state": None}
+
 def explosion_collapse_ctx(df: pd.DataFrame, atr: float, lookback=40):
     if len(df) < lookback + 5:
         return {"ok": False, "state": "NO_DATA"}
@@ -1122,6 +1232,45 @@ def log_explode(xc: dict):
         log_g(f"💥 STEP3 {st} | side={xc.get('side')} level={xc.get('level',0):.6f} vol×={xc.get('vol_x',0):.2f}")
     else:
         log_i(f"💥 STEP3 none | vol×={xc.get('vol_x',0):.2f} disp={xc.get('disp')}")
+
+# =================== CONTEXT INDICATORS (VWAP + ICHIMOKU) ===================
+def compute_vwap(df):
+    """حساب VWAP للجلسة"""
+    try:
+        tp = (df["high"] + df["low"] + df["close"]) / 3.0
+        v = df["volume"].astype(float)
+        cum_v = v.cumsum()
+        cum_tpv = (tp * v).cumsum()
+        vwap = (cum_tpv / cum_v).iloc[-1] if cum_v.iloc[-1] > 0 else float(df["close"].iloc[-1])
+        return float(vwap)
+    except Exception:
+        return float(df["close"].iloc[-1]) if len(df) > 0 else 0.0
+
+def ichimoku_bias(df):
+    """Ichimoku Cloud Bias بسيط"""
+    if len(df) < 80:
+        return "neutral"
+    
+    try:
+        high = df["high"].astype(float)
+        low = df["low"].astype(float)
+        close = df["close"].astype(float)
+
+        tenkan = (high.rolling(9).max() + low.rolling(9).min()) / 2
+        kijun  = (high.rolling(26).max() + low.rolling(26).min()) / 2
+        span_a = ((tenkan + kijun) / 2).shift(26)
+        span_b = ((high.rolling(52).max() + low.rolling(52).min()) / 2).shift(26)
+
+        sa = float(span_a.iloc[-1]); sb = float(span_b.iloc[-1]); c = float(close.iloc[-1])
+        cloud_top = max(sa, sb); cloud_bot = min(sa, sb)
+
+        if c > cloud_top:
+            return "bull"
+        if c < cloud_bot:
+            return "bear"
+        return "neutral"
+    except Exception:
+        return "neutral"
 
 # =================== ENTRY GATE FROM LIQUIDITY/SMC/STEP3 ===================
 def entry_gate_from_liq_smc_xc(snap: dict, desired: str, mode: str):
@@ -1501,6 +1650,18 @@ def compute_flow_metrics(df):
     except Exception as e:
         return {"ok": False, "why": str(e)}
 
+# ========= Liquidity Dashboard Formatter =========
+def fmt_liq_dash(liq: dict):
+    if not liq or not liq.get("ok"):
+        return "Liquidity: n/a"
+    return (
+        f"Liquidity | state={liq.get('state')} | "
+        f"sweepL={liq.get('sweep_low')} sweepH={liq.get('sweep_high')} | "
+        f"wickU={liq.get('wick_up'):.2f} wickD={liq.get('wick_dn'):.2f} | "
+        f"vol×={liq.get('vol_x'):.2f} | "
+        f"drain={liq.get('drain')}"
+    )
+
 # ========= Unified snapshot emitter =========
 def emit_snapshots(exchange, symbol, df, balance_fn=None, pnl_fn=None):
     """
@@ -1523,6 +1684,14 @@ def emit_snapshots(exchange, symbol, df, balance_fn=None, pnl_fn=None):
         
         # ===== STEP 3: Explosion/Collapse Engine =====
         xc = explosion_collapse_ctx(df, ind.get("atr", 0.0))
+        
+        # ===== Context Indicators =====
+        vwap = compute_vwap(df)
+        vw_bias = "above" if float(df["close"].iloc[-1]) > vwap else "below"
+        ichi = ichimoku_bias(df)
+        
+        # ===== Explosion/Collapse Detection =====
+        exp = detect_explosion_collapse(df, ind, flow or {}, bm or {})
         
         bal = None; cpnl = None
         if callable(balance_fn):
@@ -1569,8 +1738,35 @@ def emit_snapshots(exchange, symbol, df, balance_fn=None, pnl_fn=None):
             print(f"{strat}{(' | ' + wallet) if wallet else ''}", flush=True)
             
             # ===== Liquidity/SMC/Step3 Logs =====
-            log_liquidity_ctx(liq, smc)
-            log_explode(xc)
+            print("🧪 " + fmt_liq_dash(liq), flush=True)
+            
+            # ===== SMC Logs =====
+            if smc and smc.get("ok"):
+                ob_buy = smc.get("ob", {}).get("buy")
+                ob_sell = smc.get("ob", {}).get("sell")
+                fvg_buy = smc.get("fvg", {}).get("buy")
+                fvg_sell = smc.get("fvg", {}).get("sell")
+                bos_buy = smc.get("bos", {}).get("buy")
+                bos_sell = smc.get("bos", {}).get("sell")
+                
+                print(
+                    f"🏗️ SMC | OB(buy={bool(ob_buy)}, sell={bool(ob_sell)}) | "
+                    f"FVG(buy={bool(fvg_buy)}, sell={bool(fvg_sell)}) | "
+                    f"BOS(buy={bos_buy}, sell={bos_sell})",
+                    flush=True
+                )
+            
+            # ===== Explosion/Collapse Logs =====
+            if exp.get("state"):
+                icon = "🔥" if exp["state"] == "EXPLOSION" else "🧊"
+                print(
+                    f"{icon} {exp['state']} | dir={exp['dir'].upper()} | Δ={exp['delta']:.0f} z={exp['z']:.2f} imb={exp['imb']:.2f} | "
+                    f"reasons={','.join(exp['reasons'])}",
+                    flush=True
+                )
+            
+            # ===== Context Logs =====
+            print(f"🌫️ Context | VWAP={vwap:.4f} bias={vw_bias} | Ichimoku={ichi}", flush=True)
             
             # ===== Liquidity Snapshot بناءً على السياق =====
             ctx = {
@@ -1584,7 +1780,7 @@ def emit_snapshots(exchange, symbol, df, balance_fn=None, pnl_fn=None):
                 "sweep_price": liq.get("sweep", {}).get("level", 0) if liq.get("sweep") else 0,
                 "sweep_ref": liq.get("prev_high", 0) if liq.get("sweep", {}).get("dir") == "SELL" else liq.get("prev_low", 0) if liq.get("sweep", {}).get("dir") == "BUY" else 0,
                 "vol_spike_x": liq.get("vol_ratio", 0),
-                "vwap_bias": "Near",  # يمكن حساب VWAP لاحقًا
+                "vwap_bias": vw_bias.capitalize(),
                 "htf_bias": side_hint
             }
             
@@ -1617,13 +1813,14 @@ def emit_snapshots(exchange, symbol, df, balance_fn=None, pnl_fn=None):
 
         return {
             "bm": bm, "flow": flow, "cv": cv, "mode": mode, "gz": gz, 
-            "wallet": wallet, "ind": ind, "liq": liq, "smc": smc, "xc": xc
+            "wallet": wallet, "ind": ind, "liq": liq, "smc": smc, "xc": xc,
+            "exp": exp, "vwap": vwap, "vw_bias": vw_bias, "ichi": ichi
         }
     except Exception as e:
         print(f"🟨 AddonLog error: {e}", flush=True)
         return {"bm": None, "flow": None, "cv": {"b":0,"s":0,"score_b":0.0,"score_s":0.0,"ind":{}},
                 "mode": {"mode":"n/a"}, "gz": None, "wallet": "", 
-                "ind": {}, "liq": {}, "smc": {}, "xc": {}}
+                "ind": {}, "liq": {}, "smc": {}, "xc": {}, "exp": {}}
 
 # =================== EXECUTION MANAGER ===================
 def execute_trade_decision(side, price, qty, mode, council_data, gz_data):
@@ -1700,12 +1897,29 @@ def open_market_enhanced(side, qty, price):
     # ===== التحقق من بوابة الدخول =====
     ok, score, reasons = entry_gate_from_liq_smc_xc(snap, side, mode)
     if not ok:
-        log_w(f"⛔ ENTRY BLOCKED by LIQ/SMC/STEP3 | side={side} mode={mode} score={sc}/{2 if mode=='MID_TREND' else 3} reasons={rs}")
+        log_w(f"⛔ ENTRY BLOCKED by LIQ/SMC/STEP3 | side={side} mode={mode} score={score}/{2 if mode=='MID_TREND' else 3} reasons={reasons}")
         return False
     else:
-        log_g(f"✅ ENTRY PASS LIQ/SMC/STEP3 | side={side} mode={mode} score={sc} reasons={rs}")
+        log_g(f"✅ ENTRY PASS LIQ/SMC/STEP3 | side={side} mode={mode} score={score} reasons={reasons}")
     
-    management_config = setup_trade_management(mode)
+    # ===== بناء خطة TP ديناميكية =====
+    ind = compute_indicators(df)
+    exp = snap.get("exp", {})
+    
+    # تحديد وضع الخطة: Explosion يرفع للـBIG_TREND
+    plan_mode = "BIG_TREND" if exp.get("state") == "EXPLOSION" else mode
+    
+    # بناء خطة TP
+    plan = build_tp_plan(plan_mode, ind.get("atr"), price)
+    
+    management_config = {
+        "tp_levels": plan["tp_pcts"],
+        "tp_fracs": plan["fractions"],
+        "be_activate_pct": 0.4/100.0 if mode == "MID_TREND" else 0.5/100.0,
+        "trail_activate_pct": 0.8/100.0 if mode == "MID_TREND" else 1.2/100.0,
+        "atr_trail_mult": plan["trail_mult"],
+        "close_aggression": "medium" if mode == "MID_TREND" else "low"
+    }
     
     success = execute_trade_decision(side, price, qty, mode, votes, gz)
     
@@ -1723,6 +1937,10 @@ def open_market_enhanced(side, qty, price):
             "highest_profit_pct": 0.0, 
             "profit_targets_achieved": 0,
             "mode": mode,
+            "plan_mode": plan_mode,
+            "tp_pcts": plan["tp_pcts"],
+            "tp_fracs": plan["fractions"],
+            "trail_mult": plan["trail_mult"],
             "management": management_config,
             "last_entry_source": "trend_master"
         })
@@ -1734,9 +1952,11 @@ def open_market_enhanced(side, qty, price):
             "position_qty": qty,
             "leverage": LEVERAGE,
             "mode": mode,
+            "plan_mode": plan_mode,
             "management": management_config,
             "gz_snapshot": gz if isinstance(gz, dict) else {},
             "cv_snapshot": votes if isinstance(votes, dict) else {},
+            "exp_snapshot": exp if isinstance(exp, dict) else {},
             "opened_at": int(time.time()),
             "partial_taken": False,
             "breakeven_armed": False,
@@ -1744,7 +1964,8 @@ def open_market_enhanced(side, qty, price):
             "trail_tightened": False,
         })
         
-        log_g(f"✅ POSITION OPENED: {side.upper()} | mode={mode}")
+        log_i(f"🧾 Trade Plan: {plan_mode} | TP%={plan['tp_pcts']} | fracs={plan['fractions']} | trail×={plan['trail_mult']}")
+        log_g(f"✅ POSITION OPENED: {side.upper()} | mode={mode} | plan={plan_mode}")
         return True
     
     return False
@@ -1952,21 +2173,33 @@ def manage_after_entry_enhanced(df, ind, info):
 
     snap = emit_snapshots(ex, SYMBOL, df)
     gz = snap["gz"]
+    flow = snap.get("flow", {})
+    bm = snap.get("bm", {})
     
-    # التحقق من الانعكاس الحقيقي
-    if _is_reversal(df, ind, side):
-        log_e("🛑 REVERSAL DETECTED -> STRICT CLOSE NOW")
-        close_market_strict(reason="reversal_detected")
+    # ===== الكشف عن الانعكاس الحقيقي باستخدام Explosion/Collapse =====
+    exp_now = detect_explosion_collapse(df, ind, flow or {}, bm or {})
+    
+    # انعكاس حقيقي: Collapse ضد اتجاه المركز
+    if exp_now.get("state") == "COLLAPSE" and exp_now.get("dir") != STATE.get("side"):
+        log_e(f"❌ HARD REVERSAL — LIQUIDITY COLLAPSE | reasons={exp_now.get('reasons')}")
+        close_market_strict("LIQUIDITY_REVERSAL")
         TREND_STATE["phase"] = "EXIT"
         return
     else:
-        if TREND_STATE.get("mode") in ("BIG_TREND", "MID_TREND") and _is_correction(df, ind, side):
-            TREND_STATE["phase"] = "CORRECTION"
-            log_i("🟦 CORRECTION: holding (trend still valid)")
+        # تحقق من تصحيح vs انعكاس
+        if _is_reversal(df, ind, side):
+            log_e("🛑 REVERSAL DETECTED -> STRICT CLOSE NOW")
+            close_market_strict(reason="reversal_detected")
+            TREND_STATE["phase"] = "EXIT"
+            return
         else:
-            TREND_STATE["phase"] = "RUN"
+            if TREND_STATE.get("mode") in ("BIG_TREND", "MID_TREND") and _is_correction(df, ind, side):
+                TREND_STATE["phase"] = "CORRECTION"
+                log_i("🟦 CORRECTION: holding (trend still valid)")
+            else:
+                TREND_STATE["phase"] = "RUN"
     
-    exit_signal = smart_exit_guard(STATE, df, ind, snap["flow"], snap["bm"], 
+    exit_signal = smart_exit_guard(STATE, df, ind, flow, bm, 
                                  px, pnl_pct/100, mode, side, entry, gz)
     
     if exit_signal["log"]:
@@ -2218,7 +2451,7 @@ def trade_loop_enhanced():
                     **info
                 })
             
-            # قرار الدخول باستخدام Trend Birth Entry + Council
+            # قرار الدخول باستخدام Trend Birth Entry + Council + Explosion Override
             reason = None
             if spread_bps is not None and spread_bps > MAX_SPREAD_BPS:
                 reason = f"spread too high ({fmt(spread_bps,2)}bps > {MAX_SPREAD_BPS})"
@@ -2242,6 +2475,14 @@ def trade_loop_enhanced():
                 entry_reasons += [f"TBE:{r}" for r in tbe.get("reasons", [])]
                 log_y(f"🎯 TREND BIRTH ENTRY: {final_signal.upper()} | mode={tbe['mode']}")
             
+            # =================== Explosion/Collapse Override ===================
+            exp = snap.get("exp", {})
+            if not final_signal and exp.get("state") in ("EXPLOSION", "COLLAPSE"):
+                if exp["dir"] == htf_bias:
+                    final_signal = exp["dir"]
+                    entry_reasons.append(f"{exp['state']}_OVERRIDE")
+                    log_y(f"⚡ {exp['state']} OVERRIDE: {final_signal.upper()} aligned with HTF")
+            
             # --- Golden Entry Override ---
             if not final_signal and (gz and gz.get("ok") and ind.get("adx",0) >= GOLDEN_ENTRY_ADX):
                 if gz["zone"]["type"]=="golden_bottom" and gz["score"]>=GOLDEN_ENTRY_SCORE:
@@ -2251,7 +2492,7 @@ def trade_loop_enhanced():
                     final_signal = "sell" 
                     entry_reasons.append(f"GoldenTop score={gz['score']:.1f}")
 
-            # لو مفيش TBE ولا Golden، استخدم السكور المعتاد
+            # لو مفيش TBE ولا Golden ولا Explosion، استخدم السكور المعتاد
             if final_signal is None:
                 if council_data["score_b"] > council_data["score_s"] and council_data["score_b"] >= 8.0:
                     final_signal = "buy"
@@ -2273,7 +2514,12 @@ def trade_loop_enhanced():
                     signal_strength = "mid"
                     tp_profile = "MID_2"
 
-            # 2) غير كده (مصادر قديمة: COUNCIL) => اسمح Mid/Big فقط
+            # 2) لو جاء Explosion => يعتبر Big Trend
+            if exp.get("state") == "EXPLOSION":
+                signal_strength = "strong"
+                tp_profile = "TREND_3_EXPLOSION"
+
+            # 3) غير كده (مصادر قديمة: COUNCIL) => اسمح Mid/Big فقط
             if signal_strength is None:
                 # تحديد قوة الإشارة بناءً على Council score
                 if council_data["score_b"] >= 10.0 or council_data["score_s"] >= 10.0:
@@ -2348,8 +2594,8 @@ def trade_loop_enhanced():
                                 color_tag = "🟢" if final_signal=="buy" else "🔴"
                                 log_y(
                                     f"{color_tag} TRADE OPEN | {final_signal.upper()} | MODE={mode} "
-                                    f"| HTF={htf_bias} | TP={plan['tp_levels']} "
-                                    f"| frac={plan['fracs']} | reasons={entry_reasons}"
+                                    f"| HTF={htf_bias} | TP={plan['tp_pcts']} "
+                                    f"| frac={plan['fractions']} | reasons={entry_reasons}"
                                 )
                             else:
                                 log_w("❌ Open failed")
@@ -2392,6 +2638,7 @@ def pretty_snapshot(bal, info, ind, spread_bps, reason=None, df=None):
             print(f"   {lamp}  Entry={fmt(STATE['entry'])}  Qty={fmt(STATE['qty'],4)}  Bars={STATE['bars']}  Trail={fmt(STATE['trail'])}  BE={fmt(STATE['breakeven'])}")
             print(f"   🎯 TP_done={STATE['profit_targets_achieved']}  HP={fmt(STATE['highest_profit_pct'],2)}%")
             print(f"   📊 Trend Mode: {TREND_STATE.get('mode')} | Phase: {TREND_STATE.get('phase')}")
+            print(f"   📈 TP Plan: {STATE.get('plan_mode')} | Levels: {STATE.get('tp_pcts', [])}")
         else:
             print("   ⚪ FLAT")
             if wait_for_next_signal_side:
@@ -2458,10 +2705,11 @@ if __name__ == "__main__":
     print(colored(f"⚡ RISK: {int(RISK_ALLOC*100)}% × {LEVERAGE}x • TREND-ONLY=ENABLED", "yellow"))
     print(colored(f"📊 TREND MODES: MID (ADX≥{ADX_MID_MIN}) | BIG (ADX≥{ADX_BIG_MIN})", "yellow"))
     print(colored(f"🧭 HTF BIAS: 1H EMA{HTF_EMA_FAST}/{HTF_EMA_SLOW} | SMC+Liquidity", "yellow"))
-    print(colored(f"💰 TP PLANS: MID (2 levels) | BIG (3 levels)", "yellow"))
+    print(colored(f"💰 TP PLANS: MID (2 levels) | BIG (3 levels) | Explosion Boost", "yellow"))
     print(colored(f"🛡️ SAFETY: NO SCALP | NO WEAK | HTF CONFIRMATION", "yellow"))
     print(colored(f"🚀 EXECUTION: {'ACTIVE' if EXECUTE_ORDERS and not DRY_RUN else 'SIMULATION'}", "yellow"))
     print(colored(f"💧 LIQUIDITY ENGINE: STEP2 (Sweep/BOS/OB/FVG) + STEP3 (Explosion/Collapse)", "yellow"))
+    print(colored(f"🌫️ CONTEXT: VWAP + Ichimoku Cloud Bias", "yellow"))
     
     logging.info("service starting…")
     signal.signal(signal.SIGTERM, lambda *_: sys.exit(0))
