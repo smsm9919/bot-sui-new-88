@@ -9,6 +9,7 @@ SUI Trend Master Bot — MULTI-EXCHANGE (BingX & Bybit)
 • Multi-Exchange Support: BingX & Bybit
 • Enhanced Liquidity + SMC + Explosion/Collapse Engine
 • ANTI-DESYNC GUARD + LAYERED DECISION SYSTEM
+• CALCULATED BRAVERY EDITION v7.2
 """
 
 import os, time, math, random, signal, sys, traceback, logging, json
@@ -50,7 +51,7 @@ LOG_LEGACY = False
 LOG_ADDONS = True
 LOG_DECISION_LAYER = True  # ✅ طبقة القرار الجديدة
 
-BOT_VERSION = f"SUI Trend Master v7.1 — {EXCHANGE_NAME.upper()} Multi-Exchange"
+BOT_VERSION = f"SUI Trend Master v7.2 — {EXCHANGE_NAME.upper()} Calculated Bravery"
 print("🔁 Booting:", BOT_VERSION, flush=True)
 
 STATE_PATH = "./bot_state.json"
@@ -72,8 +73,16 @@ ALLOW_MID = True
 ALLOW_BIG = True
 
 # Mid/Big thresholds
-ADX_MID_MIN = 22.0
-ADX_BIG_MIN = 35.0
+ADX_MID_MIN = 20.0         # ⬅️ خفض من 22 إلى 20
+ADX_BIG_MIN = 28.0         # ⬅️ خفض من 35 إلى 28
+
+# Mid Trend TP Levels
+MID_TP_LEVELS = [0.008, 0.016]      # 0.8% و 1.6%
+MID_TP_FRACTIONS = [0.5, 0.5]       # 50% لكل مستوى
+
+# Big Trend TP Levels
+BIG_TP_LEVELS = [0.010, 0.020, 0.035]  # 1.0%، 2.0%، 3.5%
+BIG_TP_FRACTIONS = [0.3, 0.3, 0.4]     # 30%، 30%، 40%
 
 # HTF bias
 HTF_TF = "1h"
@@ -580,108 +589,162 @@ def log_context(vwap_bias, ichi, sma, vp):
         parts.append(f"VP={vp['zone']} POC={vp['poc']:.4f}")
     log_i("🧭 Context | " + " | ".join(parts) if parts else "🧭 Context | NA")
 
-# =================== ENTRY GATE (PATCH 4) ===================
+# =================== تصنيف الترند المحسن ===================
 def classify_trend(trend_state, adx, ichi, sma):
-    """تصنيف الترند"""
+    """تصنيف الترند - نسخة مبسطة وواقعية"""
     adx = float(adx or 0.0)
-    if trend_state in ("BIG_TREND_UP", "BIG_TREND_DOWN"):
+    
+    # تصنيف بناءً على ADX فقط (بسيط وواضح)
+    if adx >= ADX_BIG_MIN:
         return "BIG_TREND"
-    if trend_state in ("MID_TREND_UP", "MID_TREND_DOWN"):
+    elif adx >= ADX_MID_MIN:
         return "MID_TREND"
+    else:
+        return "NO_TREND"
 
-    # fallback
-    if adx >= 30 and ichi and ichi.get("ok") and sma and sma.get("ok"):
-        if ichi["bias"] in ("BULL","BEAR"):
-            return "BIG_TREND"
-    if adx >= 22:
-        return "MID_TREND"
-    return "NO_TREND"
-
+# =================== بوابة الدخول المحسنة (Calculated Bravery) ===================
 def mid_big_entry_gate(side, trend_state, liq, smc, expl, ichi, sma, vp, adx):
     """
-    يرجع (ok, reason)
+    بوابة دخول ذكية - التركيز على الأساسيات فقط
     """
+    # 1. تأكيد وجود ترند
     tclass = classify_trend(trend_state, adx, ichi, sma)
     if tclass == "NO_TREND":
         return False, "no_trend"
-
-    # منع الدخول ضد إشارات drain القوية
-    if liq and liq.get("ok") and liq.get("drain"):
-        if (liq["state"] == "DRAIN_DOWN" and side == "BUY") or (liq["state"] == "DRAIN_UP" and side == "SELL"):
-            return False, "liquidity_drain_against"
-
-    # انفجار/انهيار = يسمح بدخول مبكر (بس لازم اتجاه عام)
-    if expl and expl.get("ok") and expl.get("state") in ("EXPLOSION_UP","EXPLOSION_DOWN"):
-        # تأكد اتجاه عام
-        if side == expl.get("side"):
-            return True, f"explosion_{tclass.lower()}"
-
-    # SMC confluence
+    
+    # 2. شرط السيولة الأساسي (الأهم)
+    liq_ok = False
+    if liq and liq.get("ok"):
+        liq_state = liq.get("state", "")
+        
+        # الحالات المقبولة للدخول
+        acceptable_states = ["ACCUMULATION", "SWEEP_HIGH", "SWEEP_LOW", "NEUTRAL"]
+        
+        # منع الدخول في حالات التصريف فقط
+        if liq_state in ["DRAIN_DOWN", "DRAIN_UP"]:
+            # الدخول فقط إذا كان التصريف في اتجاه الترند
+            if (side == "BUY" and liq_state == "DRAIN_UP") or (side == "SELL" and liq_state == "DRAIN_DOWN"):
+                liq_ok = True
+            else:
+                return False, f"liquidity_drain_against_{liq_state}"
+        elif liq_state in acceptable_states:
+            liq_ok = True
+    
+    if not liq_ok:
+        return False, "liquidity_not_favorable"
+    
+    # 3. شرط SMC مبسط (واحد منهم كافي)
     smc_ok = False
     if smc and smc.get("ok"):
         if side == "BUY":
-            smc_ok = (smc.get("ob_side") == "BUY") or smc.get("fvg_buy") or smc.get("bos_up")
+            smc_ok = smc.get("ob_side") == "BUY" or smc.get("fvg_buy") or smc.get("bos_up")
         else:
-            smc_ok = (smc.get("ob_side") == "SELL") or smc.get("fvg_sell") or smc.get("bos_down")
-
-    # Ichimoku/SMA اتجاه (Role = alignment)
-    align = True
+            smc_ok = smc.get("ob_side") == "SELL" or smc.get("fvg_sell") or smc.get("bos_down")
+    
+    # للترند المتوسط: SMC ليس إلزامي (لكن يفضل)
+    if tclass == "MID_TREND" and not smc_ok:
+        # في الترند المتوسط، يمكن الدخول بدون SMC إذا كانت السيولة قوية
+        if liq and liq.get("ok") and liq.get("state") in ["ACCUMULATION", "SWEEP_HIGH", "SWEEP_LOW"]:
+            smc_ok = True
+            log_d(f"🎯 MID_TREND: Allowing entry without SMC due to strong liquidity")
+    
+    # للترند الكبير: SMC مطلوب
+    if tclass == "BIG_TREND" and not smc_ok:
+        return False, "big_trend_needs_smc"
+    
+    # 4. محاذاة الاتجاه العام (مهم)
+    align_ok = True
     if ichi and ichi.get("ok"):
-        if side == "BUY" and ichi["bias"] == "BEAR": align=False
-        if side == "SELL" and ichi["bias"] == "BULL": align=False
+        if (side == "BUY" and ichi["bias"] == "BEAR") or (side == "SELL" and ichi["bias"] == "BULL"):
+            align_ok = False
+            log_w(f"⚠️ Ichimoku bias against: {side} vs {ichi['bias']}")
+    
     if sma and sma.get("ok"):
-        if side == "BUY" and sma["bias"] == "BELOW": align=False
-        if side == "SELL" and sma["bias"] == "ABOVE": align=False
+        if (side == "BUY" and sma["bias"] == "BELOW") or (side == "SELL" and sma["bias"] == "ABOVE"):
+            align_ok = False
+            log_w(f"⚠️ SMA bias against: {side} vs {sma['bias']}")
+    
+    if not align_ok:
+        # في الترند المتوسط، يمكن التغاضي عن محاذاة ضعيفة إذا كان ADX قوي
+        if tclass == "MID_TREND" and adx >= 25:
+            log_d(f"🎯 MID_TREND: Overriding weak alignment due to strong ADX ({adx})")
+            align_ok = True
+        else:
+            return False, "htf_alignment_weak"
+    
+    # 5. VP فقط للتحذير (ليس للرفض)
+    if vp and vp.get("ok") and vp["zone"] == "POC_NEAR":
+        log_w(f"⚠️ Trading in POC zone (chop risk)")
+    
+    # 6. الانفجار يعزز الدخول (ليس شرط)
+    if expl and expl.get("ok") and expl.get("state") in ["EXPLOSION_UP", "EXPLOSION_DOWN"]:
+        if side == expl.get("side"):
+            return True, f"explosion_confirmed_{tclass.lower()}"
+        else:
+            log_w(f"⚠️ Explosion detected but in opposite direction")
+    
+    # ✅ كل الشروط الأساسية متوفرة
+    return True, f"{tclass.lower()}_confirmed"
 
-    # Volume Profile proxy: لو POC_NEAR = غالبًا تشوب → خفف دخول
-    if vp and vp.get("ok") and vp["zone"] == "POC_NEAR" and float(adx or 0) < 28:
-        return False, "vp_chop_zone"
-
-    # شرط دخول أساسي:
-    if align and smc_ok:
-        return True, f"smc_align_{tclass.lower()}"
-
-    # لو مفيش SMC بس الترند Big قوي جدًا: اسمح
-    if align and tclass == "BIG_TREND" and float(adx or 0) >= 32:
-        return True, "big_trend_align"
-
-    return False, "no_confluence"
-
-# =================== TP SYSTEM (PATCH 5) ===================
+# =================== خطة TP المحسنة ===================
 def tp_plan(mode):
-    """مستويات TP للأنماط المختلفة"""
-    # نسب بسيطة قابلة للتعديل
+    """مستويات TP الجديدة - واقعية ومرنة"""
     if mode == "MID_TREND":
-        return {"tps":[0.012, 0.024], "fracs":[0.5, 0.5], "trail_after":0.018}
+        return {
+            "tps": MID_TP_LEVELS,
+            "fracs": MID_TP_FRACTIONS,
+            "trail_after": MID_TP_LEVELS[-1] * 1.2  # بدء التريل بعد آخر TP
+        }
     if mode == "BIG_TREND":
-        return {"tps":[0.010, 0.022, 0.040], "fracs":[0.25,0.35,0.40], "trail_after":0.022}
+        return {
+            "tps": BIG_TP_LEVELS,
+            "fracs": BIG_TP_FRACTIONS,
+            "trail_after": BIG_TP_LEVELS[-2]  # بدء التريل بعد TP2
+        }
     return {"tps":[], "fracs":[], "trail_after":None}
 
-def is_pullback_not_reversal(df, side, adx, liq, smc):
+# =================== كشف الانعكاس السريع ===================
+def detect_reversal_quick(df, side, adx, liq, smc):
     """
-    Pullback: عكس بسيط بدون drain + بدون sweep عكسي قوي + ADX مش بينهار
+    كشف سريع للانعكاس - الخروج الصارم
     """
-    adx = float(adx or 0)
-    if adx < 18:
-        return False  # السوق ضعيف أصلاً
-
-    if liq and liq.get("ok"):
-        if liq.get("drain"):
-            return False
-        # sweep عكس اتجاهك يعتبر خطر
-        if side=="BUY" and liq.get("sweepH"):
-            return False
-        if side=="SELL" and liq.get("sweepL"):
-            return False
-
-    # لو SMC بيقول BOS ضدك → انعكاس
+    # 1. كسر الهيكل (BOS ضد الاتجاه)
     if smc and smc.get("ok"):
-        if side=="BUY" and smc.get("bos_down"):
-            return False
-        if side=="SELL" and smc.get("bos_up"):
-            return False
-
-    return True
+        if side == "BUY" and smc.get("bos_down"):
+            return True, "bos_break_down"
+        if side == "SELL" and smc.get("bos_up"):
+            return True, "bos_break_up"
+    
+    # 2. تصريف سيولة قوي ضد الاتجاه
+    if liq and liq.get("ok"):
+        if side == "BUY" and liq.get("state") == "DRAIN_DOWN":
+            return True, "liquidity_drain_down"
+        if side == "SELL" and liq.get("state") == "DRAIN_UP":
+            return True, "liquidity_drain_up"
+    
+    # 3. ضعف ADX مفاجئ
+    if adx < 15:  # ضعف شديد
+        return True, "adx_collapse"
+    
+    # 4. شمعة انعكاس كبيرة
+    if len(df) >= 3:
+        last = df.iloc[-1]
+        prev = df.iloc[-2]
+        
+        last_body = abs(float(last["close"]) - float(last["open"]))
+        last_range = float(last["high"]) - float(last["low"])
+        
+        if last_range > 0:
+            body_ratio = last_body / last_range
+            
+            # شمعة انعكاس قوية
+            if body_ratio > 0.7:
+                if side == "BUY" and float(last["close"]) < float(last["open"]):
+                    return True, "strong_bearish_candle"
+                if side == "SELL" and float(last["close"]) > float(last["open"]):
+                    return True, "strong_bullish_candle"
+    
+    return False, "no_reversal"
 
 # =================== STEP 1: TREND STATE ENGINE ===================
 def detect_trend_state(df, ind, htf_bias=None):
@@ -797,7 +860,7 @@ def smc_confirm(smc_ctx, side):
         if smc_ctx.get("fvg", {}).get("sell"):
             reasons.append("FVG")
     
-    ok = len(reasons) >= 2  # يحتاج إلى مؤشرين على الأقل
+    ok = len(reasons) >= 1  # ⬅️ تغيير: واحد كافي الآن
     return ok, ",".join(reasons) if reasons else "none"
 
 # =================== STEP 3: EXPLOSION / COLLAPSE ENGINE ===================
@@ -842,7 +905,8 @@ def decide_entry_enhanced(trend_state, adx, liq, smc, expl, ichi, sma, vp, htf_b
                 "side": "buy", 
                 "mode": mode, 
                 "why": why_long,
-                "gate_ok": True
+                "gate_ok": True,
+                "adx": adx
             })
     
     # اختبار الدخول لـ SHORT
@@ -855,7 +919,8 @@ def decide_entry_enhanced(trend_state, adx, liq, smc, expl, ichi, sma, vp, htf_b
                 "side": "sell", 
                 "mode": mode, 
                 "why": why_short,
-                "gate_ok": True
+                "gate_ok": True,
+                "adx": adx
             })
     
     # إذا وجدنا دخول مقبول
@@ -866,10 +931,10 @@ def decide_entry_enhanced(trend_state, adx, liq, smc, expl, ichi, sma, vp, htf_b
     # إذا لم نجد أي دخول
     return {"ok": False, "reason": "no_entry_conditions", "gate_ok": False}
 
-# =================== STEP 5: TRADE MANAGER ENHANCED ===================
+# =================== إدارة الصفقة المحسنة مع كشف الانعكاس السريع ===================
 def manage_trend_position_enhanced(state, df, ind, mode, side, liq, smc):
     """
-    إدارة الصفقة المحسنة مع كشف التصحيح vs الانعكاس
+    إدارة الصفقة المحسنة مع كشف الانعكاس السريع
     """
     current_price = float(df["close"].iloc[-1])
     entry_price = state.get("entry", current_price)
@@ -881,91 +946,105 @@ def manage_trend_position_enhanced(state, df, ind, mode, side, liq, smc):
         pnl_pct = (entry_price - current_price) / entry_price * 100
         dir_side = "SELL"
     
-    # جلب خطة TP المناسبة
+    # 1. كشف الانعكاس أولاً (الأولوية للسلامة)
+    adx = safe(ind.get("adx", 0))
+    reversal, reversal_reason = detect_reversal_quick(df, dir_side, adx, liq, smc)
+    
+    if reversal:
+        log_w(f"🚨 REVERSAL DETECTED: {reversal_reason}")
+        return "EXIT", {"reason": f"reversal_{reversal_reason}"}
+    
+    # 2. جلب خطة TP المناسبة
     tp_config = tp_plan(mode)
     tp_levels = tp_config["tps"]
     tp_fractions = tp_config["fracs"]
     
-    # تحقق من TP1
-    if not state.get("tp1_done", False) and pnl_pct >= tp_levels[0]:
-        # تحقق من Desync Guard قبل TP
-        if not guard_reduce_only(ex, SYMBOL, "TP1"):
-            return "HOLD", {"reason": "desync_guard_blocked"}
-        
+    # 3. تنفيذ TP حسب الترتيب
+    # TP1
+    if not state.get("tp1_done", False) and pnl_pct >= (tp_levels[0] * 100):
         return "TP1", {"level": tp_levels[0], "fraction": tp_fractions[0]}
     
-    # تحقق من TP2 (للمود MID وBIG)
-    if len(tp_levels) >= 2 and state.get("tp1_done", False) and not state.get("tp2_done", False) and pnl_pct >= tp_levels[1]:
-        if not guard_reduce_only(ex, SYMBOL, "TP2"):
-            return "HOLD", {"reason": "desync_guard_blocked"}
-        
+    # TP2 (للمود MID وBIG)
+    if len(tp_levels) >= 2 and state.get("tp1_done", False) and not state.get("tp2_done", False) and pnl_pct >= (tp_levels[1] * 100):
         return "TP2", {"level": tp_levels[1], "fraction": tp_fractions[1]}
     
-    # تحقق من TP3 (للبيك ترند فقط)
-    if mode == "BIG_TREND" and len(tp_levels) >= 3 and state.get("tp1_done", False) and state.get("tp2_done", False) and not state.get("tp3_done", False) and pnl_pct >= tp_levels[2]:
-        if not guard_reduce_only(ex, SYMBOL, "TP3"):
-            return "HOLD", {"reason": "desync_guard_blocked"}
-        
+    # TP3 (للبيك ترند فقط)
+    if mode == "BIG_TREND" and len(tp_levels) >= 3 and state.get("tp1_done", False) and state.get("tp2_done", False) and not state.get("tp3_done", False) and pnl_pct >= (tp_levels[2] * 100):
         return "TP3", {"level": tp_levels[2], "fraction": tp_fractions[2]}
     
-    # كشف الانعكاس (يغلق الصفقة فورًا)
-    adx = safe(ind.get("adx", 0))
-    if not is_pullback_not_reversal(df, dir_side, adx, liq, smc):
-        return "EXIT", {"reason": "reversal_detected"}
-    
-    # إذا كان الترند يضعف
-    if adx < 15 and mode == "MID_TREND":
-        return "EXIT", {"reason": "ADX_weak_mid"}
-    if adx < 20 and mode == "BIG_TREND":
-        return "EXIT", {"reason": "ADX_weak_big"}
+    # 4. ضعف الترند بدون انعكاس
+    if mode == "MID_TREND" and adx < 15:
+        return "EXIT", {"reason": "adx_weak_mid"}
+    if mode == "BIG_TREND" and adx < 18:
+        return "EXIT", {"reason": "adx_weak_big"}
     
     return "HOLD", {"pnl_pct": pnl_pct, "adx": adx}
 
-# =================== STEP 6: TRUTH LAYER LOGGER ENHANCED ===================
+# =================== طبقة اللوج المحسنة - توضيح أسباب القرار ===================
 def log_truth_layer_enhanced(trend_state, liq, smc, explosion_state, decision, ichi, sma, vp):
     """
-    طبقة اللوج المحسنة مع عرض جميع الطبقات
+    طبقة اللوج المحسنة - توضيح أسباب القرار
     """
-    print("=" * 100, flush=True)
-    print("🧠 ENHANCED TRUTH LAYER - MULTI-LAYER DECISION SYSTEM", flush=True)
-    print("=" * 100, flush=True)
+    print("=" * 80, flush=True)
+    print("🧠 ENHANCED DECISION LAYER - CALCULATED BRAVERY", flush=True)
+    print("=" * 80, flush=True)
     
-    # Layer 1: Trend
-    print(f"📈 LAYER 1 - TREND STATE: {trend_state[0]} | {trend_state[1]}", flush=True)
+    # طباعة المعلومات الأساسية
+    print(f"📊 TREND: {trend_state[0]} | ADX: {decision.get('adx', 'N/A')}", flush=True)
     
-    # Layer 2: Liquidity
-    log_liquidity(liq)
+    # طباعة السيولة
+    if liq and liq.get("ok"):
+        liq_state = liq.get("state", "UNKNOWN")
+        liq_score = "🟢" if liq_state in ["ACCUMULATION", "SWEEP_HIGH", "SWEEP_LOW"] else "🟡" if liq_state == "NEUTRAL" else "🔴"
+        print(f"💧 LIQUIDITY: {liq_score} {liq_state}", flush=True)
     
-    # Layer 3: SMC
-    log_smc(smc)
+    # طباعة SMC
+    if smc and smc.get("ok"):
+        smc_signals = []
+        if smc.get("bos_up") or smc.get("bos_down"):
+            smc_signals.append("BOS")
+        if smc.get("ob_side"):
+            smc_signals.append(f"OB({smc['ob_side']})")
+        if smc.get("fvg_buy") or smc.get("fvg_sell"):
+            smc_signals.append("FVG")
+        
+        smc_score = "🟢" if len(smc_signals) >= 1 else "🟡"
+        print(f"🏗️ SMC: {smc_score} {', '.join(smc_signals) if smc_signals else 'None'}", flush=True)
     
-    # Layer 4: Explosion/Collapse
-    if explosion_state[0]:
-        print(f"💥 LAYER 4 - EXPLOSION: {explosion_state[0]} | {explosion_state[1]}", flush=True)
-    else:
-        print(f"💥 LAYER 4 - EXPLOSION: None", flush=True)
+    # طباعة المحاذاة
+    align_score = "🟢"
+    if ichi and ichi.get("ok"):
+        print(f"☁️ ICHIMOKU: {ichi['bias']}", flush=True)
+    if sma and sma.get("ok"):
+        print(f"📈 SMA200: {sma['bias']} (slope: {sma['slope']:.6f})", flush=True)
     
-    # Layer 5: Context Indicators
-    log_context(None, ichi, sma, vp)
+    print("-" * 80, flush=True)
     
-    print("-" * 100, flush=True)
-    
-    # Final Decision
+    # القرار النهائي
     if decision.get("ok"):
         side_display = "LONG" if decision["side"] == "buy" else "SHORT"
-        print(f"🎯 FINAL DECISION: {side_display} | Mode: {decision['mode']}", flush=True)
-        print(f"✅ REASON: {decision['why']}", flush=True)
+        print(f"🎯 DECISION: ENTER {side_display}", flush=True)
+        print(f"✅ MODE: {decision['mode']}", flush=True)
+        print(f"✅ REASON: {decision.get('why', 'trend_confirmed')}", flush=True)
         
         if decision["side"] == "buy":
-            print(f"🚀 ACTION: ENTER LONG POSITION ({decision['mode']} Mode)", flush=True)
-        elif decision["side"] == "sell":
-            print(f"🚀 ACTION: ENTER SHORT POSITION ({decision['mode']} Mode)", flush=True)
+            print(f"🚀 ACTION: BUY ({decision['mode']} Mode)", flush=True)
+        else:
+            print(f"🚀 ACTION: SELL ({decision['mode']} Mode)", flush=True)
     else:
-        print(f"⏸️ NO ENTRY: {decision.get('reason', 'Unknown')}", flush=True)
-        if decision.get("gate_ok") == False:
-            print(f"🔒 ENTRY GATE BLOCKED: Requires stronger confluence", flush=True)
+        print(f"⏸️ DECISION: WAIT", flush=True)
+        reason = decision.get('reason', 'unknown')
+        print(f"❌ BLOCKED: {reason}", flush=True)
+        
+        # اقتراحات للتحسين
+        if "liquidity" in reason:
+            print(f"💡 SUGGESTION: Wait for accumulation or sweep", flush=True)
+        elif "smc" in reason:
+            print(f"💡 SUGGESTION: Wait for OB/FVG confirmation", flush=True)
+        elif "alignment" in reason:
+            print(f"💡 SUGGESTION: Wait for HTF alignment", flush=True)
     
-    print("=" * 100, flush=True)
+    print("=" * 80, flush=True)
 
 # =================== CONTEXT INDICATORS ===================
 def compute_vwap(df):
@@ -1248,6 +1327,9 @@ def emit_snapshots_enhanced(exchange, symbol, df, balance_fn=None, pnl_fn=None):
             htf_bias
         )
         
+        # إضافة ADX إلى النتيجة
+        decision_result["adx"] = adx
+        
         # ===== STEP 7: Enhanced Truth Layer Logging =====
         if LOG_DECISION_LAYER:
             log_truth_layer_enhanced(
@@ -1279,6 +1361,7 @@ def emit_snapshots_enhanced(exchange, symbol, df, balance_fn=None, pnl_fn=None):
             "xc": xc,
             "explosion_state": explosion_state_result,
             "decision": decision_result,
+            "df": df
         }
         
     except Exception as e:
@@ -1301,13 +1384,17 @@ def emit_snapshots_enhanced(exchange, symbol, df, balance_fn=None, pnl_fn=None):
 
 # =================== EXECUTION VERIFICATION ===================
 def verify_execution_environment():
-    """التحقق من بيئة التنفيذ"""
+    """التحقق من بيئة التنفيذ - إضافة الإعدادات الجديدة"""
     print(f"⚙️ EXECUTION ENVIRONMENT", flush=True)
     print(f"🔧 EXCHANGE: {EXCHANGE_NAME.upper()} | SYMBOL: {SYMBOL}", flush=True)
     print(f"🔧 EXECUTE_ORDERS: {EXECUTE_ORDERS} | DRY_RUN: {DRY_RUN}", flush=True)
     print(f"🎯 TREND-ONLY MODE: NO SCALP/WEAK | MID/BIG ONLY", flush=True)
-    print(f"📈 HTF BIAS: 1H EMA{HTF_EMA_SLOW}/{HTF_EMA_FAST} | SMC+Liquidity", flush=True)
-    print(f"⚡ TREND SETTINGS: ADX_MID={ADX_MID_MIN} | ADX_BIG={ADX_BIG_MIN}", flush=True)
+    print(f"📊 TREND THRESHOLDS: MID(ADX≥{ADX_MID_MIN}) | BIG(ADX≥{ADX_BIG_MIN})", flush=True)
+    print(f"💰 TP LEVELS: MID({MID_TP_LEVELS}) | BIG({BIG_TP_LEVELS})", flush=True)
+    print(f"🧠 ENTRY LOGIC: Calculated Bravery System", flush=True)
+    print(f"✅ ALLOW MID WITHOUT SMC: YES (if strong liquidity)", flush=True)
+    print(f"⚠️ POC ZONE WARNING: YES (not blocking)", flush=True)
+    print(f"🚨 REVERSAL DETECTION: ACTIVE (quick exit)", flush=True)
     print(f"🧱 ANTI-DESYNC GUARD: ACTIVE", flush=True)
     print(f"🧠 ENHANCED LAYERS: Liquidity+SMC+Context+EntryGate", flush=True)
     
@@ -1315,6 +1402,88 @@ def verify_execution_environment():
         print("🟡 WARNING: EXECUTE_ORDERS=False - البوت في وضع التحليل فقط!", flush=True)
     if DRY_RUN:
         print("🟡 WARNING: DRY_RUN=True - البوت في وضع المحاكاة!", flush=True)
+
+# =================== فتح صفقة محسنة مع لوج تفصيلي ===================
+def open_market_enhanced(side, qty, price, mode, snap):
+    """فتح صفقة محسنة مع لوج تفصيلي"""
+    if qty <= 0: 
+        log_e("❌ Skip open (qty<=0)")
+        return False
+    
+    # لوج تفصيلي للدخول
+    log_banner(f"ENTRY CONFIRMED - {mode}")
+    
+    print(f"🟢 TYPE: {mode}", flush=True)
+    print(f"🟢 SIDE: {side.upper()}", flush=True)
+    print(f"🟢 LIQUIDITY: {snap.get('liq', {}).get('state', 'N/A')}", flush=True)
+    
+    # SMC signals
+    smc_signals = []
+    smc = snap.get('smc', {})
+    if smc.get('ob_side'):
+        smc_signals.append(f"OB({smc['ob_side']})")
+    if smc.get('fvg_buy') or smc.get('fvg_sell'):
+        smc_signals.append("FVG")
+    if smc.get('bos_up') or smc.get('bos_down'):
+        smc_signals.append("BOS")
+    
+    print(f"🟢 SMC: {', '.join(smc_signals) if smc_signals else 'None'}", flush=True)
+    
+    # Context
+    ichi = snap.get('ichi', {})
+    if ichi.get('ok'):
+        print(f"🟢 ICHIMOKU: {ichi.get('bias', 'N/A')}", flush=True)
+    
+    print(f"🟢 ADX: {snap.get('adx', 0):.1f}", flush=True)
+    
+    # حساب VWAP
+    try:
+        vwap = compute_vwap(snap.get('df', pd.DataFrame()))
+        current_price = snap.get('price', 0)
+        vwap_bias = "ABOVE" if current_price > vwap else "BELOW"
+        print(f"🟢 VWAP BIAS: {vwap_bias}", flush=True)
+    except:
+        print(f"🟢 VWAP BIAS: N/A", flush=True)
+    
+    reason = snap.get('decision', {}).get('why', 'trend_confirmation')
+    print(f"🟢 REASON: {reason}", flush=True)
+    print(f"🟢 QTY: {qty:.4f} @ {price:.6f}", flush=True)
+    
+    log_banner("")
+    
+    # التنفيذ الفعلي
+    if DRY_RUN or not EXECUTE_ORDERS:
+        log_i(f"📝 DRY_RUN: {side} {qty:.4f} @ {price:.6f} | mode={mode}")
+        return True
+    
+    try:
+        exchange_set_leverage(ex, LEVERAGE, SYMBOL)
+        params = exchange_specific_params(side, is_close=False)
+        ex.create_order(SYMBOL, "market", side, qty, None, params)
+        
+        # تحديث الحالة
+        STATE.update({
+            "open": True, 
+            "side": "long" if side=="buy" else "short", 
+            "entry": price,
+            "qty": qty, 
+            "pnl": 0.0, 
+            "bars": 0, 
+            "trail": None, 
+            "breakeven": None,
+            "tp1_done": False, 
+            "tp2_done": False,
+            "tp3_done": False,
+            "highest_profit_pct": 0.0, 
+            "profit_targets_achieved": 0,
+            "mode": mode
+        })
+        
+        log_g(f"✅ EXECUTED: {side.upper()} {qty:.4f} @ {price:.6f}")
+        return True
+    except Exception as e:
+        log_e(f"❌ EXECUTION FAILED: {e}")
+        return False
 
 # =================== ENHANCED TRADE LOOP ===================
 def trade_loop_enhanced():
@@ -1368,7 +1537,7 @@ def trade_loop_enhanced():
                             else:
                                 params = exchange_specific_params(close_side, is_close=True)
                                 ex.create_order(SYMBOL, "market", close_side, qty_to_close, None, params)
-                                log_g(f"✅ {action}: closed {fraction*100}% at {details['level']}% profit")
+                                log_g(f"✅ {action}: closed {fraction*100}% at {details['level']*100}% profit")
                                 STATE["qty"] = safe_qty(STATE["qty"] - qty_to_close)
                                 
                                 # تحديث حالة TP
@@ -1555,46 +1724,6 @@ def compute_flow_metrics(df):
     except Exception as e:
         return {"ok": False, "why": str(e)}
 
-# =================== ENHANCED TRADE EXECUTION ===================
-def open_market_enhanced(side, qty, price, mode, snap):
-    """فتح صفقة محسنة مع طبقات القرار"""
-    if qty <= 0: 
-        log_e("skip open (qty<=0)")
-        return False
-    
-    if DRY_RUN or not EXECUTE_ORDERS:
-        log_i(f"DRY_RUN: {side} {qty:.4f} @ {price:.6f} | mode={mode}")
-        return True
-    
-    try:
-        exchange_set_leverage(ex, LEVERAGE, SYMBOL)
-        params = exchange_specific_params(side, is_close=False)
-        ex.create_order(SYMBOL, "market", side, qty, None, params)
-        
-        # تحديث الحالة
-        STATE.update({
-            "open": True, 
-            "side": "long" if side=="buy" else "short", 
-            "entry": price,
-            "qty": qty, 
-            "pnl": 0.0, 
-            "bars": 0, 
-            "trail": None, 
-            "breakeven": None,
-            "tp1_done": False, 
-            "tp2_done": False,
-            "tp3_done": False,
-            "highest_profit_pct": 0.0, 
-            "profit_targets_achieved": 0,
-            "mode": mode
-        })
-        
-        log_g(f"✅ EXECUTED: {side.upper()} {qty:.4f} @ {price:.6f}")
-        return True
-    except Exception as e:
-        log_e(f"❌ EXECUTION FAILED: {e}")
-        return False
-
 # =================== INDICATORS ===================
 def wilder_ema(s: pd.Series, n: int): 
     return s.ewm(alpha=1/n, adjust=False).mean()
@@ -1777,7 +1906,7 @@ app = Flask(__name__)
 @app.route("/")
 def home():
     mode='LIVE' if MODE_LIVE else 'PAPER'
-    return f"✅ SUI Trend Master Bot v7.1 — {EXCHANGE_NAME.upper()} — {SYMBOL} {INTERVAL} — {mode} — Trend-Only System"
+    return f"✅ SUI Trend Master Bot v7.2 — {EXCHANGE_NAME.upper()} — {SYMBOL} {INTERVAL} — {mode} — Calculated Bravery System"
 
 @app.route("/metrics")
 def metrics():
@@ -1789,7 +1918,10 @@ def metrics():
         "trend_state": TREND_STATE,
         "entry_mode": "TREND_ONLY_NO_SCALP",
         "enhanced_layers": True,
-        "anti_desync_guard": True
+        "anti_desync_guard": True,
+        "calculated_bravery": True,
+        "adx_thresholds": {"mid": ADX_MID_MIN, "big": ADX_BIG_MIN},
+        "tp_levels": {"mid": MID_TP_LEVELS, "big": BIG_TP_LEVELS}
     })
 
 @app.route("/health")
@@ -1799,7 +1931,8 @@ def health():
         "open": STATE["open"], "side": STATE["side"], "qty": STATE["qty"],
         "compound_pnl": compound_pnl, "timestamp": datetime.utcnow().isoformat(),
         "trend_state": TREND_STATE,
-        "enhanced_system": True
+        "enhanced_system": True,
+        "calculated_bravery": True
     }), 200
 
 def keepalive_loop():
@@ -1817,7 +1950,7 @@ def keepalive_loop():
 
 # =================== BOOT ===================
 if __name__ == "__main__":
-    log_banner("SUI TREND MASTER BOT v7.1 - ENHANCED TREND-ONLY MULTI-EXCHANGE")
+    log_banner("SUI TREND MASTER BOT v7.2 - CALCULATED BRAVERY EDITION")
     state = load_state() or {}
     state.setdefault("in_position", False)
 
@@ -1833,13 +1966,14 @@ if __name__ == "__main__":
     print(colored(f"🎯 EXCHANGE: {EXCHANGE_NAME.upper()} • SYMBOL: {SYMBOL} • TIMEFRAME: {INTERVAL}", "yellow"))
     print(colored(f"⚡ RISK: {int(RISK_ALLOC*100)}% × {LEVERAGE}x • TREND-ONLY=ENABLED", "yellow"))
     print(colored(f"📊 TREND MODES: MID (ADX≥{ADX_MID_MIN}) | BIG (ADX≥{ADX_BIG_MIN})", "yellow"))
-    print(colored(f"🧭 HTF BIAS: 1H EMA{HTF_EMA_FAST}/{HTF_EMA_SLOW} | SMC+Liquidity", "yellow"))
-    print(colored(f"💰 TP PLANS: MID (2 levels) | BIG (3 levels)", "yellow"))
-    print(colored(f"🛡️ SAFETY: NO SCALP | NO WEAK | HTF CONFIRMATION", "yellow"))
+    print(colored(f"💰 TP PLANS: MID {MID_TP_LEVELS} | BIG {BIG_TP_LEVELS}", "yellow"))
+    print(colored(f"🛡️ SAFETY: NO SCALP | NO WEAK | QUICK REVERSAL DETECTION", "yellow"))
     print(colored(f"🚀 EXECUTION: {'ACTIVE' if EXECUTE_ORDERS and not DRY_RUN else 'SIMULATION'}", "yellow"))
-    print(colored(f"🧠 DECISION LAYERS: 1-Trend | 2-Liquidity | 3-SMC | 4-Explosion | 5-Context", "yellow"))
+    print(colored(f"🧠 DECISION LOGIC: CALCULATED BRAVERY SYSTEM", "green"))
+    print(colored(f"✅ ALLOW MID WITHOUT SMC: YES (with strong liquidity)", "green"))
+    print(colored(f"⚠️ POC ZONE: WARNING ONLY (not blocking)", "green"))
     print(colored(f"🔒 ANTI-DESYNC GUARD: ACTIVE", "green"))
-    print(colored(f"🎯 ENTRY GATE: Mid/Big ONLY with SMC Confluence", "green"))
+    print(colored(f"🚨 REVERSAL DETECTION: QUICK EXIT ENABLED", "green"))
     
     logging.info("service starting…")
     signal.signal(signal.SIGTERM, lambda *_: sys.exit(0))
