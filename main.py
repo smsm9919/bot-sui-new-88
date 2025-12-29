@@ -667,31 +667,41 @@ def detect_early_trend(df, ind):
         if len(df) < 50:
             return {"trend": "neutral", "strength": 0.0, "confidence": 0.0}
         
-        close = df['close'].astype(float)
-        high = df['high'].astype(float)
-        low = df['low'].astype(float)
-        volume = df['volume'].astype(float)
+        close = df['close'].astype(float).iloc[-1]
+        high = df['high'].astype(float).iloc[-1]
+        low = df['low'].astype(float).iloc[-1]
+        volume = df['volume'].astype(float).iloc[-1]
         
         # مؤشرات متقدمة للكشف المبكر
-        ema_20 = close.ewm(span=20).mean()
-        ema_50 = close.ewm(span=50).mean()
-        sma_20 = close.rolling(20).mean()
+        ema_20 = df['close'].astype(float).ewm(span=20).mean().iloc[-1]
+        ema_50 = df['close'].astype(float).ewm(span=50).mean().iloc[-1]
+        sma_20 = df['close'].astype(float).rolling(20).mean().iloc[-1]
         
         # اتجاه المتوسطات
-        ema_trend = "bull" if ema_20.iloc[-1] > ema_50.iloc[-1] else "bear"
-        price_vs_ema = "bull" if close.iloc[-1] > ema_20.iloc[-1] else "bear"
+        ema_trend = "bull" if ema_20 > ema_50 else "bear"
+        price_vs_ema = "bull" if close > ema_20 else "bear"
         
         # قوة الحركة
-        momentum_5 = ((close.iloc[-1] - close.iloc[-5]) / close.iloc[-5]) * 100
-        momentum_10 = ((close.iloc[-1] - close.iloc[-10]) / close.iloc[-10]) * 100
+        if len(df) >= 5:
+            momentum_5 = ((close - df['close'].astype(float).iloc[-5]) / df['close'].astype(float).iloc[-5]) * 100
+        else:
+            momentum_5 = 0
+            
+        if len(df) >= 10:
+            momentum_10 = ((close - df['close'].astype(float).iloc[-10]) / df['close'].astype(float).iloc[-10]) * 100
+        else:
+            momentum_10 = 0
         
         # تحليل الحجم
-        volume_ma = volume.rolling(20).mean()
-        volume_spike = volume.iloc[-1] > volume_ma.iloc[-1] * 1.5
+        volume_ma = df['volume'].astype(float).rolling(20).mean().iloc[-1]
+        volume_spike = volume > volume_ma * 1.5
         
         # تحليل التقلب
         atr = safe_get(ind, 'atr', 0)
-        recent_atr = (high - low).rolling(5).mean().iloc[-1]
+        if len(df) >= 5:
+            recent_atr = (df['high'].astype(float).tail(5) - df['low'].astype(float).tail(5)).mean()
+        else:
+            recent_atr = atr
         volatility_ratio = recent_atr / atr if atr > 0 else 1.0
         
         score_bull = 0.0
@@ -706,7 +716,7 @@ def detect_early_trend(df, ind):
             score_bull += 1.0
         if momentum_10 > 1.0:
             score_bull += 1.5
-        if volume_spike and close.iloc[-1] > close.iloc[-2]:
+        if volume_spike and close > df['close'].astype(float).iloc[-2]:
             score_bull += 1.5
         
         # تصويت الاتجاه الهابط
@@ -718,7 +728,7 @@ def detect_early_trend(df, ind):
             score_bear += 1.0
         if momentum_10 < -1.0:
             score_bear += 1.5
-        if volume_spike and close.iloc[-1] < close.iloc[-2]:
+        if volume_spike and close < df['close'].astype(float).iloc[-2]:
             score_bear += 1.5
         
         # تحديد الاتجاه النهائي
@@ -754,26 +764,26 @@ def detect_breakout_opportunity(df, ind):
         if len(df) < 30:
             return {"breakout": False, "direction": "none", "strength": 0.0}
         
-        close = df['close'].astype(float)
-        high = df['high'].astype(float)
-        low = df['low'].astype(float)
-        volume = df['volume'].astype(float)
+        close = df['close'].astype(float).iloc[-1]
+        high = df['high'].astype(float).iloc[-1]
+        low = df['low'].astype(float).iloc[-1]
+        volume = df['volume'].astype(float).iloc[-1]
         
         # مستويات المقاومة والدعم
-        resistance = high.rolling(20).max()
-        support = low.rolling(20).min()
+        resistance = df['high'].astype(float).rolling(20).max().iloc[-2]
+        support = df['low'].astype(float).rolling(20).min().iloc[-2]
         
-        current_high = high.iloc[-1]
-        current_low = low.iloc[-1]
-        current_close = close.iloc[-1]
+        current_high = high
+        current_low = low
+        current_close = close
         
         # تحليل الاختراق
-        breakout_up = current_close > resistance.iloc[-2] and current_high > resistance.iloc[-2]
-        breakout_down = current_close < support.iloc[-2] and current_low < support.iloc[-2]
+        breakout_up = current_close > resistance and current_high > resistance
+        breakout_down = current_close < support and current_low < support
         
         # تأكيد الحجم
-        volume_ma = volume.rolling(20).mean()
-        volume_confirmation = volume.iloc[-1] > volume_ma.iloc[-1] * 1.2
+        volume_ma = df['volume'].astype(float).rolling(20).mean().iloc[-1]
+        volume_confirmation = volume > volume_ma * 1.2
         
         # قوة الاختراق
         strength = 0.0
@@ -782,16 +792,16 @@ def detect_breakout_opportunity(df, ind):
         if breakout_up and volume_confirmation:
             direction = "up"
             # حساب قوة الاختراق
-            breakout_power = (current_close - resistance.iloc[-2]) / resistance.iloc[-2] * 100
+            breakout_power = (current_close - resistance) / resistance * 100
             strength = min(10.0, breakout_power * 10)
-            strength += 2.0 if volume.iloc[-1] > volume_ma.iloc[-1] * 1.5 else 0.0
+            strength += 2.0 if volume > volume_ma * 1.5 else 0.0
             
         elif breakout_down and volume_confirmation:
             direction = "down"
             # حساب قوة الاختراق
-            breakout_power = (support.iloc[-2] - current_close) / support.iloc[-2] * 100
+            breakout_power = (support - current_close) / support * 100
             strength = min(10.0, breakout_power * 10)
-            strength += 2.0 if volume.iloc[-1] > volume_ma.iloc[-1] * 1.5 else 0.0
+            strength += 2.0 if volume > volume_ma * 1.5 else 0.0
         
         return {
             "breakout": direction != "none",
@@ -1022,8 +1032,8 @@ def compute_volume_profile(df, period=20):
     volume_per_price = volume / (price_range.replace(0, 1e-12))
     
     return {
-        'volume_ma': sma(volume, period),
-        'volume_spike': volume > sma(volume, period) * 1.5,
+        'volume_ma': sma(volume, period).iloc[-1],
+        'volume_spike': volume.iloc[-1] > sma(volume, period).iloc[-1] * 1.5,
         'volume_trend': 'up' if volume.iloc[-1] > volume.iloc[-2] else 'down'
     }
 
@@ -1032,15 +1042,28 @@ def compute_momentum_indicators(df):
     high = df['high'].astype(float)
     low = df['low'].astype(float)
     
-    roc = ((close - close.shift(5)) / close.shift(5)) * 100
-    price_accel = close.diff().diff()
-    volatility = high - low
+    if len(close) >= 5:
+        roc = ((close.iloc[-1] - close.iloc[-5]) / close.iloc[-5]) * 100
+    else:
+        roc = 0
+        
+    if len(close) >= 3:
+        price_accel = close.diff().diff().iloc[-1]
+    else:
+        price_accel = 0
+        
+    volatility = high.iloc[-1] - low.iloc[-1]
+    
+    if len(df) >= 20:
+        volatility_ma = (high.astype(float) - low.astype(float)).rolling(20).mean().iloc[-1]
+    else:
+        volatility_ma = volatility
     
     return {
-        'roc': roc.iloc[-1] if len(roc) > 0 else 0,
-        'price_accel': price_accel.iloc[-1] if len(price_accel) > 0 else 0,
-        'volatility': volatility.iloc[-1] if len(volatility) > 0 else 0,
-        'volatility_ma': sma(volatility, 20).iloc[-1] if len(volatility) >= 20 else 0
+        'roc': roc,
+        'price_accel': price_accel,
+        'volatility': volatility,
+        'volatility_ma': volatility_ma
     }
 
 def compute_trend_strength(df, ind):
@@ -1049,8 +1072,15 @@ def compute_trend_strength(df, ind):
     plus_di = safe_get(ind, 'plus_di', 0)
     minus_di = safe_get(ind, 'minus_di', 0)
     
-    momentum_5 = ((close.iloc[-1] - close.iloc[-5]) / close.iloc[-5]) * 100 if len(close) >= 5 else 0
-    momentum_10 = ((close.iloc[-1] - close.iloc[-10]) / close.iloc[-10]) * 100 if len(close) >= 10 else 0
+    if len(close) >= 5:
+        momentum_5 = ((close.iloc[-1] - close.iloc[-5]) / close.iloc[-5]) * 100
+    else:
+        momentum_5 = 0
+        
+    if len(close) >= 10:
+        momentum_10 = ((close.iloc[-1] - close.iloc[-10]) / close.iloc[-10]) * 100
+    else:
+        momentum_10 = 0
     
     trend_consistency = 0
     if len(close) >= 10:
@@ -1462,54 +1492,63 @@ def super_council_ai_enhanced(df):
             logs.append(f"🟨 FLOW-BOOST error: {e}")
 
         # ===== LIQUIDITY SWEEP BOOST =====
-        if liquidity.get("buy"):
-            score_b += liquidity["score_b"] * WEIGHT_SWEEP
-            votes_b += liquidity["votes_b"]
-            logs.append(f"🧲 SWEEP BOTTOM → +{liquidity['score_b']:.1f} | votes+{liquidity['votes_b']} ({';'.join(liquidity.get('reasons',[]))})")
-            confidence_factors.append(1.35)  # ثقة عالية جداً في الـSweep
+        try:
+            if liquidity.get("buy"):
+                score_b += liquidity["score_b"] * WEIGHT_SWEEP
+                votes_b += liquidity["votes_b"]
+                logs.append(f"🧲 SWEEP BOTTOM → +{liquidity['score_b']:.1f} | votes+{liquidity['votes_b']} ({';'.join(liquidity.get('reasons',[]))})")
+                confidence_factors.append(1.35)  # ثقة عالية جداً في الـSweep
 
-        if liquidity.get("sell"):
-            score_s += liquidity["score_s"] * WEIGHT_SWEEP
-            votes_s += liquidity["votes_s"]
-            logs.append(f"🧲 SWEEP TOP → +{liquidity['score_s']:.1f} | votes+{liquidity['votes_s']} ({';'.join(liquidity.get('reasons',[]))})")
-            confidence_factors.append(1.35)
+            if liquidity.get("sell"):
+                score_s += liquidity["score_s"] * WEIGHT_SWEEP
+                votes_s += liquidity["votes_s"]
+                logs.append(f"🧲 SWEEP TOP → +{liquidity['score_s']:.1f} | votes+{liquidity['votes_s']} ({';'.join(liquidity.get('reasons',[]))})")
+                confidence_factors.append(1.35)
+        except Exception as e:
+            logs.append(f"🟨 LIQUIDITY SWEEP error: {e}")
 
         # ===== EARLY TREND DETECTION BOOST =====
-        if EARLY_TREND_DETECTION and early_trend["trend"] != "neutral":
-            trend_strength_early = early_trend["strength"]
-            trend_confidence = early_trend["confidence"]
-            
-            if early_trend["trend"] == "bull" and trend_confidence > 0.6:
-                early_score = WEIGHT_EARLY_TREND * trend_strength_early
-                score_b += early_score
-                votes_b += int(trend_strength_early)
-                logs.append(f"🚀 اكتشاف مبكر لترند صاعد (قوة: {trend_strength_early:.1f})")
-                confidence_factors.append(1.3)
+        try:
+            if EARLY_TREND_DETECTION and early_trend["trend"] != "neutral":
+                trend_strength_early = early_trend["strength"]
+                trend_confidence = early_trend["confidence"]
                 
-            elif early_trend["trend"] == "bear" and trend_confidence > 0.6:
-                early_score = WEIGHT_EARLY_TREND * trend_strength_early
-                score_s += early_score
-                votes_s += int(trend_strength_early)
-                logs.append(f"💥 اكتشاف مبكر لترند هابط (قوة: {trend_strength_early:.1f})")
-                confidence_factors.append(1.3)
+                if early_trend["trend"] == "bull" and trend_confidence > 0.6:
+                    early_score = WEIGHT_EARLY_TREND * trend_strength_early
+                    score_b += early_score
+                    votes_b += int(trend_strength_early)
+                    logs.append(f"🚀 اكتشاف مبكر لترند صاعد (قوة: {trend_strength_early:.1f})")
+                    confidence_factors.append(1.3)
+                    
+                elif early_trend["trend"] == "bear" and trend_confidence > 0.6:
+                    early_score = WEIGHT_EARLY_TREND * trend_strength_early
+                    score_s += early_score
+                    votes_s += int(trend_strength_early)
+                    logs.append(f"💥 اكتشاف مبكر لترند هابط (قوة: {trend_strength_early:.1f})")
+                    confidence_factors.append(1.3)
+        except Exception as e:
+            logs.append(f"🟨 EARLY TREND error: {e}")
 
         # ===== BREAKOUT DETECTION BOOST =====
-        if BREAKOUT_CONFIRMATION and breakout["breakout"]:
-            breakout_strength = breakout["strength"]
-            
-            if breakout["direction"] == "up" and breakout["volume_confirmed"]:
-                breakout_score = WEIGHT_BREAKOUT * breakout_strength
-                score_b += breakout_score
-                votes_b += int(breakout_strength)
-                logs.append(f"📈 اختراق صاعد قوي (قوة: {breakout_strength:.1f})")
-                confidence_factors.append(1.4)
+        try:
+            if BREAKOUT_CONFIRMATION and breakout["breakout"]:
+                breakout_strength = breakout["strength"]
                 
-            elif breakout["direction"] == "down" and breakout["volume_confirmed"]:
-                breakout_score = WEIGHT_BREAKOUT * breakout_strength
-                score_s += breakout_score
-                votes_s += int(breakout_strength)
-                logs.append(f"📉 اختراق هابط قوي (قوة: {breakout_strength:.1f})")
-                confidence_factors.append(1.4)
+                if breakout["direction"] == "up" and breakout["volume_confirmed"]:
+                    breakout_score = WEIGHT_BREAKOUT * breakout_strength
+                    score_b += breakout_score
+                    votes_b += int(breakout_strength)
+                    logs.append(f"📈 اختراق صاعد قوي (قوة: {breakout_strength:.1f})")
+                    confidence_factors.append(1.4)
+                    
+                elif breakout["direction"] == "down" and breakout["volume_confirmed"]:
+                    breakout_score = WEIGHT_BREAKOUT * breakout_strength
+                    score_s += breakout_score
+                    votes_s += int(breakout_strength)
+                    logs.append(f"📉 اختراق هابط قوي (قوة: {breakout_strength:.1f})")
+                    confidence_factors.append(1.4)
+        except Exception as e:
+            logs.append(f"🟨 BREAKOUT error: {e}")
 
         # 1. تحليل الزخم المبكر
         if TREND_EARLY_DETECTION:
@@ -1726,7 +1765,7 @@ def super_council_ai_enhanced(df):
             "liquidity": liquidity
         }
     except Exception as e:
-        log_w(f"super_council_ai_enhanced error: {e}")
+        log_w(f"super_council_ai_enhanced error: {e}\n{traceback.format_exc()}")
         return {"b":0,"s":0,"score_b":0.0,"score_s":0.0,"logs":[],"ind":{},"confidence":0.0}
 
 council_votes_pro_enhanced = super_council_ai_enhanced
